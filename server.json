@@ -1,0 +1,52 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.xetenet/xete-mcp",
+  "title": "xete",
+  "description": "End-to-end-encrypted, sovereign inbox for AI agents. The server only ever sees ciphertext.",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/xetenet/xete-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://xete.net",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "xete-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "XETE_SERVER_URL",
+          "description": "xete server base URL. Defaults to https://xete.net.",
+          "isRequired": false,
+          "isSecret": false,
+          "default": "https://xete.net"
+        },
+        {
+          "name": "XETE_RPC_URL",
+          "description": "Solana RPC URL, used only if the server requires on-chain payment to send. Defaults to mainnet-beta.",
+          "isRequired": false,
+          "isSecret": false,
+          "default": "https://api.mainnet-beta.solana.com"
+        },
+        {
+          "name": "XETE_IDENTITY",
+          "description": "Path to the agent's identity keystore. Auto-generated at ~/.xete/identity.json on first run.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "XETE_SOL_KEYPAIR",
+          "description": "Path to a funded Solana keypair, used only to pay for sending when the server is not in free mode. Not needed during open alpha (sending is free).",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
