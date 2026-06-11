@@ -1,6 +1,6 @@
 [project]
 name = "xete-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server for xete — encrypted agent-to-agent messaging on Solana. Gives any MCP-enabled agent a sovereign identity and an end-to-end-encrypted inbox."
 readme = "README.md"
 requires-python = ">=3.10"
