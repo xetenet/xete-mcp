@@ -209,26 +209,34 @@ def xete_alias_claim(name: str) -> str:
     on-chain, and confirm it settled. Your identity wallet is the fee payer, so it must hold a
     little SOL — it pays the one-time price (0 for ordinary 6+ letter names, or in grace) plus a
     small network rent + gas. Check the price first with xete_alias_quote. Returns the price
-    paid, the tx signature, and the settlement status."""
-    c = _get_client()  # ensures the agent is registered in the relay (claim verifies that record)
-    pubkey = c.identity.pubkey_b58
+    paid, the tx signature, and the settlement status. You must already have a xete identity
+    registered (claiming binds the name to your agent)."""
+    # Load the identity directly: claim depends on the permit server + its relay DB, NOT on the
+    # messaging relay being reachable — so don't force a messaging-server login here.
+    ident = load_or_create_identity(IDENTITY_PATH)
+    pubkey = ident.pubkey_b58
     try:
         import base64 as _b64
+        import base58
 
         ch = requests.post(_permit_url("/alias/claim/challenge"), json={"pubkey": pubkey}, timeout=15).json()
         if "message" not in ch or "nonce" not in ch:
             return json.dumps({"status": "failed", "stage": "challenge", "detail": ch})
-        # sign the challenge with the identity ed25519 key (base64, exactly as the permit's auth expects)
-        sig = _b64.b64encode(c.identity.signing_key.sign(ch["message"].encode("utf-8")).signature).decode()
+        # sign the challenge with the identity ed25519 key. NOTE: the permit server verifies sigs as
+        # BASE58 (bs58::decode in auth.rs) — unlike the messaging relay, which uses base64. Different
+        # services, different convention; send base58 here.
+        sig = base58.b58encode(ident.signing_key.sign(ch["message"].encode("utf-8")).signature).decode()
         claim = requests.post(
             _permit_url("/alias/claim"),
             json={"pubkey": pubkey, "nonce": ch["nonce"], "signature": sig, "name": name},
             timeout=20,
         ).json()
         if claim.get("status") != "approved":
+            reason = claim.get("reason") or claim.get("error")
+            hint = ("register a xete identity first (send a message, or call xete_my_identity), then claim"
+                    if reason == "no_agent_for_wallet" else None)
             return json.dumps(
-                {"status": claim.get("status", "denied"),
-                 "reason": claim.get("reason") or claim.get("error"), "name": name},
+                {"status": claim.get("status", "denied"), "reason": reason, "hint": hint, "name": name},
                 indent=2,
             )
         # add our claimer signature (we are the fee payer) and submit on-chain
@@ -236,7 +244,7 @@ def xete_alias_claim(name: str) -> str:
         from solders.transaction import Transaction
         from solana.rpc.api import Client
 
-        claimer = Keypair.from_seed(c.identity.ed_seed)
+        claimer = Keypair.from_seed(ident.ed_seed)
         tx = Transaction.from_bytes(_b64.b64decode(claim["transaction"]))
         tx.partial_sign([claimer], tx.message.recent_blockhash)
         rpc = Client(RPC_URL)
