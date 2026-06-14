@@ -23,7 +23,7 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from .client import XeteClient, load_or_create_identity
-from . import payment
+from . import payment, settlement
 
 SERVER_URL = os.environ.get("XETE_SERVER_URL", "https://xete.net")
 RPC_URL = os.environ.get("XETE_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -267,6 +267,117 @@ def xete_alias_claim(name: str) -> str:
             "tx_signature": str(onchain),
             "settled": conf.get("status"),
         }, indent=2)
+    except Exception as e:
+        return json.dumps({"status": "failed", "error": str(e)[:300]})
+
+
+# ── confidential settlement tools (the "tab": agent->agent value transfer) ───────────
+# Deposit funds for a recipient (hidden on-chain), notify them encrypted over xete, they claim.
+# Non-custodial: only the depositor (reclaim) or beneficiary (claim) keys move funds. THIS agent's
+# identity wallet is the depositor/claimant + fee payer, so it must hold SOL.
+
+def _resolve_recipient_wallet(recipient: str):
+    """(wallet Pubkey, messageable_handle | None). Accepts a base58 wallet pubkey directly, or a
+    %alias / name resolved via the permit server to its on-chain owner wallet."""
+    import base58
+    from solders.pubkey import Pubkey
+
+    r = recipient.strip()
+    try:
+        if len(base58.b58decode(r)) == 32:
+            return Pubkey.from_string(r), None  # raw wallet; not messageable by itself
+    except Exception:
+        pass
+    name = r.lstrip("%")
+    resp = requests.get(_permit_url("/alias/resolve"), params={"name": name}, timeout=15).json()
+    owner = resp.get("alias_owner")
+    if not owner:
+        raise RuntimeError(f"could not resolve recipient '{recipient}' to a wallet (no %{name} owner on-chain)")
+    return Pubkey.from_string(owner), f"%{name}"
+
+
+@mcp.tool()
+def xete_settle_create(recipient: str, amount_sol: float, notify: bool = True) -> str:
+    """Open a confidential SETTLEMENT (a "tab") that pays `recipient` `amount_sol` — agent-to-agent
+    value transfer, not a message fee. Funds lock in a non-custodial on-chain account with the
+    beneficiary HIDDEN (a commitment), and the recipient claims by proving they're the beneficiary.
+    Recipient may be a wallet address or a %alias. Your identity wallet is the depositor + fee payer
+    (must hold amount_sol + a little for rent/gas). If notify is true and the recipient is messageable,
+    the claim ticket (escrow_id + salt) is sent to them END-TO-END ENCRYPTED over xete. ALWAYS returns
+    the ticket so you can deliver it yourself too — the recipient needs escrow_id + salt to claim. You
+    can xete_settle_reclaim it any time before they claim."""
+    ident = load_or_create_identity(IDENTITY_PATH)
+    try:
+        from solders.keypair import Keypair
+
+        recipient_wallet, handle = _resolve_recipient_wallet(recipient)
+        depositor = Keypair.from_seed(ident.ed_seed)
+        lamports = int(round(amount_sol * 1_000_000_000))
+        if lamports <= 0:
+            return json.dumps({"status": "failed", "error": "amount_sol must be > 0"})
+        eid_hex, salt_hex, pda, sig = settlement.deposit(RPC_URL, depositor, recipient_wallet, lamports)
+        ticket = {"escrow_id": eid_hex, "salt": salt_hex, "amount_sol": amount_sol,
+                  "program": str(settlement.program_id()), "claim_with": "xete_settle_claim"}
+        notified = None
+        if notify and handle:
+            try:
+                c = _get_client()
+                msg = ("You've received a xete settlement of "
+                       f"{amount_sol} SOL. Claim it with xete_settle_claim:\n"
+                       f"escrow_id: {eid_hex}\nsalt: {salt_hex}")
+                c.send_multi(handle, msg, "xete settlement")
+                notified = handle
+            except Exception as e:
+                notified = f"send failed: {str(e)[:120]}"
+        return json.dumps({
+            "status": "open", "to": recipient, "recipient_wallet": str(recipient_wallet),
+            "amount_sol": amount_sol, "pda": pda, "deposit_sig": sig,
+            "ticket": ticket, "notified": notified,
+            "note": "give the recipient escrow_id + salt to claim; reclaimable until then",
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"status": "failed", "error": str(e)[:300]})
+
+
+@mcp.tool()
+def xete_settle_claim(escrow_id: str, salt: str) -> str:
+    """Claim a confidential settlement addressed to you — using the escrow_id + salt from the claim
+    ticket (sent to your inbox, or handed to you). Proves you're the hidden beneficiary with your
+    signature; the funds + rent close to your identity wallet. Returns the tx and the amount received."""
+    ident = load_or_create_identity(IDENTITY_PATH)
+    try:
+        from solders.keypair import Keypair
+
+        beneficiary = Keypair.from_seed(ident.ed_seed)
+        sig, received = settlement.claim(RPC_URL, beneficiary, escrow_id, salt)
+        return json.dumps({"status": "claimed", "escrow_id": escrow_id, "tx_signature": sig,
+                           "received_sol": received / 1e9, "to": ident.pubkey_b58}, indent=2)
+    except Exception as e:
+        return json.dumps({"status": "failed", "error": str(e)[:300]})
+
+
+@mcp.tool()
+def xete_settle_reclaim(escrow_id: str) -> str:
+    """Cancel a settlement YOU opened and get the funds + rent back, as long as the recipient hasn't
+    claimed yet (depositor-only). Returns the tx signature."""
+    ident = load_or_create_identity(IDENTITY_PATH)
+    try:
+        from solders.keypair import Keypair
+
+        depositor = Keypair.from_seed(ident.ed_seed)
+        sig = settlement.reclaim(RPC_URL, depositor, escrow_id)
+        return json.dumps({"status": "reclaimed", "escrow_id": escrow_id, "tx_signature": sig,
+                           "to": ident.pubkey_b58}, indent=2)
+    except Exception as e:
+        return json.dumps({"status": "failed", "error": str(e)[:300]})
+
+
+@mcp.tool()
+def xete_settle_status(escrow_id: str) -> str:
+    """Check whether a settlement is still open (unclaimed and unreclaimed). A closed account means it
+    already settled. While open, returns the depositor and locked amount. Read-only."""
+    try:
+        return json.dumps(settlement.status(RPC_URL, escrow_id), indent=2)
     except Exception as e:
         return json.dumps({"status": "failed", "error": str(e)[:300]})
 
