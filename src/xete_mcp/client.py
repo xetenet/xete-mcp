@@ -28,12 +28,46 @@ import os
 
 # ── identity / keystore ─────────────────────────────────────────────────────
 
+# The canonical message EVERY xete interface signs with the WALLET key to derive
+# the shared messaging x25519 identity. MUST stay byte-identical to House Elf
+# (crypto/mod.rs::MESSAGING_SIG_MESSAGE) and the web inbox. A wallet SIGNATURE is
+# the only input a browser wallet (Phantom signMessage) can reproduce — it never
+# exposes the seed — so signing this, not hashing the seed, is what lets desktop,
+# MCP, and browser all land on the SAME key. Changing it rotates everyone's key.
+MESSAGING_SIG_MESSAGE = b"xete messaging key derivation v1"
+
+
+def derive_x25519_secret(ed_seed: bytes) -> bytes:
+    """Derive the messaging x25519 secret from the wallet's 32-byte ed25519 seed:
+        sig          = ed25519_sign(ed_seed, MESSAGING_SIG_MESSAGE)
+        x25519_secret = SHA256(sig)
+
+    ed25519 is deterministic (RFC 8032), so this is byte-stable and identical
+    across House Elf (ed25519-dalek), here (nacl), and the browser (tweetnacl /
+    Phantom). One wallet -> one messaging key in every interface.
+    """
+    sig = nacl.signing.SigningKey(ed_seed).sign(MESSAGING_SIG_MESSAGE).signature
+    return hashlib.sha256(sig).digest()
+
+
 @dataclass
 class Identity:
-    """A xete identity: a Solana ed25519 keypair (auth) + an x25519 keypair (E2E)."""
+    """A xete identity: a Solana ed25519 keypair (auth) + an x25519 keypair (E2E).
+
+    The x25519 messaging secret is NOT stored independently — it is always a pure
+    function of `ed_seed` (see __post_init__). This guarantees the messaging key
+    can never drift from the wallet, and silently heals legacy keystores that
+    stored a random x_secret (they re-derive the correct key on load, then just
+    need to re-register it with the relay).
+    """
     ed_seed: bytes                 # 32-byte ed25519 seed
-    x_secret: bytes                # 32-byte x25519 secret
+    x_secret: bytes = b""          # derived from ed_seed in __post_init__ (never trusted from input)
     agent_id: str = ""             # assigned by the server on login
+
+    def __post_init__(self) -> None:
+        # Enforce the invariant: messaging key = f(wallet seed). Any x_secret
+        # passed in (e.g. a random one from an old keystore) is discarded.
+        self.x_secret = derive_x25519_secret(self.ed_seed)
 
     @property
     def signing_key(self) -> nacl.signing.SigningKey:
@@ -57,17 +91,17 @@ class Identity:
     @classmethod
     def from_json(cls, s: str) -> "Identity":
         d = json.loads(s)
+        # Any stored x_secret is intentionally ignored — __post_init__ re-derives
+        # it from ed_seed. This auto-heals keystores written before unification.
         return cls(
             ed_seed=base64.b64decode(d["ed_seed"]),
-            x_secret=base64.b64decode(d["x_secret"]),
             agent_id=d.get("agent_id", ""),
         )
 
     @classmethod
     def generate(cls) -> "Identity":
         ed = nacl.signing.SigningKey.generate()
-        x = X25519Private.generate()
-        return cls(ed_seed=bytes(ed), x_secret=bytes(x))
+        return cls(ed_seed=bytes(ed))  # x_secret derived from ed_seed
 
 
 def load_or_create_identity(path: Path) -> Identity:
