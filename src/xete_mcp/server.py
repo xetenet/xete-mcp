@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 
+import requests
 from mcp.server.fastmcp import FastMCP
 
 from .client import XeteClient, load_or_create_identity
@@ -28,6 +29,9 @@ SERVER_URL = os.environ.get("XETE_SERVER_URL", "https://xete.net")
 RPC_URL = os.environ.get("XETE_RPC_URL", "https://api.mainnet-beta.solana.com")
 IDENTITY_PATH = Path(os.environ.get("XETE_IDENTITY", str(Path.home() / ".xete" / "identity.json")))
 SOL_KEYPAIR_PATH = os.environ.get("XETE_SOL_KEYPAIR", "")
+# The %alias permit server. Separate service from the messaging relay, though in prod it may be
+# proxied under the same host — so it defaults to SERVER_URL and is overridable.
+PERMIT_URL = os.environ.get("XETE_PERMIT_URL", SERVER_URL)
 
 mcp = FastMCP("xete")
 
@@ -146,6 +150,117 @@ def xete_check_inbox(limit: int = 20) -> str:
         return json.dumps({"count": len(msgs), "messages": msgs}, indent=2, default=str)
     except Exception as e:
         return json.dumps({"error": str(e)[:300]})
+
+
+# ── %alias registry tools ────────────────────────────────────────────────────
+# Names that resolve to a wallet (%alex). quote/resolve/reverse are read-only (no signing,
+# no cost). claim runs the full on-chain flow and is paid by THIS agent's identity wallet.
+
+def _permit_url(path: str) -> str:
+    return f"{PERMIT_URL.rstrip('/')}{path}"
+
+
+@mcp.tool()
+def xete_alias_quote(name: str, wallet: str = "") -> str:
+    """Get the one-time price to claim a xete %name, itemized and provable. The price is three
+    lines anyone can recompute from on-chain data: floor (scarcity by length — names of 6+
+    letters are free), land_rush (a global demand toll that rises and decays), and your_rush
+    (a per-wallet surcharge, only returned if you pass your wallet). Lamports; 1 SOL = 1e9
+    lamports. Read-only — costs nothing to ask. Call this before xete_alias_claim."""
+    try:
+        params = {"name": name}
+        if wallet:
+            params["wallet"] = wallet
+        r = requests.get(_permit_url("/alias/quote"), params=params, timeout=15)
+        return json.dumps(r.json(), indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)[:300]})
+
+
+@mcp.tool()
+def xete_alias_resolve(name: str) -> str:
+    """Resolve a xete %name: its on-chain owner, whether a matching .sol exists, and whether the
+    SAME wallet holds both (owns_both — the verified-identity condition). Use it to confirm a
+    name points where you expect before you trust or pay it. Read-only."""
+    try:
+        r = requests.get(_permit_url("/alias/resolve"), params={"name": name}, timeout=15)
+        return json.dumps(r.json(), indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)[:300]})
+
+
+@mcp.tool()
+def xete_alias_reverse(wallet: str) -> str:
+    """Reverse-resolve a wallet to its best xete %name — the identity to show for a raw address —
+    plus whether it also holds the matching .sol. Returns name:null when the wallet holds no
+    name (callers then fall back to the truncated address). Read-only."""
+    try:
+        r = requests.get(_permit_url("/alias/reverse"), params={"wallet": wallet}, timeout=15)
+        return json.dumps(r.json(), indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)[:300]})
+
+
+@mcp.tool()
+def xete_alias_claim(name: str) -> str:
+    """Claim a xete %name for THIS agent — its identity wallet (see xete_my_identity →
+    wallet_pubkey) becomes the owner. Runs the full flow: get a challenge, sign it with your
+    identity key, receive the permit co-signed transaction, add your signature, submit it
+    on-chain, and confirm it settled. Your identity wallet is the fee payer, so it must hold a
+    little SOL — it pays the one-time price (0 for ordinary 6+ letter names, or in grace) plus a
+    small network rent + gas. Check the price first with xete_alias_quote. Returns the price
+    paid, the tx signature, and the settlement status."""
+    c = _get_client()  # ensures the agent is registered in the relay (claim verifies that record)
+    pubkey = c.identity.pubkey_b58
+    try:
+        import base64 as _b64
+
+        ch = requests.post(_permit_url("/alias/claim/challenge"), json={"pubkey": pubkey}, timeout=15).json()
+        if "message" not in ch or "nonce" not in ch:
+            return json.dumps({"status": "failed", "stage": "challenge", "detail": ch})
+        # sign the challenge with the identity ed25519 key (base64, exactly as the permit's auth expects)
+        sig = _b64.b64encode(c.identity.signing_key.sign(ch["message"].encode("utf-8")).signature).decode()
+        claim = requests.post(
+            _permit_url("/alias/claim"),
+            json={"pubkey": pubkey, "nonce": ch["nonce"], "signature": sig, "name": name},
+            timeout=20,
+        ).json()
+        if claim.get("status") != "approved":
+            return json.dumps(
+                {"status": claim.get("status", "denied"),
+                 "reason": claim.get("reason") or claim.get("error"), "name": name},
+                indent=2,
+            )
+        # add our claimer signature (we are the fee payer) and submit on-chain
+        from solders.keypair import Keypair
+        from solders.transaction import Transaction
+        from solana.rpc.api import Client
+
+        claimer = Keypair.from_seed(c.identity.ed_seed)
+        tx = Transaction.from_bytes(_b64.b64decode(claim["transaction"]))
+        tx.partial_sign([claimer], tx.message.recent_blockhash)
+        rpc = Client(RPC_URL)
+        onchain = rpc.send_raw_transaction(bytes(tx)).value
+        # wait for settlement, then ask the permit server to verify the on-chain owner
+        import time as _t
+        for _ in range(30):
+            _t.sleep(0.5)
+            st = rpc.get_signature_statuses([onchain]).value[0]
+            if st and st.confirmation_status:
+                break
+        conf = requests.post(_permit_url("/alias/claim/confirm"),
+                             json={"pubkey": pubkey, "name": name}, timeout=20).json()
+        return json.dumps({
+            "status": "claimed" if conf.get("status") == "confirmed" else conf.get("status", "submitted"),
+            "name": name,
+            "owner": pubkey,
+            "price_lamports": claim.get("price_lamports"),
+            "free_grace": claim.get("free_grace"),
+            "tx_signature": str(onchain),
+            "settled": conf.get("status"),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"status": "failed", "error": str(e)[:300]})
 
 
 def main():
