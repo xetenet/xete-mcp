@@ -271,6 +271,55 @@ def xete_alias_claim(name: str) -> str:
         return json.dumps({"status": "failed", "error": str(e)[:300]})
 
 
+# ── unified resolver ─────────────────────────────────────────────────────────────────
+# One call to turn any xete identifier (wallet | %alias | .sol) into a single identity view.
+# Pure addressing over the alias permit server — no messaging, no inbox, no decryption.
+
+def _classify_identifier(identifier: str):
+    """(kind, query) — kind in {handle, wallet, sol, alias}; query is the lookup key (a wallet
+    pubkey, or a bare name with any %/.sol stripped). Pure, no I/O."""
+    import base58
+
+    r = identifier.strip()
+    if r.startswith("@"):
+        return "handle", r[1:]
+    try:
+        if len(base58.b58decode(r)) == 32:
+            return "wallet", r
+    except Exception:
+        pass
+    name = r.lstrip("%")
+    if name.lower().endswith(".sol"):
+        return "sol", name[:-4]
+    return "alias", name
+
+
+@mcp.tool()
+def xete_resolve(identifier: str) -> str:
+    """Resolve any xete identifier to one identity view. Pass a wallet address, a %alias, or a .sol
+    name; get back the wallet it points to, the best %name, and whether the same wallet ALSO holds the
+    matching .sol (the verified-identity / owns_both badge). Read-only addressing — it does not send,
+    receive, or decrypt anything. (@handle is not yet supported.)"""
+    kind, query = _classify_identifier(identifier)
+    if kind == "handle":
+        return json.dumps({"input": identifier, "kind": "handle", "supported": False,
+                           "note": "@handle resolution is not yet available"}, indent=2)
+    try:
+        if kind == "wallet":
+            rev = requests.get(_permit_url("/alias/reverse"), params={"wallet": query}, timeout=15).json()
+            return json.dumps({"input": identifier, "kind": "wallet", "wallet": query,
+                               "name": rev.get("name"), "owns_both": rev.get("owns_both", False),
+                               "names_count": rev.get("names_count")}, indent=2)
+        res = requests.get(_permit_url("/alias/resolve"), params={"name": query}, timeout=15).json()
+        wallet = res.get("sol_owner") if kind == "sol" else res.get("alias_owner")
+        return json.dumps({"input": identifier, "kind": kind, "name": query, "wallet": wallet,
+                           "alias_owner": res.get("alias_owner"), "sol_owner": res.get("sol_owner"),
+                           "owns_both": res.get("owns_both", False),
+                           "sol_mismatch": res.get("sol_mismatch")}, indent=2)
+    except Exception as e:
+        return json.dumps({"input": identifier, "error": str(e)[:300]})
+
+
 # ── confidential settlement tools (the "tab": agent->agent value transfer) ───────────
 # Deposit funds for a recipient (hidden on-chain), notify them encrypted over xete, they claim.
 # Non-custodial: only the depositor (reclaim) or beneficiary (claim) keys move funds. THIS agent's
