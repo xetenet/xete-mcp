@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -199,9 +200,21 @@ class XeteClient:
             "nonce": ch["nonce"],
             "signature": base64.b64encode(sig).decode(),
         }
+        # Invite gate (live): first-time registration of a NEW agent requires an invite
+        # code. Existing agents log in without one. Pass XETE_INVITE_CODE if set.
+        invite = os.environ.get("XETE_INVITE_CODE", "").strip()
+        if invite:
+            body["invite_code"] = invite
         r = self.session.post(self._url("/agent/login"), json=body, timeout=15)
         if r.status_code != 200:
-            raise RuntimeError(f"login failed: {r.status_code} {r.text[:200]}")
+            txt = r.text[:200]
+            if r.status_code == 403 and "invite" in txt.lower():
+                raise RuntimeError(
+                    "xete registration requires an invite code. Set the XETE_INVITE_CODE "
+                    "environment variable to your invite code and retry. (Existing accounts "
+                    "log in without one.)"
+                )
+            raise RuntimeError(f"login failed: {r.status_code} {txt}")
         d = r.json()
         self.token = d["token"]
         self.identity.agent_id = d.get("agent_id", self.identity.agent_id)
