@@ -1,0 +1,88 @@
+#!/bin/sh
+# Xete pre-commit gate — enforces doubt-driven-review artifacts on protected paths.
+# Install into a repo with: git config core.hooksPath .githooks
+# Protected paths are defined in .githooks/protected-paths (one pattern per line, extended regex).
+#
+# Also installed as .githooks/pre-merge-commit: git invokes it before creating a
+# non-fast-forward merge commit, closing the local "merge a feature branch into trunk
+# without any hook firing" bypass. Fast-forward merges run NO hook — that residual is
+# covered only by the server-side ddr-gate required check + branch protection.
+
+HOOKDIR="$(dirname "$0")"
+PATTERNS_FILE="$HOOKDIR/protected-paths"
+
+if [ ! -f "$PATTERNS_FILE" ]; then
+  echo "[xete-gate] WARNING: $PATTERNS_FILE missing; gate disabled." >&2
+  exit 0
+fi
+
+STAGED=$(git diff --cached --name-only)
+[ -z "$STAGED" ] && exit 0
+
+TOUCHED_PROTECTED=""
+while IFS= read -r pattern; do
+  case "$pattern" in ""|\#*) continue;; esac
+  MATCH=$(echo "$STAGED" | grep -E "$pattern" || true)
+  if [ -n "$MATCH" ]; then
+    TOUCHED_PROTECTED="$TOUCHED_PROTECTED$MATCH\n"
+  fi
+done < "$PATTERNS_FILE"
+
+if [ -z "$TOUCHED_PROTECTED" ]; then
+  exit 0
+fi
+
+# Branch-aware enforcement: feature branches commit freely (warn only);
+# the hard gate is at the merge boundary — direct commits to the trunk branch, and the
+# ddr-gate Actions check on PRs. This matches skills/git-discipline: atomic
+# WIP commits on a branch must not each demand a review artifact.
+#
+# The trunk branch list is configurable because not every Xete repo uses main/master
+# (xete-relay-clone's trunk is "Artery"). Set it per repo with:
+#   git config xete.trunk "Artery"        (space-separated list allowed)
+# Default: "main master".
+TRUNKS=$(git config --get xete.trunk || echo "main master")
+BRANCH=$(git symbolic-ref --short -q HEAD || echo detached)
+IS_TRUNK=0
+for T in $TRUNKS; do
+  [ "$BRANCH" = "$T" ] && IS_TRUNK=1
+done
+if [ "$IS_TRUNK" -eq 0 ]; then
+  echo "[xete-gate] Protected paths staged on branch '$BRANCH' — allowed (feature branch; trunk=$TRUNKS)." >&2
+  echo "[xete-gate] Reminder: merging to trunk requires reviews/DDR-*.md with Verdict: SHIP (enforced by the ddr-gate PR check)." >&2
+  exit 0
+fi
+
+# A protected path is staged on trunk. Require a staged DDR artifact in the same commit.
+DDR=$(echo "$STAGED" | grep -E '^reviews/DDR-.*\.md$' || true)
+
+if [ -z "$DDR" ]; then
+  echo "" >&2
+  echo "[xete-gate] COMMIT BLOCKED — protected paths staged without a review artifact:" >&2
+  printf "$TOUCHED_PROTECTED" | sed 's/^/  - /' >&2
+  echo "" >&2
+  echo "  Run the doubt-driven-review skill (CLAIM -> EXTRACT -> DOUBT -> RECONCILE)," >&2
+  echo "  write reviews/DDR-<name>-$(date +%Y%m%d).md with verdict SHIP, and stage it" >&2
+  echo "  in this commit. See skills/doubt-driven-review/SKILL.md." >&2
+  echo "" >&2
+  echo "  Emergency bypass (logged, use sparingly): git commit --no-verify" >&2
+  exit 1
+fi
+
+# DDR present — verify it carries a SHIP verdict and no open security gates.
+for f in $DDR; do
+  if [ -f "$f" ]; then
+    if ! grep -qiE '^##? *Verdict: *SHIP' "$f"; then
+      echo "[xete-gate] COMMIT BLOCKED — $f has no 'Verdict: SHIP' line." >&2
+      echo "  Reconcile all doubts and set the verdict, or split this commit." >&2
+      exit 1
+    fi
+    if grep -qiE 'OPEN-GATE' "$f"; then
+      echo "[xete-gate] COMMIT BLOCKED — $f contains OPEN-GATE markers from security review." >&2
+      exit 1
+    fi
+  fi
+done
+
+echo "[xete-gate] Protected-path commit allowed: DDR artifact present with SHIP verdict."
+exit 0
