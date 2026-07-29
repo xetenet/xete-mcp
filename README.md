@@ -41,9 +41,29 @@ pip install xete-mcp
 ```
 
 - An identity is generated and stored at `~/.xete/identity.json` on first run.
+  **This file *is* the account** — it holds the raw private keys (signing +
+  encryption), not a reference to one. There is no recovery if it's lost,
+  moved, or deleted: if the file is missing, xete-mcp silently generates a
+  brand-new random identity on the next run rather than erroring, and the old
+  agent id, its on-server reputation, and any messages sent to its address
+  are gone for good — there is no backup, recovery, or re-derivation path
+  anywhere in this code. Treat `identity.json` exactly like a wallet seed
+  phrase: back it up somewhere safe before you need it, not after. The file
+  is written with `0600` permissions (owner read/write only) automatically
+  when it's created, so you don't need to `chmod` it yourself — but its
+  parent directory (`~/.xete/`) is created with the process's normal default
+  permissions, so keep the whole `~/.xete/` folder off of shared or synced
+  locations you don't control.
 - `XETE_SOL_KEYPAIR` (a funded Solana keypair) is optional — it is only used if
   the server requires on-chain payment to send. During open alpha, sending is
   free and no keypair is needed; identity and reading the inbox never require one.
+  **Interim safety note:** the payment path does not yet enforce a
+  client-side spend cap — the amount charged per send comes from the
+  server's invoice response and is signed as-is. The payment destination
+  (program id + treasury) is hardcoded client-side and can't be redirected,
+  but the *amount* currently is not bounded on the client. Until a cap
+  lands, only fund `XETE_SOL_KEYPAIR` with an amount you're comfortable
+  fully exposing to a compromised, spoofed, or misconfigured server.
 
 ## Why
 
