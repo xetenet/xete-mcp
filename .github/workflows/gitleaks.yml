@@ -1,0 +1,90 @@
+name: gitleaks
+
+# Secret scanning for xete-mcp.
+#
+# This repo is PUBLIC. Anything that lands in a commit here is world-readable
+# the moment it is pushed, and a force-push does not un-publish it - it only
+# hides it from the branch tip. So the gate has to exist at commit time (the
+# secret scan in .githooks/pre-commit) AND at push/PR time (this workflow).
+# Neither one alone is sufficient: the hook can be skipped with --no-verify or
+# simply not installed (it needs `git config core.hooksPath .githooks`), and
+# this workflow only sees history that has already been written.
+#
+# Scope: the FULL commit history is rescanned on every run, not just the newly
+# pushed range. A range-only scan cannot see a secret that was introduced
+# before the range and is still live in the tree. History here is short and
+# gitleaks is fast; if this ever gets slow, narrow it with --log-opts rather
+# than dropping the history scan.
+#
+# Rules: .gitleaks.toml = upstream defaults + one added rule for raw ed25519 /
+# Solana keypair arrays, which upstream does not detect (see that file).
+#
+# Known-good exceptions live in .gitleaksignore, pinned by commit fingerprint,
+# each with a written justification. Inline `gitleaks:allow` comments are also
+# honoured - and are honoured by the local pre-commit hook too, so one
+# annotation satisfies both scanners.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitleaks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    name: scan history for secrets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Pinned version + checksum rather than a marketplace action:
+      # gitleaks-action@v2 requires a paid GITLEAKS_LICENSE for repos owned by
+      # a GitHub organization, which would leave this check permanently red.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          chmod +x "$RUNNER_TEMP/gitleaks-bin/gitleaks"
+          echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/gitleaks-bin/gitleaks" version
+
+      # --redact is mandatory, not cosmetic: Actions logs on a public repo are
+      # public, so an un-redacted finding would republish the secret it found.
+      - name: Scan git history
+        run: |
+          set -euo pipefail
+          gitleaks git . \
+            --config .gitleaks.toml \
+            --redact \
+            --no-banner \
+            --exit-code 1 \
+            --log-level info
+
+      # Catches anything sitting in the tree that the commit-diff scan above
+      # would not surface on its own (for example a file re-added by a merge
+      # resolution). Cheap, and it makes the tree state explicitly asserted.
+      - name: Scan working tree
+        if: always()
+        run: |
+          set -euo pipefail
+          gitleaks dir . \
+            --config .gitleaks.toml \
+            --redact \
+            --no-banner \
+            --exit-code 1 \
+            --log-level info
