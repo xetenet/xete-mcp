@@ -79,3 +79,18 @@ infra_monitor.py
 # exploit paths). Master lives in the private xete-agent-skills repo. Never
 # track it here - this repo is public or pushes to a public remote.
 benchmarks/
+
+# --- xete estate secret hygiene (2026-07-31, gitignore-estate) ---
+# Globs, deliberately NOT exact basenames: two real ed25519 private keys sat
+# untracked-and-unignored in a public repo root because the rule was the exact
+# name "identity.json". Backstopped by .githooks/pre-push.
+*keypair*.json
+id_ed25519*
+id_rsa*
+.env.*
+*SEEDPHRASE*
+*CREDENTIALS*
+!.env.example
+!.env.sample
+!.env.template
+# --- end xete estate secret hygiene ---
