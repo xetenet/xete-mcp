@@ -26,9 +26,51 @@ identity.json
 *.key
 *.pem
 
+# ops / coordination — LOCAL ONLY, never publish (echo internals, drafts,
+# the agent-to-agent transcript archive, the chat tool). The echo's *existence*
+# is public; its under-the-hood is not.
+echo_agent.py
+ECHO_AGENT_SECURITY_AUDIT.md
+TOOL_DESCRIPTION_PROPOSAL.md
+DIRECTORY_SUBMISSIONS_DRAFT.md
+xete_chat.py
+watch_inbox.py
+worker_watch.py
+manager_watch.py
+archive/
+
+# ops / coordination (cont.) — LOCAL ONLY agent tooling, drafts, logs, run docs.
+# Several contain keys/addresses/internal procedure; none belong in the public package.
+_msg_*
+_send_*
+_resend_*
+msg_*.py
+my_agent_*.py
+*_chat.py
+watch_*.py
+watch-*.out
+watch-*.err
+agentloop_demo.py
+mainnet_agent_loop.py
+devnet_faucet.py
+presigned_tx.py
+DEMO_CAPTURE.md
+MAINNET_GO.md
+TEAM_STARTUP_PROMPTS.md
+
 # OS / editor
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
 mcp-publisher.exe
+
+# secrets / PII hardening (audit finding mcp-keys, 2026-07-31)
+# The bare 'identity.json' rule above is an exact-basename match and missed
+# real key files such as Usersjshed.xeteclaude3-identity.json, which sat
+# untracked and UNIGNORED in this public repo's root. Broaden the net.
+*identity*.json
+*.xete*
+Usersjshed*
+infra_monitor.py
+*.pkl
