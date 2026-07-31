@@ -74,3 +74,8 @@ mcp-publisher.exe
 Usersjshed*
 infra_monitor.py
 *.pkl
+
+# Security: vulnerability-research corpus (BM-*.md documents live, unfixed
+# exploit paths). Master lives in the private xete-agent-skills repo. Never
+# track it here - this repo is public or pushes to a public remote.
+benchmarks/

@@ -1,8 +1,0 @@
-# BM: mpl-core CPIs omit the collection account — every plugin/transfer op on a collection-member Core asset fails on mainnet (Velvetfur 0x19)
-Source: xete-swap culprit da88aaf14 (blame boundary — pure code-motion; the omission originates where Core support was first written) fixed by 392176efe
-Paths: src/cpi.rs (mpl_core_plugin), src/escrowless.rs (list/fill/cancel_listing_core), src/order.rs (settle_signed_order_core)
-Class: logic (CPI interface gap — callee's conditional required account hardcoded to the None sentinel)
-Catchable at commit time: hindsight-only at the blamed commit; catchable at the commit that first added Core CPI support, where "collection (None sentinel)" was hardcoded and tests covered only standalone assets
-Gate mapping: NEW — CPI account-list completeness across asset variants: for every external-program CPI, enumerate the callee's optional/conditional accounts and prove each variant (standalone vs collection-member, Token vs Token-2022, ...) is either supported or explicitly rejected, with a test per variant
-Doubt prompt: mpl_core_plugin passes the core program id as the collection slot ("None sentinel") unconditionally — what happens when the asset is a member of a collection, which mpl-core requires be passed (and writable) for plugin ops? Is there any test using a collection-member asset?
-Real solution: mpl_core_plugin and the three Core handlers accept an optional trailing collection account (arity-detected, backward compatible), pass it writable for plugin ops / readonly for TransferV1, and require it be owned by mpl-core; new collection-member test reproduces the mainnet 0x19 and proves the fix.
