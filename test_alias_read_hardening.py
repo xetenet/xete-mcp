@@ -437,7 +437,12 @@ def test_a_read_only_settlement_tool_refuses_a_plain_http_rpc(net, monkeypatch):
     tool by design — nothing here signs or submits."""
     monkeypatch.setenv("XETE_RPC_URL", "http://evil.example.com")
 
-    got = out(server.xete_settle_status("00" * 16))
+    # 64 hex chars: since the settlement track merged, every escrow_id is validated as the
+    # FIRST statement of the tool (an over-length id makes solders raise a Rust
+    # PanicException that kills the stdio session). A 32-char dummy is now rejected there,
+    # before the RPC is ever looked at, which would make this test pass for the wrong
+    # reason. Verified by hand that the http:// refusal still fires with a valid id.
+    got = out(server.xete_settle_status("00" * 32))
 
     assert got["status"] == "failed"
     assert "XETE_RPC_URL" in got["error"]
