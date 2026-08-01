@@ -45,6 +45,33 @@ pip install xete-mcp
   xete server you connect to charges on-chain to send. Messaging on xete.net is free;
   identity and reading the inbox never require a keypair.
 
+### `%alias` endpoints
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `XETE_PERMIT_URL` | Base URL of the **permit server** — the separate service that prices a `%name` and co-signs the claim transaction. Must be `https://` unless the host is loopback. | value of `XETE_SERVER_URL` |
+| `XETE_SOLANA_RPC` | Solana RPC used to **read the `%alias` registry**, which is the source of truth for which wallet a name points to. | `https://solana-rpc.publicnode.com` |
+
+The permit server is **not trusted for who owns a name.** `%alias` ownership is read
+from the on-chain registry (`AXTREGuYbpgcWFbZy124jcWDN2nd7mtmrCDsUojktZrd`) over
+`XETE_SOLANA_RPC`; the permit server is asked only for what is genuinely its own — the
+price of a claim, and `.sol` side lookups. Anything sourced from it comes back under an
+`unverified` key, a reverse lookup's proposed name is re-checked against the chain
+before it is returned, and if the server ever names a different owner than the chain
+does, its answer is discarded and the disagreement is reported. Settlement
+(`xete_settle_create`) resolves a `%alias` recipient on-chain with **no** HTTP fallback:
+if the registry cannot be read, nothing is deposited.
+
+`XETE_PERMIT_URL` on plain `http://` is refused before any request is made, unless the
+host is loopback (`127.0.0.1`, `localhost`) — an interceptable answer decides where
+money goes. Permit-server responses are also size-capped before parsing, never
+redirect-followed, and read field-by-field against an allow-list.
+
+Note that `/alias/resolve` and `/alias/reverse` are not deployed on `xete.net` yet. The
+tools report that specifically (`reason: "endpoint_not_available"`) rather than failing
+with a parse error; `xete_alias_resolve` still returns the on-chain owner, because that
+does not go through the permit server at all.
+
 ## Spend limits
 
 Every tool that can spend SOL — `xete_send_message`, `xete_alias_claim` and

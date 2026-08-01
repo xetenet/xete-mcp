@@ -47,6 +47,19 @@
           "isSecret": true
         },
         {
+          "name": "XETE_PERMIT_URL",
+          "description": "Base URL of the %alias permit server — the separate service that prices a %name and co-signs the claim transaction. Defaults to XETE_SERVER_URL. Must be https:// unless the host is loopback. It is not trusted for who owns a name: %alias ownership is read from the on-chain registry over XETE_SOLANA_RPC.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "XETE_SOLANA_RPC",
+          "description": "Solana RPC used to read the %alias registry, the source of truth for which wallet a %name points to. Defaults to https://solana-rpc.publicnode.com (api.mainnet-beta throttles reads).",
+          "isRequired": false,
+          "isSecret": false,
+          "default": "https://solana-rpc.publicnode.com"
+        },
+        {
           "name": "XETE_SPEND_MAX_LAMPORTS",
           "description": "Client-side spend limit: the most a single transaction may cost, in lamports. Enforced before anything is signed. Unset means the conservative default, never unlimited.",
           "isRequired": false,
