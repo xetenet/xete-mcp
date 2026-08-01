@@ -67,8 +67,8 @@ mcp-publisher.exe
 
 # secrets / PII hardening (audit finding mcp-keys, 2026-07-31)
 # The bare 'identity.json' rule above is an exact-basename match and missed
-# real key files such as Usersjshed.xeteclaude3-identity.json, which sat
-# untracked and UNIGNORED in this public repo's root. Broaden the net.
+# real key files whose names carry a host/user prefix before "-identity.json",
+# which sat untracked and UNIGNORED in this public repo's root. Broaden the net.
 *identity*.json
 *.xete*
 Usersjshed*
