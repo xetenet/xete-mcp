@@ -34,11 +34,18 @@ identify. Full reasoning in src/xete_mcp/txguard.py and src/xete_mcp/signguard.p
   XETE_ALIAS_TX_TOLERANCE_LAMPORTS  how far above the quoted price the claim transaction
                                     may debit, covering rent + fees a quote excludes
                                                                      (default 5000000)
-  XETE_ALIAS_TREASURY               the only account a claim's price may be paid into
-                                    (defaults to the live xete treasury)
+  XETE_ALIAS_TREASURY               override for the only account a claim's price may be
+                                    paid into. Unset, it is READ from the registry's
+                                    config account (config.names_wallet) — it is
+                                    rotatable, and a hardcoded one went stale
+  XETE_ALIAS_MAX_PRIORITY_FEE_LAMPORTS  ceiling on the priority fee a claim may
+                                    authorise, independent of the price tolerance
+                                                                     (default 100000)
   XETE_ALIAS_REQUIRE_SIMULATION     0 to let a claim proceed when the RPC could not
-                                    simulate it; the full ceiling is then charged
-                                    against the spend limits    (default 1, fail closed)
+                                    answer (simulation, and the config read that
+                                    supplies the treasury); the full ceiling is then
+                                    charged against the spend limits
+                                                                (default 1, fail closed)
 """
 from __future__ import annotations
 
@@ -259,7 +266,7 @@ def xete_alias_reverse(wallet: str) -> str:
 
 
 @mcp.tool()
-def xete_alias_claim(name: str) -> str:
+def xete_alias_claim(name: str, max_price_lamports: int = 0) -> str:
     """Claim a xete %name for THIS agent — its identity wallet (see xete_my_identity →
     wallet_pubkey) becomes the owner. Runs the full flow: get a challenge, sign it with your
     identity key, receive the permit co-signed transaction, add your signature, submit it
@@ -269,20 +276,53 @@ def xete_alias_claim(name: str) -> str:
     paid, the tx signature, and the settlement status. You must already have a xete identity
     registered (claiming binds the name to your agent).
 
+    Pass max_price_lamports to cap what you are willing to pay: call xete_alias_quote first
+    and echo the figure it returns. Leave it 0 only if any price under your spend limit is
+    acceptable — the price is otherwise chosen entirely by the permit server, and the quote
+    tool and the claim are two separate calls that can disagree.
+
     The permit server's transaction is DECODED and allow-listed before your key touches it:
-    the registry instruction must be the CLAIM operation, must name the name you asked for in
-    its own data, must carry a price equal to the quote, and must put your wallet, the name's
-    account and the xete treasury in the positions a claim puts them in. Top-level System
-    instructions and durable-nonce constructions are refused outright. The network is then
-    asked what the transaction really moves, and a claim that cannot be simulated is refused
-    rather than signed. Anything else is refused unsigned, and the result reports what was
-    verified."""
+    the registry instruction must be the CLAIM operation, must name the canonical form of the
+    name you asked for in its own data, must carry a price equal to the quote, must bind YOUR
+    agent id (the 32-byte record key), and must put your wallet, the name's account and the
+    registry's own treasury (read from its config account on chain) in the positions a claim
+    puts them in. Top-level System instructions, durable-nonce constructions and an outsized
+    priority fee are refused outright. The network is then asked what the transaction really
+    moves, and a claim that cannot be simulated is refused rather than signed. Anything else
+    is refused unsigned, and the result reports what was verified."""
     # Load the identity directly: claim depends on the permit server + its relay DB, NOT on the
     # messaging relay being reachable — so don't force a messaging-server login here.
     ident = load_or_create_identity(IDENTITY_PATH)
     pubkey = ident.pubkey_b58
     try:
         import base58
+        import hashlib
+
+        # WHICH AGENT the name will point at. The claim instruction's 32-byte "record
+        # key" is the on-chain agent_id (permit cosign.rs ClaimParts.agent_id ->
+        # wire::data_claim), the permit server's rule that a wallet may only bind the
+        # agent_id it owns (auth.rs) is enforced by the party txguard exists to
+        # distrust, and the program does not check the field at all. Unpinned, a
+        # hostile permit server binds %yourname to ITS agent, at our expense.
+        # Mirrors permit auth::agent_id_bytes = sha256(registered agent_id string).
+        agent_id = ident.agent_id
+        if not agent_id:
+            # The keystore only carries agent_id if something wrote it there; the relay
+            # assigns it at login. Recover it rather than refuse a legitimate claim.
+            try:
+                agent_id = _get_client().identity.agent_id or ""
+            except Exception:
+                agent_id = ""
+        if not agent_id:
+            return json.dumps({
+                "status": "refused", "name": name, "signed": False, "submitted": False,
+                "reason": "REFUSED: this agent's xete agent id is not known locally, and it is "
+                          "what a claim writes on chain as the identity %{} will resolve to. "
+                          "Claiming without pinning it would let the permit server bind the "
+                          "name to an agent of its choosing. Register/log in first (call "
+                          "xete_my_identity, or send a message) and retry.".format(name),
+            }, indent=2)
+        expect_record_key = hashlib.sha256(agent_id.encode("utf-8")).digest()
 
         ch = requests.post(_permit_url("/alias/claim/challenge"), json={"pubkey": pubkey}, timeout=15).json()
         if "message" not in ch or "nonce" not in ch:
@@ -318,6 +358,24 @@ def xete_alias_claim(name: str) -> str:
         quoted = int(claim.get("price_lamports") or 0)
         tx_b64 = claim.get("transaction")
 
+        # THE CALLER'S OWN CEILING. `price == quoted` only makes the permit server
+        # self-consistent: quote and claim are separate calls, and nothing on chain
+        # bounds the price either, so without this the only limit is the blanket
+        # per-transaction spend cap rather than a decision anyone made about THIS name.
+        cap = int(max_price_lamports or 0)
+        if cap < 0:
+            return json.dumps({"status": "refused", "name": name, "signed": False,
+                               "submitted": False,
+                               "reason": f"REFUSED: max_price_lamports={cap} is negative."},
+                              indent=2)
+        if cap and quoted > cap:
+            return json.dumps({
+                "status": "refused", "name": name, "signed": False, "submitted": False,
+                "price_lamports": quoted, "max_price_lamports": cap,
+                "reason": f"REFUSED: the permit server wants {quoted} lamports to claim %{name}, "
+                          f"above the {cap} you allowed. Nothing was signed.",
+            }, indent=2)
+
         # ── DECODE BEFORE SIGNING ───────────────────────────────────────────────────
         # Allow-list every instruction against what an alias claim is allowed to be, and
         # bound what the transaction can visibly take from us. Raises TransactionRejected
@@ -328,6 +386,10 @@ def xete_alias_claim(name: str) -> str:
             expect_fee_payer=Pubkey.from_string(pubkey),
             expect_name=name,
             quoted_lamports=quoted,
+            expect_record_key=expect_record_key,
+            # config.names_wallet, read from chain. It is rotatable, and the hardcoded
+            # value this replaced had already gone stale into a total outage.
+            treasury=txguard_mod.treasury_for_claim(RPC_URL),
         )
 
         # ── AND ASK THE NETWORK WHAT IT ACTUALLY MOVES ──────────────────────────────
@@ -355,10 +417,26 @@ def xete_alias_claim(name: str) -> str:
         onchain = rpc.send_raw_transaction(bytes(tx)).value
         # wait for settlement, then ask the permit server to verify the on-chain owner
         import time as _t
+        chain_error = None
         for _ in range(30):
             _t.sleep(0.5)
             st = rpc.get_signature_statuses([onchain]).value[0]
-            if st and st.confirmation_status:
+            if st is None:
+                continue
+            # `err` is the chain's own verdict and outranks anything the permit server
+            # says about its own claim. Without this the ONLY success signal was
+            # /alias/claim/confirm, so a transaction that landed with an
+            # InstructionError was still reported as `status: claimed`.
+            chain_error = getattr(st, "err", None)
+            if chain_error is not None:
+                return json.dumps({
+                    "status": "failed_on_chain", "name": name, "owner": pubkey,
+                    "tx_signature": str(onchain), "chain_error": str(chain_error)[:300],
+                    "verified_before_signing": inspection.as_dict(),
+                    "detail": "the transaction was submitted and the network rejected it; the "
+                              "name was NOT claimed and the fee was spent.",
+                }, indent=2)
+            if st.confirmation_status:
                 break
         conf = requests.post(_permit_url("/alias/claim/confirm"),
                              json={"pubkey": pubkey, "name": name}, timeout=20).json()

@@ -16,7 +16,16 @@ Every expectation is fetched from a source OTHER than the transaction under test
   quoted_lamports    the inner CPI System transfer actually observed in the
                      transaction's METADATA — the lamports that really moved, which the
                      instruction data is then required to agree with. Zero when the
-                     claim moved nothing.
+                     claim moved nothing;
+  treasury           the DESTINATION of that inner CPI transfer, read from the
+                     transaction's metadata — i.e. where the money provably went, not
+                     what the instruction's account list claims. txguard now reads the
+                     treasury from config.names_wallet, and that field is ROTATABLE (it
+                     was rotated on 2026-07-30), so replaying a historical claim against
+                     today's value would fail for a reason that has nothing to do with
+                     the guard. A free claim moves nothing, so it offers no independent
+                     source at all and is replayed with the treasury unpinned, which the
+                     output says.
 
 Read-only. It makes getSignaturesForAddress / getTransaction / getAccountInfo calls and
 signs nothing.
@@ -157,7 +166,10 @@ def main() -> int:
                 print(f"SKIPPED   {entry['signature'][:16]}  %{name} has changed owner since "
                       "this claim; the record can no longer supply the expected fee payer")
                 continue
-            moved = 0
+            # Where the money PROVABLY went, from the executed inner instructions —
+            # not from the account list the guard is being asked to validate. A free
+            # claim moves nothing and therefore names no treasury independently.
+            treasury, moved = None, 0
             for inner in meta.get("innerInstructions") or []:
                 for iix in inner["instructions"]:
                     if keys[iix["programIdIndex"]] != SYSTEM:
@@ -165,7 +177,8 @@ def main() -> int:
                     d = base58.b58decode(iix["data"])
                     if len(d) == 12 and struct.unpack("<I", d[:4])[0] == 2:
                         src, dst = (keys[a] for a in iix["accounts"])
-                        if src == owner and dst == txguard.MAINNET_ALIAS_TREASURY:
+                        if src == owner:
+                            treasury = dst
                             moved += struct.unpack("<Q", d[4:12])[0]
 
             rebuilt = rebuild(program, data, accounts, signers, writables,
@@ -173,7 +186,8 @@ def main() -> int:
             try:
                 _, report = txguard.inspect_alias_claim(
                     rebuilt, expect_fee_payer=Pubkey.from_string(owner),
-                    expect_name=name, quoted_lamports=moved)
+                    expect_name=name, quoted_lamports=moved,
+                    treasury=Pubkey.from_string(treasury) if treasury else None)
             except txguard.TransactionRejected as e:
                 rejected += 1
                 print(f"REJECTED  {entry['signature'][:16]}  %{name}\n          {e}")
@@ -181,7 +195,8 @@ def main() -> int:
                 accepted += 1
                 print(f"ACCEPTED  {entry['signature'][:16]}  %{report.claim_name:<20} "
                       f"price={report.claim_price_lamports:<10} moved={moved:<10} "
-                      f"static_debit={report.static_debit_lamports}")
+                      f"static_debit={report.static_debit_lamports} "
+                      f"treasury={report.treasury or '<unpinned: free claim moved nothing>'}")
 
     print(f"\n{accepted} real claims accepted, {rejected} rejected, "
           f"{skipped} non-claim registry operations skipped.")

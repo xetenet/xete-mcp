@@ -41,13 +41,29 @@ from xete_mcp.signguard import (
 from xete_mcp.txguard import TransactionRejected
 
 ALIAS_PROGRAM = Pubkey.from_string(txguard.MAINNET_ALIAS_PROGRAM)
-TREASURY = Pubkey.from_string(txguard.MAINNET_ALIAS_TREASURY)
+# config.names_wallet as the live registry carries it today. There is no longer a
+# treasury constant in txguard to import — the treasury is READ from the config account
+# (it was rotated on 2026-07-30 and the constant that used to live here had gone stale
+# into a total outage), so these offline unit tests pin it the supported offline way:
+# the XETE_ALIAS_TREASURY override, set by the autouse fixture below.
+TREASURY = Pubkey.from_string("9zHPVcHhBeZBCLcw8NMWvAQqLWmMNBrcuiYVwyUcwFds")
 CONFIG = txguard.config_pda(ALIAS_PROGRAM)
 SYSTEM = txguard.SYSTEM_PROGRAM
 CB = txguard.COMPUTE_BUDGET
 BLOCKHASH = Hash.default()
 NAME = "mcptestname"
 RECORD_KEY = bytes([5] * 32)   # the 32-byte record field; not the owner (see test below)
+
+
+@pytest.fixture(autouse=True)
+def _pin_treasury_offline(monkeypatch):
+    """These are offline unit tests: no RPC, so no config account to read.
+
+    Setting the documented override is how a caller pins a treasury without a network,
+    and it keeps every "the money may only land HERE" assertion below testing the same
+    property it always tested — only the source of the pinned value changed.
+    """
+    monkeypatch.setenv(txguard.ENV_TREASURY, str(TREASURY))
 
 
 # ── builders that reproduce the real shapes seen on mainnet ──────────────────────────
@@ -284,7 +300,7 @@ def test_unknown_program_is_rejected():
 def test_different_name_is_rejected():
     me = _claimer()
     tx_b64 = _encode([_alias_ix(me.pubkey(), "someoneelse")], me.pubkey())
-    with pytest.raises(TransactionRejected, match="registers %someoneelse"):
+    with pytest.raises(TransactionRejected, match='registers the name "someoneelse"'):
         _inspect(tx_b64, payer=me.pubkey(), name=NAME)
 
 
@@ -294,7 +310,7 @@ def test_right_name_in_the_data_but_a_different_pda_is_rejected():
     me = _claimer()
     other = txguard.alias_pda(ALIAS_PROGRAM, "someoneelse")
     tx_b64 = _encode([_alias_ix(me.pubkey(), pda=other)], me.pubkey())
-    with pytest.raises(TransactionRejected, match="the registry account for %"):
+    with pytest.raises(TransactionRejected, match="the registry account for the name"):
         _inspect(tx_b64, payer=me.pubkey(), name=NAME)
 
 
@@ -477,7 +493,11 @@ def _mainnet_tx(data: bytes, accounts: list[AccountMeta], payer: Pubkey) -> str:
     return base64.b64encode(bytes(Transaction.populate(msg, sigs))).decode()
 
 
-def test_a_real_mainnet_claim_is_accepted():
+def test_a_real_mainnet_claim_is_accepted(monkeypatch):
+    # The treasury in force when this claim landed. config.names_wallet was rotated on
+    # 2026-07-30; replaying a 2026-07 claim against today's value would be an anachronism,
+    # so the historical treasury is pinned explicitly for this one replay.
+    monkeypatch.setenv(txguard.ENV_TREASURY, str(BOLT_TREASURY))
     tx_b64 = _mainnet_tx(BOLT_IX_DATA, [
         AccountMeta(BOLT_OWNER, True, True),
         AccountMeta(BOLT_AUTHORITY, True, False),
@@ -672,6 +692,7 @@ def test_an_unpinnable_treasury_is_reported_rather_than_assumed(monkeypatch):
     """On a local validator there is no honest default; the inspection says so instead
     of silently accepting any destination while looking like it checked."""
     local = Keypair()
+    monkeypatch.delenv(txguard.ENV_TREASURY, raising=False)
     monkeypatch.setenv(txguard.ENV_ALIAS_PROGRAM, str(local.pubkey()))
     me, anyone = _claimer(), Keypair().pubkey()
     ix = Instruction(program_id=local.pubkey(), data=_claim_data(),
@@ -698,29 +719,37 @@ def test_a_repeated_compute_budget_op_is_rejected():
 
 
 def test_the_record_key_is_reported_and_can_be_pinned():
-    """The 32-byte field a claim writes into the record is not the owner (the owner is
-    the payer account), and this client cannot yet say what it SHOULD be. So it is
-    surfaced in the report, and callers that learn the answer can pin it without another
-    change to this module."""
+    """The 32-byte field a claim writes into the record is the on-chain agent_id (permit
+    cosign.rs ClaimParts.agent_id -> wire::data_claim). Nothing on chain validates it, so
+    it is pinned here or nowhere; `record_key_pinned` says which happened rather than
+    letting the report imply a check that did not run."""
     me = _claimer()
     tx_b64 = _encode([_alias_ix(me.pubkey())], me.pubkey())
     _, report = _inspect(tx_b64, payer=me.pubkey())
     assert report.record_key == str(Pubkey.from_bytes(RECORD_KEY))
+    assert report.record_key_pinned is False
+    _, pinned = _inspect(tx_b64, payer=me.pubkey(), expect_record_key=RECORD_KEY)
+    assert pinned.record_key_pinned is True
     _inspect(tx_b64, payer=me.pubkey(), expect_record_key=RECORD_KEY)
-    with pytest.raises(TransactionRejected, match="would write record key"):
+    with pytest.raises(TransactionRejected, match="would bind %mcptestname to agent id"):
         _inspect(tx_b64, payer=me.pubkey(), expect_record_key=bytes(32))
 
 
 def test_the_pda_is_derived_from_the_matched_name_bytes():
-    """The name is matched as BYTES against the user's candidates, and the PDA is
-    derived from those same bytes — no decode/re-encode step sits between the check and
-    the derivation."""
+    """The PDA is derived from the BYTES that were matched — no decode/re-encode step
+    sits between the check and the derivation.
+
+    This used to be demonstrated with a non-ASCII name. It no longer can be, and that is
+    the point: the only name a claim may carry is the canonical registrable form, which
+    is ASCII by construction, so the round trip that this test guarded against cannot
+    exist. The non-ASCII case is now refused before the transaction is even parsed —
+    asserted directly below."""
     me = _claimer()
-    tx_b64 = _encode([_alias_ix(me.pubkey(), "Ünïcode")], me.pubkey())
-    _, report = _inspect(tx_b64, payer=me.pubkey(), name="Ünïcode")
-    assert report.alias_pda == str(txguard.alias_pda(ALIAS_PROGRAM, "Ünïcode".encode()))
-    with pytest.raises(TransactionRejected, match="registers %"):
-        _inspect(tx_b64, payer=me.pubkey(), name="Unicode")
+    tx_b64 = _encode([_alias_ix(me.pubkey(), NAME)], me.pubkey())
+    _, report = _inspect(tx_b64, payer=me.pubkey(), name=NAME)
+    assert report.alias_pda == str(txguard.alias_pda(ALIAS_PROGRAM, NAME.encode()))
+    with pytest.raises(TransactionRejected, match="not a claimable"):
+        _inspect(tx_b64, payer=me.pubkey(), name="Ünïcode")
 
 
 def test_tolerance_is_configurable_and_fails_closed(monkeypatch):

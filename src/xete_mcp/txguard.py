@@ -48,9 +48,11 @@ WHAT IS CHECKED
   * every other required signer has ALREADY signed (the permit server co-signature),
     so we are not the missing piece of some other party's transaction;
   * exactly one alias-registry instruction, it is discriminator 0x02 (claim) and
-    nothing else, it names the name we asked for IN ITS DATA, its trailing price u64
-    equals the price we were quoted, and its six accounts are in the positions a claim
-    puts them in — including the treasury the money lands in;
+    nothing else, it names the name we asked for IN ITS DATA — the ONE canonical byte
+    string, not a family of spellings — its trailing price u64 equals the price we were
+    quoted, its 32-byte record key is the agent_id THIS agent owns, and its six accounts
+    are in the positions a claim puts them in — including the treasury the money
+    lands in;
   * NO top-level SystemProgram instruction of any kind. A real claim has none, so
     permitting one buys zero compatibility and costs an unrestricted transfer to an
     address of the server's choosing. Transfer, CreateAccount, Assign, the nonce
@@ -64,10 +66,24 @@ WHAT IS CHECKED
     authorise is computed and counted. SetComputeUnitPrice is a lamport-draining
     instruction wearing a harmless-looking hat: price is in micro-lamports per compute
     unit, so an unbounded price times a 1.4M compute-unit limit empties a wallet
-    without a single "transfer" appearing anywhere;
+    without a single "transfer" appearing anywhere. That fee is ALSO bounded on its
+    own, not merely counted towards the price tolerance: a fee is not rent, simulation
+    cannot see it (simulateTransaction charges no fees), and every real claim on
+    mainnet paid exactly 10,000 lamports with no compute-budget instruction at all;
   * the total this transaction can debit from us — the claim price the data itself
     declares, plus the worst-case fee — is bounded by the quoted price plus a
     tolerance.
+
+WHERE THE TREASURY COMES FROM
+It is `config.names_wallet` — bytes 64..96 of the registry's config PDA — read from
+chain, NOT a constant in this file. An earlier version pinned a hardcoded address and
+justified it with "the config account does not carry a treasury field". That was simply
+wrong: the account is `admin(32) | permit_authority(32) | names_wallet(32) | bump(1)`,
+the program rejects any other account in slot 4 (mainnet simulateTransaction:
+`InstructionError InvalidArgument` for the old address, `err: None` for
+`config.names_wallet`), and the value was rotated on 2026-07-30 — so the constant
+turned the guard into a total outage of `xete_alias_claim` rather than a protection.
+`XETE_ALIAS_TREASURY` remains as an explicit override and is how offline tests pin.
 
 WHAT STATIC DECODING CANNOT SEE
 The PDA rent is funded by a cross-program invocation and is not visible in the
@@ -100,15 +116,21 @@ CONFIGURATION (environment)
   XETE_ALIAS_PROGRAM                  alias registry program id. Exists for
                                       local-validator testing. Never point it at an
                                       untrusted program with a funded key.
-  XETE_ALIAS_TREASURY                 the account a claim's price is allowed to land
-                                      in. Defaults to the live mainnet treasury when
-                                      the program is the live registry.
+  XETE_ALIAS_TREASURY                 override for the account a claim's price is
+                                      allowed to land in. Unset (the normal case) the
+                                      treasury is read from `config.names_wallet` on
+                                      chain.
   XETE_ALIAS_TX_TOLERANCE_LAMPORTS    how much ABOVE the quoted price the claim
                                       transaction may debit, covering the account rent
                                       and network fees a quote excludes.
                                       default 5000000 (0.005 SOL)
+  XETE_ALIAS_MAX_PRIORITY_FEE_LAMPORTS  hard ceiling on the priority fee a claim may
+                                      authorise, applied independently of the price
+                                      tolerance. default 100000 (0.0001 SOL); every
+                                      real mainnet claim paid 0.
   XETE_ALIAS_REQUIRE_SIMULATION       0 to allow a claim to proceed when the RPC could
-                                      not simulate it. Default 1 (fail closed).
+                                      not answer — simulation, and the config read that
+                                      supplies the treasury. Default 1 (fail closed).
 """
 from __future__ import annotations
 
@@ -117,6 +139,7 @@ import hashlib
 import hmac
 import math
 import os
+import string
 import struct
 from dataclasses import dataclass, field
 
@@ -130,17 +153,24 @@ COMPUTE_BUDGET = Pubkey.from_string("ComputeBudget111111111111111111111111111111
 # The live %alias registry. Hardcoded so a compromised permit server cannot redirect
 # the claim at a program of its choosing.
 MAINNET_ALIAS_PROGRAM = "AXTREGuYbpgcWFbZy124jcWDN2nd7mtmrCDsUojktZrd"
-# The account every one of the registry's claims has paid into (11/11 in the program's
-# whole history). Pinned so a hostile permit server cannot point the price at itself:
-# the price moves by CPI to whatever sits in account position 4, and the config account
-# does not carry a treasury field, so the client is the only thing that can bound it.
-MAINNET_ALIAS_TREASURY = "CmraiWB8rTfR4td7iC7TmvrjMGbJv1nqkvJsbz2MJaDq"
+
+# The registry's config account: admin(32) | permit_authority(32) | names_wallet(32) |
+# bump(1). `names_wallet` is the treasury — the ONLY account the program will let a
+# claim pay — and it is rotatable by the admin (it was rotated on 2026-07-30). It is
+# therefore READ, never hardcoded. Offsets mirror xete-alias-client's config_layout.
+CONFIG_ACCOUNT_LEN = 97
+CONFIG_NAMES_WALLET_OFFSET = 64
 
 ENV_ALIAS_PROGRAM = "XETE_ALIAS_PROGRAM"
 ENV_TREASURY = "XETE_ALIAS_TREASURY"
 ENV_TOLERANCE = "XETE_ALIAS_TX_TOLERANCE_LAMPORTS"
+ENV_MAX_PRIORITY_FEE = "XETE_ALIAS_MAX_PRIORITY_FEE_LAMPORTS"
 ENV_REQUIRE_SIMULATION = "XETE_ALIAS_REQUIRE_SIMULATION"
 DEFAULT_TOLERANCE_LAMPORTS = 5_000_000   # 0.005 SOL — alias PDA rent is ~0.00163 SOL
+# Every claim in the registry's history paid a 10,000-lamport fee (two signatures, zero
+# compute-budget instructions), so this ceiling costs nothing in compatibility and takes
+# away the one drain the mandatory simulation cannot see.
+DEFAULT_MAX_PRIORITY_FEE_LAMPORTS = 100_000
 
 # ── the claim instruction, as it appears on mainnet ──────────────────────────────────
 # 02 | u8 name_len | name | 32-byte record key | u64 price (little-endian)
@@ -175,6 +205,10 @@ _LAMPORTS_PER_SIGNATURE = 5_000
 MAX_INSTRUCTIONS = 8
 MAX_ACCOUNT_KEYS = 32
 MAX_IX_DATA_BYTES = 512
+
+# Default for `inspect_alias_claim(treasury=...)`: "resolve XETE_ALIAS_TREASURY and
+# nothing else". Distinct from None, which means "genuinely unpinned, and say so".
+TREASURY_FROM_ENV = object()
 
 
 class TransactionRejected(RuntimeError):
@@ -218,12 +252,112 @@ def tolerance_lamports() -> int:
     return value
 
 
-def treasury_pubkey(program: Pubkey) -> Pubkey | None:
+def max_priority_fee_lamports() -> int:
+    raw = os.environ.get(ENV_MAX_PRIORITY_FEE, "").strip()
+    if not raw:
+        return DEFAULT_MAX_PRIORITY_FEE_LAMPORTS
+    try:
+        value = int(raw)
+    except ValueError:
+        raise TransactionRejected(
+            f"TRANSACTION REJECTED (bad configuration): {ENV_MAX_PRIORITY_FEE}={raw!r} is not a "
+            f"whole number of lamports. Unset it to fall back to "
+            f"{DEFAULT_MAX_PRIORITY_FEE_LAMPORTS}. Nothing was signed."
+        ) from None
+    if value < 0:
+        raise TransactionRejected(
+            f"TRANSACTION REJECTED (bad configuration): {ENV_MAX_PRIORITY_FEE}={value} is "
+            "negative. Nothing was signed."
+        )
+    return value
+
+
+def _rpc_call(rpc_url: str, method: str, params: list, *, timeout: int = 20):
+    """One JSON-RPC call, retried on transport failure. Raises RuntimeError on giving up.
+
+    The default endpoint rate-limits, and a 429 that turned an RPC-backed check off
+    would be the cheapest attack on this whole module. Retry before giving up, and when
+    we do give up the caller fails closed. A node that answers with an `error` object
+    has answered — that is not retried.
+    """
+    import time
+
+    import requests
+
+    attempts, last = 3, None
+    for attempt in range(attempts):
+        try:
+            r = requests.post(rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": method,
+                                             "params": params}, timeout=timeout)
+            if r.status_code in (429, 502, 503, 504):
+                last = f"http {r.status_code}"
+            else:
+                r.raise_for_status()
+                body = r.json()
+                if "error" in body:                      # a real answer: do not retry it
+                    raise RuntimeError(f"{method} rpc error: {str(body['error'])[:200]}")
+                return body["result"]
+        except RuntimeError:
+            raise
+        except Exception as e:                           # transport-level, retryable
+            last = e
+        if attempt < attempts - 1:
+            time.sleep(0.4 * (attempt + 1))
+    raise RuntimeError(f"{method}: {last}")
+
+
+def read_config_names_wallet(rpc_url: str, program: Pubkey, *, timeout: int = 15) -> Pubkey:
+    """Read `config.names_wallet` — the only account the program lets a claim pay.
+
+    The config PDA is DERIVED from the pinned program id, so a hostile permit server
+    cannot substitute a different config; the only party that can lie here is the RPC,
+    and a lie costs it nothing but a failed transaction, because the program compares
+    slot 4 against the real config itself.
+
+    Raises RuntimeError if the account cannot be read or is not the shape the registry
+    writes. The caller decides whether that is fatal.
+    """
+    key = config_pda(program)
+    result = _rpc_call(rpc_url, "getAccountInfo",
+                       [str(key), {"encoding": "base64", "commitment": "confirmed"}],
+                       timeout=timeout)
+    value = (result or {}).get("value")
+    if not value:
+        raise RuntimeError(f"the registry's config account {key} does not exist")
+    if str(value.get("owner")) != str(program):
+        raise RuntimeError(
+            f"the registry's config account {key} is owned by {value.get('owner')}, "
+            f"not {program}")
+    encoded = value.get("data")
+    if not isinstance(encoded, list) or not encoded:
+        raise RuntimeError("getAccountInfo did not return base64 account data")
+    try:
+        data = base64.b64decode(encoded[0], validate=True)
+    except Exception as e:
+        raise RuntimeError(f"config account data is not valid base64 ({e})") from None
+    if len(data) != CONFIG_ACCOUNT_LEN:
+        raise RuntimeError(
+            f"config account {key} is {len(data)} bytes, not the {CONFIG_ACCOUNT_LEN} the "
+            "registry writes (admin | permit_authority | names_wallet | bump)")
+    off = CONFIG_NAMES_WALLET_OFFSET
+    return Pubkey.from_bytes(data[off:off + 32])
+
+
+def treasury_pubkey(program: Pubkey, *, rpc_url: str = "", read=None) -> Pubkey | None:
     """Where a claim's price is allowed to land, or None if it cannot be known.
 
-    None happens only when XETE_ALIAS_PROGRAM points somewhere other than the live
-    registry (local-validator testing) and no treasury was configured — there is no
-    honest default to pin in that case. The inspection reports which happened.
+    Resolution order:
+      1. `XETE_ALIAS_TREASURY` — an explicit operator override, and how offline tests
+         and the historical-claim replay pin a value without a network.
+      2. `config.names_wallet`, read from chain over `rpc_url`. This is the real
+         answer: the program enforces exactly this account and the admin can rotate it.
+      3. None — unpinned, and reported as such, so nothing silently pretends to have
+         checked. `rpc_url=""` (offline callers) lands here.
+
+    A chain read that FAILS is fatal when RPC checks are required (the default): the
+    claim is refused rather than signed against an unknown treasury. With
+    XETE_ALIAS_REQUIRE_SIMULATION=0 the operator has already said an unanswering RPC
+    may not stop a claim, so it degrades to None instead.
     """
     raw = os.environ.get(ENV_TREASURY, "").strip()
     if raw:
@@ -234,9 +368,27 @@ def treasury_pubkey(program: Pubkey) -> Pubkey | None:
                 f"TRANSACTION REJECTED (bad configuration): {ENV_TREASURY}={raw!r} is not a "
                 f"valid Solana address ({e}). Nothing was signed."
             ) from None
-    if str(program) == MAINNET_ALIAS_PROGRAM:
-        return Pubkey.from_string(MAINNET_ALIAS_TREASURY)
-    return None
+    if not rpc_url:
+        return None
+    try:
+        return (read or read_config_names_wallet)(rpc_url, program)
+    except Exception as e:
+        if simulation_required():
+            raise TransactionRejected(
+                f"TRANSACTION REJECTED: the registry's config account could not be read "
+                f"({str(e)[:200]}), so the account this claim is allowed to pay is unknown. "
+                "The treasury is config.names_wallet, it is rotatable, and guessing it is how "
+                "this client once refused every claim the live program would accept. Point "
+                f"XETE_RPC_URL at a working node and retry, set {ENV_TREASURY} if you know the "
+                f"current treasury, or set {ENV_REQUIRE_SIMULATION}=0 to proceed with the "
+                "treasury unpinned. Nothing was signed."
+            ) from None
+        return None
+
+
+def treasury_for_claim(rpc_url: str, program: Pubkey | None = None) -> Pubkey | None:
+    """The treasury to hand `inspect_alias_claim`. One `getAccountInfo`, or the env pin."""
+    return treasury_pubkey(program or alias_program_id(), rpc_url=rpc_url)
 
 
 def simulation_required() -> bool:
@@ -269,20 +421,79 @@ def config_pda(program: Pubkey) -> Pubkey:
     return Pubkey.find_program_address([b"config"], program)[0]
 
 
-def _name_candidates(name: str) -> list[str]:
-    """The names a permit server may legitimately have normalised `name` to.
+# A registrable name, exactly as xete-alias-client::valid_name defines it: 1..32 bytes
+# of lowercase ASCII, digits and underscore. The PROGRAM enforces this (mainnet
+# simulateTransaction: b'ZzAtkprobe3', b'%zzatkprobe2' and b'zz atk4' all come back
+# InvalidInstructionData), so a claim of anything else can only ever burn a fee.
+_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_")
 
-    The USER chose the name, so this set is not attacker-controlled; it exists only so
-    a server that lowercases or strips a leading % is not mistaken for a server that
-    substituted a different name entirely.
+
+def canonical_name(name: str) -> str:
+    """THE one byte string a claim may register. Not a family of spellings.
+
+    Identical to `alias_chain.normalize_name` (`strip().lstrip('%').strip().lower()`),
+    which is what the resolver reads, and a superset of the permit server's own
+    `xete_alias_client::normalize_name` (`trim().to_ascii_lowercase()`) for the inputs
+    the server accepts at all.
+
+    The previous version accepted a SET of candidate spellings. A hostile server picked
+    whichever member it liked, derived the PDA from that, and every other check then
+    agreed with itself: the user paid to register `%mcptestname` or `Mcptestname` at an
+    address no resolver will ever look at. Only one of those strings is the name.
     """
-    seen, out = set(), []
-    base = name.strip()
-    for candidate in (name, base, base.lstrip("%"), base.lower(), base.lstrip("%").lower()):
-        if candidate and candidate not in seen:
-            seen.add(candidate)
-            out.append(candidate)
-    return out
+    if not isinstance(name, str):
+        raise TransactionRejected(
+            f"TRANSACTION REJECTED: a %name must be text, got {type(name).__name__}. "
+            "Nothing was signed."
+        )
+    return name.strip().lstrip("%").strip().lower()
+
+
+def _registrable_name_bytes(name: str) -> bytes:
+    """The canonical form of `name` as bytes, or a refusal if it is not registrable."""
+    canonical = canonical_name(name)
+    encoded = canonical.encode("utf-8")
+    if not 1 <= len(encoded) <= MAX_ALIAS_NAME_BYTES:
+        raise TransactionRejected(
+            f"TRANSACTION REJECTED: {_safe_text(name, alphabet=_SAFE_ARG_CHARS)} is not a claimable "
+            f"%name — its canonical "
+            f"form is {len(encoded)} bytes and the registry holds 1..{MAX_ALIAS_NAME_BYTES}. "
+            "Nothing was signed."
+        )
+    if not all(chr(b) in _NAME_CHARS for b in encoded):
+        raise TransactionRejected(
+            f"TRANSACTION REJECTED: {_safe_text(name, alphabet=_SAFE_ARG_CHARS)} is not a claimable "
+            f"%name — the registry "
+            "accepts lowercase letters, digits and underscore only, and rejects anything else "
+            "on chain, so this claim could do nothing but burn a fee. Nothing was signed."
+        )
+    return encoded
+
+
+# The alphabet a registry NAME is allowed to use. Anything a server puts in that field
+# outside this set is not a name, so it does not need to stay legible — it gets escaped.
+_SAFE_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_")
+# Looser, for echoing back the CALLER's own argument, where legibility is the point.
+_SAFE_ARG_CHARS = frozenset(string.ascii_letters + string.digits + " _-.%@")
+
+
+def _safe_text(raw: bytes | str, *, limit: int = 32, alphabet=_SAFE_NAME_CHARS) -> str:
+    """Render SERVER-CHOSEN bytes safe to put in a message an agent will read.
+
+    A refusal reason is deliberately not truncated — it is the most useful thing this
+    tool can say — which made it a channel: up to 32 bytes of attacker-chosen text,
+    newlines included, were decoded with errors='replace' and echoed verbatim into the
+    `reason` field an agent then reads as instructions.
+
+    Sanitising where the bytes ENTER the message keeps the refusal complete while making
+    the server's share of it one quoted, length-bounded, control-character-free token
+    that reads as data. For the name field the alphabet is the registry's own
+    (`[a-z0-9_]`), so prose does not survive the trip at all.
+    """
+    b = raw.encode("utf-8", "replace") if isinstance(raw, str) else bytes(raw)
+    head, extra = b[:limit], len(b) - limit
+    shown = "".join(chr(c) if chr(c) in alphabet else f"\\x{c:02x}" for c in head)
+    return f'"{shown}"' + (f" (+{extra} more bytes)" if extra > 0 else "")
 
 
 # ── raw framing checks (done before handing bytes to a parser) ───────────────────────
@@ -353,11 +564,13 @@ class ClaimInspection:
     claim_name: str = ""
     claim_price_lamports: int = 0
     record_key: str = ""
+    record_key_pinned: bool = False
     treasury: str = ""
     treasury_pinned: bool = False
     message_sha256: str = ""
     instructions: list[dict] = field(default_factory=list)
     transfers: list[dict] = field(default_factory=list)
+    priority_fee_lamports: int = 0
     worst_case_fee_lamports: int = 0
     static_debit_lamports: int = 0
     ceiling_lamports: int = 0
@@ -371,11 +584,13 @@ class ClaimInspection:
             "claim_name": self.claim_name,
             "claim_price_lamports": self.claim_price_lamports,
             "record_key": self.record_key,
+            "record_key_pinned": self.record_key_pinned,
             "treasury": self.treasury,
             "treasury_pinned": self.treasury_pinned,
             "message_sha256": self.message_sha256,
             "instructions": self.instructions,
             "transfers": self.transfers,
+            "priority_fee_lamports": self.priority_fee_lamports,
             "worst_case_fee_lamports": self.worst_case_fee_lamports,
             "static_debit_lamports": self.static_debit_lamports,
             "ceiling_lamports": self.ceiling_lamports,
@@ -425,19 +640,30 @@ def _decode_claim_data(data: bytes, *, position: int, expected_names: set[bytes]
         )
     name_bytes = data[2:2 + name_len]
     if name_bytes not in expected_names:
-        shown = name_bytes.decode("utf-8", "replace")
         raise TransactionRejected(
-            f"TRANSACTION REJECTED: the claim instruction registers %{shown}, but you asked to "
-            f"claim %{expect_name}. This is the check that catches a server swapping in a "
-            "different name, and it reads the name out of the instruction DATA rather than "
-            "inferring it from an account. Nothing was signed."
+            f"TRANSACTION REJECTED: the claim instruction registers the name "
+            f"{_safe_text(name_bytes)}, but the canonical form of the name you asked to claim is "
+            f"%{expect_name}. Exactly one byte string is the name — a different spelling is a "
+            "different address, which no resolver will ever read. This check reads the name out "
+            "of the instruction DATA rather than inferring it from an account. Nothing was "
+            "signed."
         )
     key32 = data[2 + name_len:2 + name_len + 32]
     if expect_record_key is not None and not hmac.compare_digest(key32, bytes(expect_record_key)):
+        # This 32-byte field is the on-chain agent_id (permit cosign.rs: ClaimParts
+        # .agent_id -> wire::data_claim). The permit server's own rule is that a claim
+        # may bind ONLY the agent_id the authenticated wallet owns — and the permit
+        # server is the party this module exists to distrust, while the program does
+        # not validate the field at all (mainnet simulateTransaction with 0xAB*32
+        # returns err: None). Unpinned, %name -> {owner, agent_id} is forgeable to
+        # point at somebody else's agent, paid for and signed by us.
         raise TransactionRejected(
-            f"TRANSACTION REJECTED: the claim would write record key "
-            f"{Pubkey.from_bytes(key32)} into %{expect_name}, not "
-            f"{Pubkey.from_bytes(bytes(expect_record_key))}. Nothing was signed."
+            f"TRANSACTION REJECTED: the claim would bind %{expect_name} to agent id "
+            f"{Pubkey.from_bytes(key32)}, not this agent's "
+            f"{Pubkey.from_bytes(bytes(expect_record_key))}. That 32-byte field is the "
+            "on-chain agent identity the name resolves to, nothing on chain checks it, and "
+            "writing someone else's there is exactly the impersonation the registry's design "
+            "forbids — at our expense and under our signature. Nothing was signed."
         )
     price = struct.unpack("<Q", data[-8:])[0]
     if price != quoted_lamports:
@@ -487,17 +713,17 @@ def _check_claim_accounts(indexes, accounts, *, header, n_keys: int, position: i
         )
     # Derived from the NAME BYTES that were matched, never from a decoded-and-re-encoded
     # string, so no round-trip can change what the PDA is checked against.
-    shown = claim_name.decode("utf-8", "replace")
+    shown = _safe_text(claim_name)
     want_pda = alias_pda(program, claim_name)
     if accounts[IX_ALIAS_PDA] != want_pda:
         raise TransactionRejected(
             f"TRANSACTION REJECTED: the claim instruction writes account "
-            f"{accounts[IX_ALIAS_PDA]}, but the registry account for %{shown} is "
+            f"{accounts[IX_ALIAS_PDA]}, but the registry account for the name {shown} is "
             f"{want_pda}. Nothing was signed."
         )
     if not _is_writable(indexes[IX_ALIAS_PDA], header, n_keys):
         raise TransactionRejected(
-            f"TRANSACTION REJECTED: the account for %{shown} ({want_pda}) is read-only in "
+            f"TRANSACTION REJECTED: the account for the name {shown} ({want_pda}) is read-only in "
             "this transaction, so the claim cannot be what it writes. Nothing was signed."
         )
     want_config = config_pda(program)
@@ -528,6 +754,7 @@ def inspect_alias_claim(tx_b64: str, *, expect_fee_payer: Pubkey, expect_name: s
                         tolerance: int | None = None,
                         blockhash_is_live: bool | None = None,
                         expect_record_key: bytes | None = None,
+                        treasury: Pubkey | None | object = TREASURY_FROM_ENV,
                         ) -> tuple[Transaction, ClaimInspection]:
     """Decode and allow-list a permit-server alias-claim transaction.
 
@@ -535,10 +762,22 @@ def inspect_alias_claim(tx_b64: str, *, expect_fee_payer: Pubkey, expect_name: s
     TransactionRejected otherwise — at which point nothing has been signed.
 
     Every expectation is supplied by the CALLER from values it knew before it talked to
-    the server: our own wallet, the name the user typed, the price we were quoted.
-    Nothing is read out of the transaction and then used to validate the transaction.
+    the server: our own wallet, the name the user typed, the price we were quoted, the
+    agent_id we own, the treasury the registry's config names.
+
+    This function does NO network I/O, so the treasury has to be handed in. Callers that
+    can reach an RPC pass `treasury=treasury_pubkey(program, rpc_url=...)`; leaving it at
+    the default resolves `XETE_ALIAS_TREASURY` alone and reports `treasury_pinned:false`
+    when that is unset, rather than pretending a stale constant is the answer.
     """
     program = program or alias_program_id()
+    if treasury is TREASURY_FROM_ENV:
+        treasury = treasury_pubkey(program)
+    # ONE canonical byte string, settled before a single byte of the server's answer is
+    # looked at. From here on `expect_name` is that string: registrable by definition,
+    # so safe to interpolate into a message, and the only spelling a claim may register.
+    want_name = _registrable_name_bytes(expect_name)
+    expect_name = want_name.decode("ascii")
     ceiling = int(quoted_lamports) + (tolerance_lamports() if tolerance is None else int(tolerance))
 
     if not isinstance(tx_b64, str) or not tx_b64:
@@ -561,7 +800,7 @@ def inspect_alias_claim(tx_b64: str, *, expect_fee_payer: Pubkey, expect_name: s
     except Exception as e:
         raise TransactionRejected(
             f"TRANSACTION REJECTED: the bytes do not deserialize as a Solana transaction "
-            f"({e}). Nothing was signed."
+            f"({str(e)[:200]}). Nothing was signed."
         ) from None
 
     msg = tx.message
@@ -621,8 +860,7 @@ def inspect_alias_claim(tx_b64: str, *, expect_fee_payer: Pubkey, expect_name: s
             )
 
     # ── what runs ────────────────────────────────────────────────────────────────────
-    expected_names = {n.encode("utf-8") for n in _name_candidates(expect_name)}
-    treasury = treasury_pubkey(program)
+    expected_names = {want_name}
     described: list[dict] = []
     transfers: list[dict] = []
     debit = 0
@@ -798,6 +1036,25 @@ def inspect_alias_claim(tx_b64: str, *, expect_fee_payer: Pubkey, expect_name: s
     fee = _LAMPORTS_PER_SIGNATURE * nsig + priority_fee
     debit += fee
 
+    # The priority fee is bounded ON ITS OWN, not merely folded into the price
+    # tolerance. Two reasons the tolerance is the wrong instrument for it: the tolerance
+    # exists to cover ~0.00163 SOL of PDA rent, and simulation — the backstop that makes
+    # everything else in this module survivable — CANNOT see a fee at all, because
+    # simulateTransaction does not charge one. Left inside the tolerance, a hostile
+    # server burns the entire allowance on a free claim and every check still passes.
+    fee_cap = max_priority_fee_lamports()
+    if priority_fee > fee_cap:
+        raise TransactionRejected(
+            f"TRANSACTION REJECTED: this transaction authorises a priority fee of up to "
+            f"{priority_fee} lamports ({cu_price_micro} micro-lamports per compute unit over "
+            f"{cu_limit} units), above the {fee_cap} this client will sign for. A priority fee is "
+            "burned whether or not the claim succeeds, and simulation cannot see it — "
+            "simulateTransaction charges no fees — so it is bounded here or nowhere. Every claim "
+            "in the registry's history paid a flat 10,000-lamport fee and carried no "
+            f"compute-budget instruction at all. Raise {ENV_MAX_PRIORITY_FEE} only if you know "
+            "why this one needs to be different. Nothing was signed."
+        )
+
     if debit > ceiling:
         raise TransactionRejected(
             f"TRANSACTION REJECTED: this transaction visibly debits {debit} lamports from "
@@ -824,11 +1081,13 @@ def inspect_alias_claim(tx_b64: str, *, expect_fee_payer: Pubkey, expect_name: s
         claim_name=claim_name,
         claim_price_lamports=claim_price,
         record_key=record_key,
+        record_key_pinned=expect_record_key is not None,
         treasury=str(treasury) if treasury is not None else "",
         treasury_pinned=treasury is not None,
         message_sha256=hashlib.sha256(bytes(msg)).hexdigest(),
         instructions=described,
         transfers=transfers,
+        priority_fee_lamports=priority_fee,
         worst_case_fee_lamports=fee,
         static_debit_lamports=debit,
         ceiling_lamports=ceiling,
@@ -863,34 +1122,8 @@ def simulated_debit(rpc_url: str, tx_b64: str, account: Pubkey, *, timeout: int 
     shape we do not understand; the caller decides what to do with that, because a
     flaky RPC is not evidence of an attack.
     """
-    import time
-
-    import requests
-
     def call(method: str, params: list):
-        # The default endpoint rate-limits, and a 429 that turned simulation off would
-        # be the cheapest attack on this whole module. Retry before giving up, and when
-        # we do give up the caller fails closed.
-        attempts, last = 3, None
-        for attempt in range(attempts):
-            try:
-                r = requests.post(rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": method,
-                                                 "params": params}, timeout=timeout)
-                if r.status_code in (429, 502, 503, 504):
-                    last = f"http {r.status_code}"
-                else:
-                    r.raise_for_status()
-                    body = r.json()
-                    if "error" in body:                  # a real answer: do not retry it
-                        raise RuntimeError(f"{method} rpc error: {str(body['error'])[:200]}")
-                    return body["result"]
-            except RuntimeError:
-                raise
-            except Exception as e:                       # transport-level, retryable
-                last = e
-            if attempt < attempts - 1:
-                time.sleep(0.4 * (attempt + 1))
-        raise RuntimeError(f"{method}: {last}")
+        return _rpc_call(rpc_url, method, params, timeout=timeout)
 
     pre = call("getBalance", [str(account), {"commitment": "confirmed"}])["value"]
     sim = call("simulateTransaction", [tx_b64, {
@@ -904,7 +1137,8 @@ def simulated_debit(rpc_url: str, tx_b64: str, account: Pubkey, *, timeout: int 
     if sim.get("err") is not None:
         raise TransactionRejected(
             f"TRANSACTION REJECTED: the network says this transaction fails "
-            f"({str(sim['err'])[:200]}). Nothing was signed."
+            f"({_safe_text(str(sim['err']), limit=200, alphabet=_SAFE_ARG_CHARS)}). "
+            "Nothing was signed."
         )
     accounts = sim.get("accounts") or []
     if not accounts or accounts[0] is None or "lamports" not in accounts[0]:
