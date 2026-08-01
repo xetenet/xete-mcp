@@ -338,11 +338,24 @@ def test_alias_resolve_refuses_rather_than_guessing_when_the_rpc_is_down(net):
 
 
 def test_a_jsonrpc_error_is_not_read_as_unclaimed(net):
+    """The property under test is that this RAISES rather than returning None.
+
+    It used to also assert the endpoint's own `message` appeared in the exception string.
+    That is no longer true and must not be: `message` is a string the RPC wrote, and
+    interpolating it into an exception delivered it to an agent as an unattributed
+    sentence. It now travels on `server_text`, which the caller boxes under a banner
+    naming its author — the same discipline the permit-server path already used. The
+    JSON-RPC `code` is an int this client formats itself, so it stays in the message.
+    """
     net.rpc_response = make_response(200, {"jsonrpc": "2.0", "id": 1,
                                            "error": {"code": -32602, "message": "WrongSize"}},
                                      url=RPC)
-    with pytest.raises(alias_chain.AliasChainError, match="WrongSize"):
+    with pytest.raises(alias_chain.AliasChainError) as ei:
         alias_chain.resolve_owner("bob")
+
+    assert "WrongSize" not in str(ei.value), "endpoint prose must not be in our own sentence"
+    assert "-32602" in str(ei.value)
+    assert ei.value.server_text == "WrongSize"
 
 
 def test_an_unclaimed_name_returns_none(net):

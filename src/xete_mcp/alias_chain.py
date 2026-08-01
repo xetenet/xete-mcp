@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 
 from solders.pubkey import Pubkey
 
@@ -73,12 +74,26 @@ MAX_RPC_BYTES = 64 * 1024
 COMMITMENT = "finalized"            # ownership decides where money goes; take the settled answer
 
 
+_PUBKEY_RE = re.compile(r"\A[1-9A-HJ-NP-Za-km-z]{32,44}\Z")   # base58, no 0OIl
+
+
 class AliasChainError(RuntimeError):
     """The registry could not be read, or answered something unusable.
 
     NOT the same as "the name is unclaimed" — that is a None return. Anything that
     raises means the caller does not know who owns the name and must not guess.
+
+    `server_text` mirrors safehttp.EndpointError: the RPC endpoint is untrusted, and any
+    string IT wrote goes here rather than into the message. The message is this client's
+    own words, end to end, so a caller can present it as such and put the endpoint's words
+    in a labelled quarantine box. A JSON-RPC `error.message` interpolated into an
+    exception string arrives in an agent's context as an unattributed sentence — which is
+    precisely the delivery mechanism the permit-server quarantine exists to close.
     """
+
+    def __init__(self, message: str, *, server_text: str | None = None):
+        super().__init__(message)
+        self.server_text = server_text or None
 
 
 class InvalidAliasName(AliasChainError):
@@ -110,7 +125,15 @@ def rpc_url() -> str:
 
 
 def rpc_display() -> str:
-    """The effective alias-read endpoint, redacted, for putting in a tool's output."""
+    """The effective alias-read endpoint, redacted, for putting in a tool's output.
+
+    `redact_url` reduces this to scheme+host+port. That matters here more than anywhere
+    else in the package: this string is printed in `resolution.rpc` on every SUCCESSFUL
+    resolve, and since alias reads inherit XETE_RPC_URL, the URL is whatever the operator
+    configured for everything else — which for QuickNode, Alchemy and Ankr is a URL whose
+    PATH is the API token, and for Helius a query string that is. "Which host answered" is
+    the entire diagnostic this field owes anyone.
+    """
     return redact_url(rpc_source()[0])
 
 
@@ -167,18 +190,32 @@ def resolve_owner(name: str, rpc: str | None = None) -> str | None:
             max_bytes=MAX_RPC_BYTES,
         )
     except EndpointError as e:
+        # `str(e)` is safehttp's own sentence and carries no endpoint-written bytes; any
+        # such bytes travel separately on `server_text` and are forwarded, not inlined.
         raise AliasChainError(
             f"the %alias registry could not be read from {shown}: {e} Refusing to guess an owner "
-            f"for %{bare} — no server's word is used as a substitute."
+            f"for %{bare} — no server's word is used as a substitute.",
+            server_text=e.server_text,
         ) from e
 
     # A JSON-RPC error arrives as HTTP 200 with an "error" member. Reading only "result"
     # would turn every RPC failure into "this name is unclaimed".
+    #
+    # `error` is whatever the endpoint put there — not necessarily an object, and
+    # `message` not necessarily present or a string. `{"error": {"code": -32602}}` is an
+    # ordinary shape; `{"error": 500}` and `{"error": ["x"]}` are hostile ones. All of
+    # them are handled by `sanitize_text` coercing, and none of them reaches the message.
     if "error" in body:
         err = body.get("error")
         detail = err.get("message") if isinstance(err, dict) else err
+        code = err.get("code") if isinstance(err, dict) else None
+        code_txt = (f" (code {code})" if isinstance(code, int) and not isinstance(code, bool)
+                    else "")
         raise AliasChainError(
-            f"{shown} returned a JSON-RPC error resolving %{bare}: {sanitize_text(detail, 200)}")
+            f"{shown} returned a JSON-RPC error{code_txt} resolving %{bare}, so the registry was "
+            "not read and no owner is being guessed. Any text that endpoint sent is quarantined, "
+            "not repeated here.",
+            server_text=sanitize_text(detail, 200))
 
     result = body.get("result")
     if not isinstance(result, dict) or "value" not in result:
@@ -193,9 +230,20 @@ def resolve_owner(name: str, rpc: str | None = None) -> str | None:
 
     owner_program = value.get("owner")
     if owner_program != str(AXTREG):
+        # `owner` is a string the endpoint chose. On a real answer it is a base58 program
+        # address, which is safe to name; anything else is prose using an address-shaped
+        # field as a delivery channel and goes in the quarantine box instead. This was the
+        # one endpoint-controlled string in this function that was neither shape-checked
+        # nor sanitised — `str(owner_program)[:60]!r` handed 60 chars straight through.
+        if isinstance(owner_program, str) and _PUBKEY_RE.match(owner_program):
+            raise AliasChainError(
+                f"the account at {pda} is owned by program {owner_program}, not the xete "
+                f"alias registry {AXTREG}. Not treating it as a %{bare} registration.")
         raise AliasChainError(
-            f"the account at {pda} is owned by program {str(owner_program)[:60]!r}, not the xete "
-            f"alias registry {AXTREG}. Not treating it as a %{bare} registration.")
+            f"the account at {pda} reported an owner that is not a program address at all, so it "
+            f"is not the xete alias registry {AXTREG}. Not treating it as a %{bare} registration; "
+            "the value it sent is quarantined, not repeated here.",
+            server_text=sanitize_text(owner_program, 60))
 
     raw_data = value.get("data")
     if (not isinstance(raw_data, list) or len(raw_data) != 2
