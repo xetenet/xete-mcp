@@ -49,6 +49,7 @@ _CHUNK = 8192
 _MAX_IGNORED_REPORTED = 5           # a width budget for attacker prose, not a debug aid
 MAX_TEXT = 200                      # hard cap on any single untrusted string we echo
 MAX_KEY_NAME = 24                   # hard cap on an echoed key name; real ones are short
+MAX_SCRUB_INPUT = 4096              # hard cap on what the redactors will REGEX — see `scrub`
 
 
 class EndpointError(RuntimeError):
@@ -114,6 +115,33 @@ _BARE_USERINFO_RE = re.compile(r"(?:(?<=\s)|\A)([^\s/\\?#@:]+:)[^\s/\\?#@]*@")
 _QUERY_RE = re.compile(r"\?[A-Za-z0-9_.\-%\[\]]+=[^\s\"'<>]*")
 
 
+# Whitespace and the two slash leans: both userinfo patterns above stop at one of these,
+# so a userinfo run can never straddle a cut taken at one. See `_capped`.
+_CUT_AT = " \t\r\n\f\v/\\"
+
+
+def _capped(raw: str) -> str:
+    """`raw` shortened to something the patterns above can be run over in bounded time.
+
+    Truncation is taken back to the last delimiter, and that is not fastidiousness — it
+    is the whole difference between a cap and a hole. Both userinfo patterns key on a
+    terminator that sits to the RIGHT of the secret, the `@`, so a plain `raw[:4096]` on
+    `https://user:pwSECRET` + 8KB of padding + `@host/` deletes the `@`, the userinfo
+    passes then match nothing, and the password is returned by the redactor. Cutting back
+    to the last whitespace or slash means whatever is left of a userinfo run leaves with
+    the tail it belonged to. `_QUERY_RE` needs no such care — its anchor is the `?key=`
+    to the LEFT of the value, so a cut through the value still matches and still redacts.
+
+    A run with no delimiter in the first 4KB collapses to the marker alone. That is the
+    right answer: 4096 characters of unbroken text is not a diagnostic.
+    """
+    if len(raw) <= MAX_SCRUB_INPUT:
+        return raw
+    head = raw[:MAX_SCRUB_INPUT]
+    keep = max(head.rfind(c) for c in _CUT_AT)
+    return head[:keep + 1] + "...(oversized, truncated)"
+
+
 def scrub(text) -> str:
     """Strip credentials out of arbitrary text — an exception message, a header, a URL.
 
@@ -121,8 +149,21 @@ def scrub(text) -> str:
     on anything third-party (notably `requests`' own exception strings) before it is
     interpolated into a message this package emits. Cheap, and the alternative is trusting
     every library in the stack to redact for us.
+
+    "CHEAP" WAS FALSE ABOVE A FEW KB, AND THE PARTY WHO PICKS THE LENGTH IS THE ONE THIS
+    FUNCTION DEFENDS AGAINST. `_USERINFO_RE` opens with `[A-Za-z][A-Za-z0-9+.-]*:`; on a
+    long run of scheme-legal characters containing no colon, that class scans to the end
+    of the string and fails — and it does so again from every start position. Quadratic,
+    measured on this branch: 0.047s at 8KB, 0.19s at 16KB, 0.74s at 32KB, 2.9s at 64KB.
+    It is remotely reachable, not theoretical: `_read_json` answers a 3xx BEFORE it reads
+    any body, and passes the untrusted `Location` header through `redact_url` into here,
+    and http.client's `_MAXLINE` allows that header 65536 bytes. A slashless `Location`
+    cost 3.0s of pinned CPU per response and `https:` + padding cost 9.1s, free and
+    repeatable, chosen entirely by the far end. Hence the cap. Nothing legitimate is
+    lost — every consumer of this output truncates it to 200 characters or fewer through
+    `sanitize_text` — and the surviving 4KB is bounded work (~12ms worst case).
     """
-    out = _USERINFO_RE.sub(r"\1<redacted>@", "" if text is None else str(text))
+    out = _USERINFO_RE.sub(r"\1<redacted>@", _capped("" if text is None else str(text)))
     out = _BARE_USERINFO_RE.sub(r"\1<redacted>@", out)
     return _QUERY_RE.sub("?<redacted>", out)
 
@@ -213,9 +254,26 @@ def redact_url(url) -> str:
     token into the agent's context, the MCP transcript and the host's logs.
 
     Never raises: it is called from inside error paths, and a redactor that throws while
-    formatting an error message is a redactor that gets removed.
+    formatting an error message is a redactor that gets removed. Anything over
+    MAX_SCRUB_INPUT is refused rather than parsed — see the note at the top of the body.
     """
     raw = "" if url is None else (url if isinstance(url, str) else str(url))
+    # OVERSIZE IS REFUSED, NOT TRUNCATED. This function reaches `scrub`'s quadratic
+    # blowup through the `not parts.netloc` fallback below — `https:` plus 64KB of
+    # letters has no netloc and none of the `@%?/\` shapes, so it lands on
+    # `return scrub(raw)` — and `_read_json` hands this function a `Location` header the
+    # far end wrote, up to http.client's 65536-byte line limit. But `scrub`'s cure cannot
+    # be reused here: truncating a URL and then PARSING it is fail-open in a way
+    # truncating free text is not. `https://user:pwSECRET` + 8KB of padding + `@host/`
+    # loses its `@` to any cut, urlsplit then reads `user:pwSECRET<padding>` as the HOST,
+    # the "@ in netloc" branch never fires, and the password is returned as the origin —
+    # out of the one function whose entire contract is that only the origin survives.
+    # No URL an operator ever typed is 4KB, so this fails closed and keeps the scheme,
+    # which is the part that explains the failure.
+    if len(raw) > MAX_SCRUB_INPUT:
+        m = _SCHEME_SEP_RE.match(raw[:64])      # a scheme longer than 64 chars is not a scheme
+        scheme = raw[:m.end()].split(":", 1)[0] if m else ""
+        return f"{scheme}://<oversized-url>" if scheme else "<oversized-url>"
     # Cut userinfo out textually BEFORE urlsplit, so a `#` or `?` inside the password
     # cannot move it somewhere urlsplit reports as a fragment and this function leaves alone.
     span = _authority_span(raw)
