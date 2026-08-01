@@ -34,10 +34,19 @@ from a machine that is not this one.
 
 CONFIGURATION (environment)
 ---------------------------
-  XETE_SOLANA_RPC   Solana RPC used for %alias reads. Default
-                    https://solana-rpc.publicnode.com — api.mainnet-beta throttles and
+  XETE_SOLANA_RPC   Solana RPC used for %alias reads. Same variable name the relay uses.
+  XETE_RPC_URL      the RPC this package already used for everything else. Used for
+                    alias reads too when XETE_SOLANA_RPC is unset.
+  (default)         https://solana-rpc.publicnode.com — api.mainnet-beta throttles and
                     times out on reads, which for a resolver means a payment that
-                    cannot be addressed. Same variable name the relay uses.
+                    cannot be addressed.
+
+The order matters and is not cosmetic. Introducing XETE_SOLANA_RPC with a new
+third-party default, and reading it FIRST with no fallback, silently moves
+money-destination resolution off an operator's own validator and onto a host they never
+configured — for every existing install, on upgrade, with no signal. An operator who
+hardened XETE_RPC_URL has expressed a preference about which node they trust; that
+preference now carries. The public default applies only when neither is set.
 """
 from __future__ import annotations
 
@@ -46,11 +55,13 @@ import os
 
 from solders.pubkey import Pubkey
 
-from .safehttp import EndpointError, post_json, require_secure_url
+from .safehttp import (EndpointError, post_json, redact_url, require_secure_url,
+                       sanitize_text)
 
 AXTREG = Pubkey.from_string("AXTREGuYbpgcWFbZy124jcWDN2nd7mtmrCDsUojktZrd")
 
 ENV_RPC = "XETE_SOLANA_RPC"
+ENV_RPC_FALLBACK = "XETE_RPC_URL"
 DEFAULT_RPC = "https://solana-rpc.publicnode.com"
 
 # alias account layout (mirrors xete-alias): owner[0..32], name[32..64], name_len[64], len=106
@@ -74,9 +85,33 @@ class InvalidAliasName(AliasChainError):
     """The string cannot be a %name, so no lookup was attempted."""
 
 
+def rpc_source() -> tuple[str, str]:
+    """(url, which env var it came from) for alias reads. Unchecked — see `rpc_url`.
+
+    `ENV_RPC` wins, then the RPC the operator already configured for everything else,
+    then the public default. Split out from `rpc_url` so callers can REPORT the endpoint
+    without re-deriving the precedence and getting it wrong: a tool that prints
+    `os.environ[ENV_RPC] or DEFAULT_RPC` names the wrong host whenever the fallback is
+    the one in use.
+    """
+    configured = (os.environ.get(ENV_RPC) or "").strip()
+    if configured:
+        return configured, ENV_RPC
+    inherited = (os.environ.get(ENV_RPC_FALLBACK) or "").strip()
+    if inherited:
+        return inherited, ENV_RPC_FALLBACK
+    return DEFAULT_RPC, ENV_RPC
+
+
 def rpc_url() -> str:
     """The RPC endpoint for alias reads, checked before it is used."""
-    return require_secure_url(os.environ.get(ENV_RPC) or DEFAULT_RPC, ENV_RPC)
+    url, env_name = rpc_source()
+    return require_secure_url(url, env_name)
+
+
+def rpc_display() -> str:
+    """The effective alias-read endpoint, redacted, for putting in a tool's output."""
+    return redact_url(rpc_source()[0])
 
 
 def normalize_name(name: str) -> str:
@@ -93,8 +128,12 @@ def normalize_name(name: str) -> str:
     if not bare:
         raise InvalidAliasName("an empty string is not a %name.")
     if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in bare):
+        # `name` can be a string an untrusted server proposed, and this message is read
+        # by an agent. Echo it flattened and short — enough to identify the input,
+        # not enough to be a paragraph of instructions with newlines in it.
         raise InvalidAliasName(
-            f"{name!r} contains whitespace or control characters, which no %name can.")
+            f"{sanitize_text(name, 48)!r} contains whitespace or control characters, which no "
+            "%name can.")
     encoded = bare.encode("utf-8")
     if len(encoded) > MAX_NAME_BYTES:
         raise InvalidAliasName(
@@ -117,6 +156,7 @@ def resolve_owner(name: str, rpc: str | None = None) -> str | None:
     bare = normalize_name(name)
     pda = alias_pda(bare)
     url = rpc_url() if rpc is None else require_secure_url(rpc, ENV_RPC)
+    shown = redact_url(url)     # every message below; the real url only goes on the wire
 
     try:
         body = post_json(
@@ -128,7 +168,7 @@ def resolve_owner(name: str, rpc: str | None = None) -> str | None:
         )
     except EndpointError as e:
         raise AliasChainError(
-            f"the %alias registry could not be read from {url}: {e} Refusing to guess an owner "
+            f"the %alias registry could not be read from {shown}: {e} Refusing to guess an owner "
             f"for %{bare} — no server's word is used as a substitute."
         ) from e
 
@@ -138,18 +178,18 @@ def resolve_owner(name: str, rpc: str | None = None) -> str | None:
         err = body.get("error")
         detail = err.get("message") if isinstance(err, dict) else err
         raise AliasChainError(
-            f"{url} returned a JSON-RPC error resolving %{bare}: {str(detail)[:200]}")
+            f"{shown} returned a JSON-RPC error resolving %{bare}: {sanitize_text(detail, 200)}")
 
     result = body.get("result")
     if not isinstance(result, dict) or "value" not in result:
         raise AliasChainError(
-            f"{url} returned a getAccountInfo response with no result value for %{bare}.")
+            f"{shown} returned a getAccountInfo response with no result value for %{bare}.")
 
     value = result["value"]
     if value is None:
         return None                                   # provably unclaimed
     if not isinstance(value, dict):
-        raise AliasChainError(f"{url} returned a non-object account for %{bare}.")
+        raise AliasChainError(f"{shown} returned a non-object account for %{bare}.")
 
     owner_program = value.get("owner")
     if owner_program != str(AXTREG):
@@ -160,11 +200,11 @@ def resolve_owner(name: str, rpc: str | None = None) -> str | None:
     raw_data = value.get("data")
     if (not isinstance(raw_data, list) or len(raw_data) != 2
             or not isinstance(raw_data[0], str) or raw_data[1] != "base64"):
-        raise AliasChainError(f"{url} returned account data for %{bare} in an unexpected form.")
+        raise AliasChainError(f"{shown} returned account data for %{bare} in an unexpected form.")
     try:
         data = base64.b64decode(raw_data[0], validate=True)
     except Exception:
-        raise AliasChainError(f"{url} returned account data for %{bare} that is not base64.") from None
+        raise AliasChainError(f"{shown} returned account data for %{bare} that is not base64.") from None
     if len(data) != ALIAS_LEN:
         raise AliasChainError(
             f"the registry account for %{bare} is {len(data)} bytes, not the {ALIAS_LEN} byte "
