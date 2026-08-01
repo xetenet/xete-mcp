@@ -31,3 +31,35 @@ description = "Raw ed25519/Solana secret keypair (bare JSON array of 64 bytes)"
 # 63+ separators means 64+ elements: a 32-byte seed alone will not trip this,
 # which keeps ordinary small int arrays out of the results.
 regex = '''\[\s*\d{1,3}\s*(?:,\s*\d{1,3}\s*){63,}\]'''
+
+# ---------------------------------------------------------------------------
+# Allowlist. Narrow by construction: a path rule ALONE would switch off secret
+# scanning for a whole file, and these test files are exactly where a real
+# credential is most likely to get pasted by accident while reproducing a bug.
+# This pins the literal fixture values, so the files stay fully scanned and only
+# the known-fake strings are exempt.
+# ---------------------------------------------------------------------------
+[[allowlists]]
+# Fake credentials that EXIST TO BE LEAKED AT. The alias-read hardening tests feed
+# `https://svcuser:hunter2SECRET@permit.test` to every alias tool and fail if any
+# byte of it comes back -- the regression test for the finding where a security
+# refusal echoed the rejected URL, credentials and all. A fixture like that has to
+# be credential-shaped or it proves nothing, so it trips `generic-api-key` by design.
+#
+# NO `paths` ENTRY, DELIBERATELY. A path entry exempts the WHOLE FILE: gitleaks
+# 8.30.1 ORs allowlist criteria and does not honour `matchCondition` here. Verified
+# by planting a fresh high-entropy secret in one of these files and watching the
+# scanner stay silent. Pinning the literal fake values instead keeps these files
+# FULLY scanned -- a real secret pasted into them still fails CI, which is the
+# property that matters: a test file reproducing a credential bug is exactly where
+# a live credential gets pasted by accident.
+#
+# Renaming the fixtures to please the scanner would be wrong twice over: it would
+# weaken the tests, and it would teach the next person that the way to handle a
+# gitleaks hit is to rename the string.
+description = "known-fake credential fixtures in the credential-redaction tests"
+regexTarget = "match"
+regexes = [
+  '''hunter2SECRET''',
+  '''hl-SECRET-KEY-4242z9''',
+]
