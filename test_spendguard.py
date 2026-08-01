@@ -499,6 +499,30 @@ EXPECTED_TOUCHPOINTS = {
         "user from collecting money owed to them",
     ("server.py", "xete_settle_reclaim"):
         "EXEMPT — income. Recovering this agent's own deposit; net positive",
+
+    # ── newly VISIBLE, not newly unsafe ────────────────────────────────────────────────
+    # These five reach a submitter through a module-local helper call, which the scan used
+    # to discard because it only looked at attribute calls. Every one of them was already
+    # correct; the control simply could not see them. Each is classified on its own merits
+    # below rather than waved through as a batch — a blanket exemption here would recreate
+    # the blindness in table form.
+    ("settlement.py", "deposit"):
+        "GATED — calls authorize() at settlement.py:511 before any transaction is built, "
+        "and it is in GATED_DIRECTLY, which asserts that independently",
+    ("settlement.py", "claim"):
+        "EXEMPT — income. Proves you are the hidden beneficiary and RECEIVES funds; it "
+        "moves money toward this agent, and a cap here would block someone collecting what "
+        "is owed to them. Costs only a signature fee",
+    ("settlement.py", "reclaim"):
+        "EXEMPT — income. Depositor-only cancel that returns the funds AND the rent. Net "
+        "positive to this agent by construction",
+    ("server.py", "xete_send_message"):
+        "GATED indirectly — the only spend is inside payment.pay_herd, which gates before "
+        "it builds or signs. Reaches a submitter here only via _load_payer, which loads a "
+        "key and spends nothing",
+    ("server.py", "xete_my_identity"):
+        "EXEMPT — reports identity and spend limits. It touches _load_payer to say whether "
+        "a payer is configured and never builds, signs or submits anything",
 }
 
 GATED_DIRECTLY = [
@@ -508,22 +532,65 @@ GATED_DIRECTLY = [
 ]
 
 
+def _direct_hit(node) -> str | None:
+    """The submit/sign/key-load call name, if this node is one. Attribute calls only."""
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return None
+    attr = node.func.attr
+    if attr in SUBMIT_OR_SIGN:
+        return attr
+    if isinstance(node.func.value, ast.Name) and (node.func.value.id, attr) in KEY_LOADERS:
+        return attr
+    return None
+
+
 def _touchpoints():
-    found = {}
-    for pyfile in sorted((SRC / "xete_mcp").glob("*.py")):
-        tree = ast.parse(pyfile.read_text(encoding="utf-8"), filename=str(pyfile))
+    """Every function that submits or signs -- DIRECTLY, or through a module-local helper.
+
+    THE HOLE THIS CLOSES: the scan used to `continue` on anything that was not an
+    ast.Attribute call, and every money function in settlement.py submits through the
+    module-local helper `_send(...)`, which is an ast.NAME call. So the control that exists
+    to catch an ungated spending path could not see the idiom this codebase actually uses.
+    Reproduced by an outside reviewer: appending a plausible `sweep_everything()` calling
+    `_send(...)` to a copy of settlement.py left every meta-test GREEN, while the same
+    function calling `client.send_transaction` directly went RED.
+
+    A name-based scan that misses the local convention is worse than no scan, because it
+    reports success. So: find helpers that themselves submit, then treat a call to one of
+    them as a submission too, to a FIXED POINT -- a helper calling a helper calling a
+    submitter is still a spending path.
+    """
+    parsed = {}
+    for pyfile in sorted((SRC / "xete_mcp").rglob("*.py")):   # rglob: a subpackage was invisible
+        parsed[pyfile.name] = ast.parse(pyfile.read_text(encoding="utf-8"), filename=str(pyfile))
+
+    # Pass 1 -- direct submitters, per file.
+    direct = {}
+    for name, tree in parsed.items():
         for func in [n for n in ast.walk(tree)
                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
             for node in ast.walk(func):
-                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-                    continue
-                attr = node.func.attr
-                hit = attr in SUBMIT_OR_SIGN or (
-                    isinstance(node.func.value, ast.Name)
-                    and (node.func.value.id, attr) in KEY_LOADERS
-                )
+                hit = _direct_hit(node)
                 if hit:
-                    found.setdefault((pyfile.name, func.name), []).append((attr, node.lineno))
+                    direct.setdefault((name, func.name), []).append((hit, node.lineno))
+
+    # Pass 2 -- transitive closure over module-local Name calls, within each file.
+    found = dict(direct)
+    changed = True
+    while changed:
+        changed = False
+        for name, tree in parsed.items():
+            submitters = {fn for (f, fn) in found if f == name}
+            for func in [n for n in ast.walk(tree)
+                         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+                if (name, func.name) in found:
+                    continue
+                for node in ast.walk(func):
+                    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                            and node.func.id in submitters):
+                        found[(name, func.name)] = [(f"-> {node.func.id}()", node.lineno)]
+                        changed = True
+                        break
     return found
 
 
