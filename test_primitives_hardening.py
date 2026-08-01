@@ -139,3 +139,30 @@ def test_the_settlement_module_cannot_emit_an_unredacted_endpoint():
     assert not bare, (
         "settlement.py interpolates an endpoint variable without redact_url:\n  "
         + "\n  ".join(bare))
+
+
+@pytest.mark.parametrize("url,label", [
+    ("https://user＠host/qn-SECRETTOKEN99/", "U+FF20 fullwidth at-sign"),
+    ("https://user﹫host/qn-SECRETTOKEN99/", "U+FE6B small at-sign"),
+    ("https://[not:an:ip/qn-SECRETTOKEN99/",     "malformed IPv6 bracket"),
+])
+def test_redact_url_fails_closed_when_the_url_cannot_be_parsed(url, label):
+    """`redact_url` had TWO fail-open doors and only one was closed.
+
+    The missing-netloc branch was fixed to return a marker. Fifteen lines above it,
+    `except ValueError: return scrub(raw)` was untouched -- and scrub has a userinfo pass
+    and a query pass and NO PATH PASS, so a QuickNode `/qn-TOKEN/` credential came back
+    byte-for-byte from the function whose only job is removing it.
+
+    Any character that NFKC-normalises into /?#@: makes urlsplit RAISE, as does a malformed
+    IPv6 bracket. No attacker sophistication required.
+
+    This became load-bearing when settlement.py started routing endpoint output through
+    redact_url: it is now the only thing between an operator's paid Helius or QuickNode
+    credential and the agent's context on the settlement path. A fix that closes a symptom
+    while the root cause keeps a second door is not closed.
+    """
+    from xete_mcp.safehttp import redact_url
+    out = redact_url(url)
+    assert "SECRETTOKEN99" not in out, f"{label}: credential survived -> {out!r}"
+    assert out != url, f"{label}: redact_url returned its own input"

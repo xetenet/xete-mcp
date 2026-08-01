@@ -286,7 +286,22 @@ def redact_url(url) -> str:
     try:
         parts = urlsplit(raw)
     except ValueError:
-        return scrub(raw)
+        # FAIL CLOSED, the same way the missing-netloc branch below now does. This used to
+        # `return scrub(raw)`, and scrub has a userinfo pass and a query pass and NO PATH
+        # PASS -- so a QuickNode `/qn-TOKEN/` credential came back byte for byte from the
+        # function whose entire job is removing it.
+        #
+        # Reaching it needs no attacker sophistication: any character that NFKC-normalises
+        # into /?#@: makes urlsplit RAISE (U+FF20 fullwidth-at, U+FE6B small-at), and so
+        # does a malformed IPv6 bracket. Both verified leaking before this change.
+        #
+        # It matters more since settlement.py started routing its endpoint output through
+        # redact_url: this function is now the only thing between an operator's paid Helius
+        # or QuickNode credential and the agent's context on the settlement path, so a door
+        # that returns its own input is the single point of failure for that fix.
+        scheme = raw.split(":", 1)[0] if ":" in raw else ""
+        return f"{scheme}://<unparseable-url>" if scheme.isascii() and scheme.isalnum() \
+            else "<unparseable-url>"
     if not parts.netloc:
         # No authority this parser can find. The OLD behaviour here was `return scrub(raw)`,
         # which fails OPEN: `scrub` has a userinfo pass and a query pass and NO path pass, so
