@@ -34,6 +34,8 @@ from solana.rpc.api import Client
 from solana.rpc.commitment import Confirmed
 from solana.rpc.types import TxOpts
 
+from .safehttp import endpoint_identity
+
 try:                                     # the JSON-RPC error type, as distinct from transport
     from solana.rpc.core import RPCException
 except Exception:                        # pragma: no cover — layout drift in solana-py
@@ -301,9 +303,11 @@ def _corroborate_dropped(sig, bh, primary: str | None,
     confirmation budget bounds the total. An unbounded corroboration would let a merely-slow
     second endpoint add ~20s to a tool call that promised not to.
 
-    Whether the endpoints are genuinely independent is `second_rpc_url`'s judgement, and it is a
-    raw string comparison — two spellings of one host still count as two. That is findings
-    [G10]/[G16], owned elsewhere; this function is no stronger than the answer it gets there.
+    Whether the endpoints are genuinely independent is `second_rpc_url`'s judgement. It compares
+    (scheme, host, port), not the raw string, so two spellings of one host — a trailing slash,
+    two API keys on one provider, a different host case — no longer count as two (findings
+    [G10]/[G16]). This function is no stronger than the answer it gets there, so that key is the
+    thing to attack if this verdict is ever doubted.
     """
     try:
         url = second_rpc_url(primary) if primary else None
@@ -534,9 +538,20 @@ _ONE_SOURCE_CAVEAT = (
 
 def second_rpc_url(primary: str | None = None) -> str | None:
     """The corroborating endpoint, or None. Same endpoint twice is not two sources, so a value
-    equal to the primary is treated as unset rather than silently counted as agreement."""
+    that names the same SERVER as the primary is treated as unset rather than silently counted
+    as agreement.
+
+    "Same server" is `safehttp.endpoint_identity` — (scheme, host, port) — not a string
+    comparison. It used to be `v == primary`, which meant `https://h` plus `https://h/` (or,
+    realistically, one provider's URL with two different `?api-key=` values) upgraded `status()`
+    from a caveated one-source answer to the uncaveated "VERIFIED ... no single endpoint chose
+    this answer" while exactly one host was contacted. That is finding [G10]/[G16], and it is
+    the same key error as `server.alias_rpc_endpoints`; both sites are fixed with the same
+    function so they cannot drift apart again."""
     v = (os.environ.get(ENV_SECOND_RPC) or "").strip()
-    if not v or (primary is not None and v == str(primary).strip()):
+    if not v:
+        return None
+    if primary is not None and endpoint_identity(v) == endpoint_identity(primary):
         return None
     return v
 
@@ -601,6 +616,13 @@ def status(rpc_url: str, escrow_id_hex: str, expect_commitment_hex: str | None =
     pda = escrow_pda(prog, eid)
 
     second = second_rpc_url(rpc_url) if second_rpc is None else (second_rpc or None)
+    # The identity check lives in `second_rpc_url`, which an explicit `second_rpc=` skips — so
+    # a caller could hand this function two spellings of one host and get back the uncaveated
+    # "Two independently-configured endpoints ... no single endpoint chose this answer". No
+    # in-tree caller does; it is enforced here anyway, because a guarantee that depends on which
+    # door the caller came through is not a guarantee. Found by the fresh-context pass.
+    if second is not None and endpoint_identity(second) == endpoint_identity(rpc_url):
+        second = None
     authenticated, lamports = _read_account(rpc_url, pda)
     exists, owner, data = authenticated
 

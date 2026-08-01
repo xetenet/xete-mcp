@@ -207,6 +207,108 @@ def redact_url(url) -> str:
     return out
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+# Everything on this list is THE SAME MACHINE as everything else on it, and `require_secure_url`
+# lets plain http through to all of them, so scheme and port cannot separate them either. Two
+# loopback URLs are one source however they are spelled — see `_LOOPBACK_IDENTITY`.
+_LOOPBACK_NAMES = frozenset({"localhost", "localhost.localdomain", "ip6-localhost",
+                             "ip6-loopback"})
+_LOOPBACK_IDENTITY = ("loopback", "loopback", None)
+
+
+def endpoint_identity(url) -> tuple[str, str, int | None]:
+    """(scheme, host, port) — WHICH SERVER a URL names, for deciding if two URLs are one source.
+
+    This is a corroboration primitive, not a display one. Everywhere this package says "two
+    independently-operated endpoints" it has to answer "are these two the same box?", and the
+    answer used to be a raw string comparison — so `https://host/rpc` and `https://host/rpc/`
+    counted as two sources, filled both slots of a two-of-two agreement rule, and the honest
+    fallback endpoint was never asked. That is findings [G10]/[G16]: one hostile host, spelled
+    twice, certified a payment to an attacker while the output read "TWO independent endpoints
+    that agree". The realistic spelling is not even a typo — "one provider, two API keys" is
+    what a careful operator does when told to configure two endpoints.
+
+    So the key deliberately DISCARDS path, query, fragment and userinfo, and normalises case
+    and the default port. Two URLs that differ only in those name the same operator's same
+    machine; an API key buys a second credential, never a second opinion. It keeps scheme
+    because http and https to one host are genuinely different transports, and a plain-http
+    "corroborator" is refused elsewhere on its own merits.
+
+    `redact_url` is NOT usable for this and the difference is load-bearing: it keeps a
+    `?<redacted>` marker, does not lower-case the host, and leaves an explicit `:443` in place.
+
+    Four further foldings, each because the two spellings are one convention apart and reach the
+    same machine — and the fresh-context pass on this very function found three of them, which is
+    the tell that a normalising key needs its own adversarial table:
+
+      * a trailing root dot   `h.example.`     — the FQDN form; DNS resolves it identically;
+      * an IP literal         `[0:0:0:0:0:0:0:1]` vs `[::1]` — normalised through `ipaddress`;
+      * a unicode hostname    `bücher.example` vs `xn--bcher-kva.example` — IDNA, best effort;
+      * ANY loopback          `localhost`, `127.0.0.1`, `[::1]`, `127.0.0.2`, http or https —
+        one box, one operator, one adversary, so one identity regardless of scheme or port.
+        Scheme is otherwise kept (http and https really are different transports), but it
+        cannot separate loopback URLs because `require_secure_url` admits plain http to
+        loopback by design. A developer with two local validators on different ports is told
+        they have one source, which is the truthful answer: the same machine is answering.
+
+    The IDNA fold uses Python's built-in codec (IDNA2003 + nameprep) while requests/urllib3 put
+    hosts on the wire via the `idna` package (IDNA2008/UTS-46). They disagree on a few
+    characters — `straße.example` folds together with `strasse.example` here and does not there.
+    Known, and left as-is: the disagreement collapses two names into one identity, which costs a
+    corroborator (fail closed, refuse or caveat) and can never manufacture agreement.
+
+    Unparseable input keeps its own identity (`("", <lowered raw>, None)`) rather than
+    collapsing to a shared sentinel — two different malformed strings must not become "the same
+    endpoint", which would be this bug all over again in the error path. Never raises.
+    """
+    raw = ("" if url is None else str(url)).strip()
+    try:
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").lower()
+        port = parts.port                       # raises ValueError on a non-numeric port
+    except ValueError:
+        return ("", raw.lower(), None)
+    if not host:
+        return ("", raw.lower(), None)
+    host = host.rstrip(".") or host             # `h.example.` is `h.example`
+    if host in _LOOPBACK_NAMES:
+        return _LOOPBACK_IDENTITY
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            host = host.encode("idna").decode("ascii").lower()
+        except Exception:                       # noqa: BLE001 — an over-long or odd label
+            pass                                # keep the lower-cased host; never raise
+    else:
+        if ip.is_loopback:
+            return _LOOPBACK_IDENTITY
+        host = ip.compressed
+    scheme = (parts.scheme or "").lower()
+    return (scheme, host, port if port is not None else _DEFAULT_PORTS.get(scheme))
+
+
+def distinct_endpoints(urls) -> list[str]:
+    """The input list with same-server duplicates collapsed, first spelling of each kept.
+
+    Order is preserved because callers rank their endpoints (the operator's own validator
+    first, a public default last) and the ranking is the reason the list exists.
+    """
+    out: list[str] = []
+    seen: set[tuple[str, str, int | None]] = set()
+    for u in urls:
+        u = ("" if u is None else str(u)).strip()
+        if not u:
+            continue
+        ident = endpoint_identity(u)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(u)
+    return out
+
+
 # ── untrusted text ───────────────────────────────────────────────────────────────────
 
 _DROP_CATEGORIES = ("Cc", "Cf", "Co", "Cs")     # control, format (incl. bidi), private, surrogate

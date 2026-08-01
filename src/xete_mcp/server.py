@@ -87,13 +87,30 @@ Settlement confirmation (env):
 
 Money-path RPC independence (env) — an endpoint that answers alone decides where money goes:
   XETE_ALIAS_RPC              comma-separated Solana endpoints for %alias resolution, best
-                              first. TWO from DIFFERENT providers are required before
-                              xete_verify_settlement_tx will accept a %name instead of a raw
-                              wallet; with one, it refuses rather than re-deriving the draft's
-                              own answer. Falls back to XETE_SOLANA_RPC, then XETE_RPC_URL.
+                              first. TWO from DIFFERENT providers are required before ANY tool
+                              will accept a %name in place of a raw wallet — that now includes
+                              the tools that SPEND (xete_settle_create, xete_draft_settlement_tx)
+                              and not only xete_verify_settlement_tx, which advises. With one,
+                              they refuse; pass the recipient's base58 wallet instead.
+                              xete_settle_status is read-only and degrades instead: it still
+                              answers open/determinate but leaves beneficiary_verified null.
+                              Falls back to XETE_SOLANA_RPC, then XETE_RPC_URL.
   XETE_RPC_URL_2              a second Solana endpoint for settlement account reads. Without
                               it, xete_settle_status can only report what one endpoint said,
                               and labels its answers accordingly.
+
+  DIFFERENT PROVIDERS MEANS DIFFERENT HOSTS, and it is enforced, not advisory: endpoints are
+  counted by (scheme, host, port), so two spellings of one URL — a trailing slash, a path, a
+  second ?api-key= on the same provider, different host case, an explicit :443, the FQDN root
+  dot — are ONE endpoint, and every loopback spelling is one endpoint regardless of port. Two
+  API keys buy two credentials, never two opinions.
+
+  A DEFAULT INSTALL ALREADY HAS TWO (solana-rpc.publicnode.com and api.mainnet-beta.solana.com),
+  so %name spending works out of the box. The one configuration that loses it is setting
+  XETE_RPC_URL to a host this package already uses as a default — the list then collapses to
+  one and every %name is refused with instructions. Putting the same URL in XETE_SOLANA_RPC
+  instead keeps two, because XETE_RPC_URL is what the module default mirrors. Prefer naming your
+  own providers in XETE_ALIAS_RPC and the asymmetry never arises.
 """
 from __future__ import annotations
 
@@ -107,8 +124,8 @@ from mcp.server.fastmcp import FastMCP
 from .client import XeteClient, load_or_create_identity
 from . import alias_chain, draft, payment, settlement, signguard
 from . import txguard as txguard_mod
-from .safehttp import (EndpointError, as_bool, as_int, as_name, as_str, get_json,
-                       project, redact_url, require_secure_url)
+from .safehttp import (EndpointError, as_bool, as_int, as_name, as_str, distinct_endpoints,
+                       get_json, project, redact_url, require_secure_url)
 
 SERVER_URL = os.environ.get("XETE_SERVER_URL", "https://xete.net")
 RPC_URL = os.environ.get("XETE_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -623,6 +640,27 @@ def _alias_view(name: str) -> dict:
     out["alias_owner"] = owner
     out["claimed"] = owner is not None
     out["resolution"] = _chain_source()
+    if owner is not None:
+        # `verified: true` on this path means "read off the chain instead of taken from the
+        # permit server". It does NOT mean corroborated, and one endpoint chose this wallet —
+        # through a precedence chain (XETE_SOLANA_RPC -> XETE_RPC_URL -> default) that does not
+        # even read XETE_ALIAS_RPC, so the operator's ranked corroborators are not consulted.
+        #
+        # Found by the fresh-context pass on the corroboration fix, and it is the cheaper route
+        # to the same money decision: the settlement tools refuse a %name they cannot corroborate
+        # and tell the agent to pass a base58 wallet, the agent calls THIS tool to get one, and
+        # the wallet a single endpoint chose is deposited to two calls later — arriving as base58,
+        # so `_resolve_recipient_corroborated` short-circuits it as "nothing was resolved, so no
+        # endpoint had any say in it". Refusing here would break a read tool that has legitimate
+        # non-money uses; saying so plainly, in a key an agent cannot read as a badge, does not.
+        out["WARNING_ONE_ENDPOINT_CHOSE_THIS_WALLET"] = (
+            "This wallet came from a SINGLE Solana endpoint and `verified` here means only "
+            "'read from the chain rather than from the permit server' — it is not corroborated. "
+            "DO NOT paste it into xete_settle_create, xete_draft_settlement_tx or "
+            "xete_verify_settlement_tx as a recipient you 'looked up': those tools refuse an "
+            "uncorroborated %name on purpose, and feeding them this answer as a base58 address "
+            "launders the refusal instead of satisfying it. A payee's wallet must come from "
+            "whoever is authorising the payment, out of band.")
 
     unverified: dict = {
         "source": "permit_server",
@@ -1153,8 +1191,16 @@ def alias_rpc_endpoints() -> list[str]:
 
     Order: XETE_ALIAS_RPC (comma-separated, wins outright and may name several), then
     XETE_SOLANA_RPC, then XETE_RPC_URL *if the operator actually set it*, then alias_chain's
-    public default, then whatever RPC_URL ended up as. Duplicates are collapsed, so listing the
-    same URL twice cannot manufacture agreement between "two" endpoints.
+    public default, then whatever RPC_URL ended up as.
+
+    Duplicates are collapsed BY SERVER, not by string — `safehttp.endpoint_identity`, i.e.
+    (scheme, host, port). That distinction is the whole guarantee: this list is what
+    `_resolve_recipient_corroborated` slices `[:2]` from, so anything that fills two slots with
+    one machine turns "two endpoints agree" back into one endpoint talking to itself. A raw
+    string key let `https://h/rpc` and `https://h/rpc/`, `?api-key=A` and `?api-key=B`, and
+    `https://H` and `https://h` all do exactly that, and the honest fallback that would have
+    contradicted the liar was then never reached — findings [G10]/[G16]. Two API keys on one
+    provider are two credentials, not two opinions.
 
     XETE_RPC_URL is ranked by whether it was SET, not by its value, and that distinction is
     load-bearing in both directions. Set, it is the operator's deliberate choice of endpoint and
@@ -1167,12 +1213,7 @@ def alias_rpc_endpoints() -> list[str]:
     ordered.append(os.environ.get("XETE_RPC_URL") or "")     # only when explicitly configured
     ordered.append(alias_chain.DEFAULT_RPC)
     ordered.append(RPC_URL or "")
-    out: list[str] = []
-    for u in ordered:
-        u = u.strip()
-        if u and u not in out:
-            out.append(u)
-    return out
+    return distinct_endpoints(ordered)
 
 
 def _reject_confusable_name(bare: str) -> None:
@@ -1243,7 +1284,10 @@ def xete_settle_create(recipient: str, amount_sol: float, notify: bool = True) -
     """Open a confidential SETTLEMENT (a "tab") that pays `recipient` `amount_sol` — agent-to-agent
     value transfer, not a message fee. Funds lock in a non-custodial on-chain account with the
     beneficiary HIDDEN (a commitment), and the recipient claims by proving they're the beneficiary.
-    Recipient may be a wallet address or a %alias. Your identity wallet is the depositor + fee payer
+    Recipient may be a wallet address or a %alias — but a %alias is accepted only when TWO
+    differently-configured Solana endpoints (XETE_ALIAS_RPC) resolve it to the SAME wallet, so
+    that no single endpoint can choose who your money goes to. With one endpoint it is refused:
+    pass the base58 wallet. Your identity wallet is the depositor + fee payer
     (must hold amount_sol + a little for rent/gas). If notify is true and the recipient is messageable,
     the claim ticket (escrow_id + salt) is sent to them END-TO-END ENCRYPTED over xete. ALWAYS returns
     the ticket so you can deliver it yourself too — the recipient needs escrow_id + salt to claim. You
@@ -1259,7 +1303,10 @@ def xete_settle_create(recipient: str, amount_sol: float, notify: bool = True) -
     try:
         from solders.keypair import Keypair
 
-        recipient_wallet, handle = _resolve_recipient_wallet(recipient)
+        # Two endpoints must agree on a %name before a lamport moves — the same bargain
+        # xete_verify_settlement_tx imposes on a draft it only ADVISES about. See
+        # _resolve_recipient_corroborated: this call used to ask exactly one endpoint.
+        recipient_wallet, _provenance, handle = _resolve_recipient_corroborated(recipient, "spend")
         depositor = Keypair.from_seed(ident.ed_seed)
         lamports = int(round(amount_sol * 1_000_000_000))
         if lamports <= 0:
@@ -1498,7 +1545,12 @@ def xete_settle_status(escrow_id: str, expect_recipient: str = "", salt: str = "
     its id, and the depositor, amount and pda will all look exactly right. Pass `expect_recipient`
     (normally your own wallet, from xete_my_identity) and the `salt` from the ticket: this
     re-derives the commitment and tells you plainly whether it matches. Without them,
-    `beneficiary_verified` comes back null and you have verified nothing."""
+    `beneficiary_verified` comes back null and you have verified nothing.
+
+    PREFER A BASE58 WALLET for `expect_recipient`. A %alias is resolved through two
+    differently-configured endpoints that must agree (XETE_ALIAS_RPC); if they cannot,
+    `beneficiary_verified` stays null with WARNING_RECIPIENT_WAS_NOT_INDEPENDENTLY_RESOLVED
+    rather than vouching for a wallet one endpoint chose. The open/settled answer is unaffected."""
     bad = _escrow_id_error(escrow_id)
     if bad:
         return _status_refusal(bad)
@@ -1509,11 +1561,54 @@ def xete_settle_status(escrow_id: str, expect_recipient: str = "", salt: str = "
     try:
         expect_commitment = None
         checked_against = None
+        recipient_refusal = None
         if expect_recipient and salt:
-            wallet, _ = _resolve_recipient_wallet(expect_recipient)
-            expect_commitment = settlement.commitment(wallet, settlement.parse_salt(salt)).hex()
-            checked_against = str(wallet)
+            # A %name here decides WHICH WALLET this tool vouches for, so it gets the same
+            # two-endpoint rule as the verifier. It used to go through
+            # `_resolve_recipient_wallet` -> `alias_rpc_endpoints()[0]`: one endpoint, the exact
+            # tautology xete_verify_settlement_tx refuses by name, and a victim naming their own
+            # alias got `beneficiary_verified: true` for an escrow that genuinely paid the
+            # attacker (finding [G11]). Unlike the spending tools this one DEGRADES instead of
+            # refusing: it is read-only, and it is where every unconfirmed-submit message sends
+            # an agent that does not know whether its money moved. Losing `open`/`determinate`
+            # over an unverifiable %name would take the answer away exactly when it is needed.
+            #
+            # And the catch is `Exception`, not just CorroborationUnavailable, deliberately.
+            # Resolving the recipient is an EXTRA check bolted onto a question about an escrow
+            # account; it must not be able to answer that question with an error. Asking two
+            # endpoints instead of one doubles the chance one of them is down, so narrowing this
+            # to the refusal class would have made a flaky alias RPC newly capable of destroying
+            # the `determinate` field that xete_settle_create/_claim/_reclaim tell the agent to
+            # "read FIRST" — trading finding [G11] for finding [G19]. Nothing positive is ever
+            # concluded from this branch: beneficiary_verified stays null and says why.
+            try:
+                wallet, _prov, _h = _resolve_recipient_corroborated(expect_recipient, "status")
+            except Exception as e:              # noqa: BLE001 — deliberate, see above
+                recipient_refusal = str(e)[:400]
+            else:
+                expect_commitment = settlement.commitment(
+                    wallet, settlement.parse_salt(salt)).hex()
+                checked_against = str(wallet)
         out = settlement.status(_signing_rpc_url(), escrow_id, expect_commitment_hex=expect_commitment)
+        if out.get("second_endpoint_error"):
+            # A configured corroborator that did not answer used to downgrade the whole reply to
+            # one source in silence — no WARNING_* key at all, while two endpoints that DISAGREE
+            # fail closed and half a claim ticket gets WARNING_NOTHING_WAS_VERIFIED. The
+            # adversary who can lie on endpoint 1 is usually the same one who can drop endpoint
+            # 2's connection, so the control was disableable by the party it defends against
+            # (finding [G18]). The availability tradeoff is kept deliberately — a corroborator
+            # that is down costs confidence, not the answer — but an agent branching on
+            # `open`/`beneficiary_verified` never reads verdict prose, so the downgrade is now
+            # stated in a key it cannot miss.
+            out["WARNING_CORROBORATION_REQUESTED_BUT_NOT_OBTAINED"] = (
+                "A second endpoint IS configured (" + settlement.ENV_SECOND_RPC + ") and it did "
+                "not answer, so every positive field below rests on ONE endpoint's account of "
+                "the chain — the configuration you set up precisely so that it would not. This "
+                "is not the same as having no corroborator: an endpoint that can lie to you can "
+                "usually also silence the one that would contradict it. Treat `open` and "
+                "`beneficiary_verified` as that single endpoint's claim and re-check before "
+                "releasing anything or discarding a ticket. Endpoint error: "
+                + str(out["second_endpoint_error"])[:160])
         if out.get("determinate") is False:
             # `open` is null here, and an agent that treats null as falsey concludes "not open"
             # — which for xete_settle_create's guidance means "your funds never left" and for
@@ -1523,6 +1618,18 @@ def xete_settle_status(escrow_id: str, expect_recipient: str = "", salt: str = "
             out["WARNING_STATUS_IS_INDETERMINATE"] = _INDETERMINATE_WARNING
         if checked_against:
             out["checked_against_wallet"] = checked_against
+        elif recipient_refusal:
+            # beneficiary_verified is already None — settlement.status was given no commitment to
+            # compare — but silence about WHY reads as "you did not ask", which is the one thing
+            # that did not happen. Say that the recipient could not be pinned down, in the same
+            # WARNING_ shape as the other two weak answers.
+            out["WARNING_RECIPIENT_WAS_NOT_INDEPENDENTLY_RESOLVED"] = (
+                "beneficiary_verified is null and NOTHING about who this escrow pays has been "
+                "checked: the recipient you passed could not be pinned to a wallet by two "
+                "independently-operated Solana endpoints, and resolving it through one would "
+                "have let that one endpoint decide the answer it was being asked to confirm. "
+                "The open/settled answer below is unaffected — it is about the escrow account, "
+                "not about who it pays. Reason: " + recipient_refusal)
         elif expect_recipient or salt:
             # Half a claim ticket verifies NOTHING, and silence about that is worse than not
             # offering the argument: a caller who passed their own wallet reasonably reads a
@@ -1562,7 +1669,10 @@ def xete_draft_settlement_tx(recipient: str, amount_sol: float) -> str:
     """Draft an UNSIGNED settlement transaction paying `recipient` `amount_sol` — for review and
     signing by a HUMAN in their own wallet. This tool CANNOT move funds: it holds no key and
     submits nothing. Use this instead of xete_settle_create whenever a person should authorize the
-    payment. Recipient may be a wallet address or a %alias. Returns base64 unsigned transaction, a
+    payment. Recipient may be a wallet address or a %alias — a %alias only when TWO
+    differently-configured Solana endpoints (XETE_ALIAS_RPC) agree on the wallet it names; with
+    one endpoint it is refused, because xete_verify_settlement_tx could not check such a draft
+    either. Returns base64 unsigned transaction, a
     plain-English summary, the claim ticket (escrow_id + salt) the recipient will need, and the
     exact arguments to pass to xete_verify_settlement_tx. The beneficiary is HIDDEN on-chain as a
     hash, so the raw transaction does not show who gets paid — always verify before signing."""
@@ -1574,7 +1684,11 @@ def xete_draft_settlement_tx(recipient: str, amount_sol: float) -> str:
                                "XETE_DEPOSITOR_WALLET is not set. The operator must configure the "
                                "wallet that will sign; it is deliberately not a tool argument."})
         depositor = Pubkey.from_string(DEPOSITOR_WALLET)
-        recipient_wallet, handle = _resolve_recipient_wallet(recipient)
+        # Same two-endpoint rule as the verifier. A draft resolved through one endpoint could
+        # never be verified anyway (xete_verify_settlement_tx refuses a %name in that
+        # configuration), so building it is a dead end that ends with a human staring at an
+        # unsignable transaction — or signing it without the check.
+        recipient_wallet, _provenance, handle = _resolve_recipient_corroborated(recipient, "spend")
         lamports = int(round(amount_sol * 1_000_000_000))
         if lamports <= 0:
             return json.dumps({"status": "failed", "error": "amount_sol must be > 0"})
@@ -1631,8 +1745,45 @@ def _is_raw_wallet(s: str) -> bool:
         return False
 
 
-def _resolve_for_verification(expect_recipient: str) -> tuple[object, str]:
-    """(wallet, provenance) for the VERIFIER — resolved so that it cannot be the draft's own oracle.
+class CorroborationUnavailable(RuntimeError):
+    """A %name could not be pinned to a wallet by two independently-operated endpoints.
+
+    Its own class, and not a bare RuntimeError, because the callers want different things from
+    it. The two tools that choose where money goes (xete_settle_create, xete_draft_settlement_tx)
+    and the tool that certifies a draft (xete_verify_settlement_tx) must REFUSE. xete_settle_status
+    is read-only, and is the tool every unconfirmed-submit message sends an agent to when it does
+    not know whether its money moved — it must still answer the open/determinate question and
+    merely decline to vouch for the beneficiary.
+
+    Distinct from a resolution FAILURE (name not registered, chain unreadable), which is
+    alias_chain's AliasChainError / a plain RuntimeError and still fails every caller closed.
+    """
+
+
+# (verb, why-one-endpoint-is-not-enough) per calling context. The verb keeps the refusal honest
+# about what is being refused: telling a spender "refusing to verify" sends them looking for a
+# verifier they never called.
+_CORROBORATION_PURPOSE = {
+    "verify": (
+        "verify against",
+        "the draft resolved that same name through that same endpoint, so re-resolving it here "
+        "re-derives the draft's own answer and every check passes by construction — which is "
+        "exactly the failure this tool exists to catch."),
+    "spend": (
+        "send money to",
+        "one endpoint would choose the destination of a real payment with nothing able to "
+        "contradict it, and a lying or MITM'd endpoint is the entire threat here. "
+        "xete_verify_settlement_tx already refuses a %name in this configuration; the tool that "
+        "MOVES the money must not be the weaker of the two."),
+    "status": (
+        "check against",
+        "the wallet would come from one endpoint, and `beneficiary_verified: true` derived that "
+        "way says only that one endpoint agrees with itself about who your alias belongs to."),
+}
+
+
+def _resolve_recipient_corroborated(recipient: str, purpose: str = "verify"):
+    """(wallet, provenance, handle) — a %name pinned by TWO independently-operated endpoints.
 
     THE TAUTOLOGY THIS EXISTS TO BREAK. xete_draft_settlement_tx resolves a %name and builds a
     commitment from the answer. If xete_verify_settlement_tx then resolves the same %name the
@@ -1657,46 +1808,81 @@ def _resolve_for_verification(expect_recipient: str) -> tuple[object, str]:
     costs the operator one environment variable or one copy-paste of a wallet address, and it is
     the only shape in which this tool's answer means what it says.
 
+    WHY THE SPENDING TOOLS CALL THIS TOO, and they did not used to. This rule was enforced on
+    xete_verify_settlement_tx — which only ADVISES — while xete_settle_create,
+    xete_draft_settlement_tx and xete_settle_status resolved through `alias_rpc_endpoints()[0]`,
+    one endpoint, even when two were configured. In one configuration a reviewer got the verifier
+    refusing ("resolves DIFFERENTLY on two endpoints") and, in the same process, `settle_create`
+    depositing to the attacker that same lying endpoint had named: the tool that only advises was
+    strictly better defended than the tool that moves the money (finding [G17], and [G11] for the
+    status half). "Two endpoints" is a property of the DESTINATION DECISION, so it belongs
+    wherever that decision is made, not only where it is reported.
+
     Note what this does to the reviewer's attack. Pointing XETE_SOLANA_RPC at a hostile endpoint
     used to be sufficient: it answered for both the draft AND the verifier. It is now only ever
     endpoint #1, so the verifier also asks #2 (the operator's own, or the unrelated public
     default) and the two disagree — the payment is refused instead of certified. The attacker
-    now has to own two independently-operated endpoints, not one.
+    now has to own two independently-operated endpoints, not one — and since
+    `alias_rpc_endpoints` keys on (scheme, host, port), owning one host under two spellings is
+    not two.
     """
-    r = expect_recipient.strip()
+    r = recipient.strip()
     if _is_raw_wallet(r):
-        wallet, _ = _resolve_recipient_wallet(r)
+        wallet, handle = _resolve_recipient_wallet(r)
         return wallet, ("the base58 wallet you supplied — nothing was resolved, so no endpoint "
-                        "had any say in it")
+                        "had any say in it"), handle
 
+    # Confusables BEFORE the endpoint count. A %name that renders as a different name must be
+    # refused for that reason under every configuration; letting the one-endpoint refusal mask it
+    # would send an operator off configuring a second RPC to "fix" a name that must never resolve.
+    name = alias_chain.normalize_name(r)
+    _reject_confusable_name(name)
+
+    verb, why = _CORROBORATION_PURPOSE[purpose]
     endpoints = alias_rpc_endpoints()
     if len(endpoints) < 2:
-        # Remediation FIRST. These messages are truncated for display, and the half a human
-        # needs is the half that says what to do — not the half that explains the theory.
-        raise RuntimeError(
-            f"PASS THE RECIPIENT'S BASE58 WALLET ADDRESS instead of '{expect_recipient}', or set "
-            "XETE_ALIAS_RPC to two comma-separated Solana endpoints run by different providers. "
-            f"Refusing to verify against a %name with only one Solana endpoint configured "
-            f"({endpoints[0]}): the draft resolved that same name through that same endpoint, so "
-            "re-resolving it here re-derives the draft's own answer and every check passes by "
-            "construction — which is exactly the failure this tool exists to catch.")
+        # Remediation FIRST. These messages are truncated for display (300 chars in some tool
+        # handlers), and the half a human needs is the half that says what to do — not the half
+        # that explains the theory.
+        raise CorroborationUnavailable(
+            f"PASS THE RECIPIENT'S BASE58 WALLET ADDRESS — from whoever is authorising this "
+            f"payment, NOT from xete_resolve or xete_alias_resolve, which ask one endpoint and "
+            f"would launder this refusal rather than satisfy it — instead of '{recipient}'; or "
+            "set XETE_ALIAS_RPC to two comma-separated Solana endpoints run by different "
+            f"providers. Refusing to {verb} a %name with only one Solana endpoint configured "
+            f"({endpoints[0]}): " + why)
 
     answers: dict[str, str] = {}
     for url in endpoints[:2]:
-        wallet, _ = _resolve_recipient_wallet(r, rpc=url)
+        try:
+            wallet, _ = _resolve_recipient_wallet(r, rpc=url)
+        except alias_chain.AliasChainError as e:
+            # An endpoint that cannot be READ is not the same as an endpoint that says "no such
+            # name" — the latter is a definite answer and keeps its own message. This branch is
+            # the cost of requiring two sources: a flaky second endpoint now blocks a %name spend
+            # that one endpoint alone would have completed. That is the correct direction for
+            # money (do not send what you could not confirm), but the refusal has to hand the
+            # caller the way out, or it reads as an outage rather than a choice.
+            raise CorroborationUnavailable(
+                f"PASS THE RECIPIENT'S BASE58 WALLET ADDRESS instead of '{recipient}': {url} "
+                f"could not answer for it ({type(e).__name__}: {str(e)[:120]}), and a %name "
+                "needs TWO independently-operated endpoints that agree before it can decide "
+                "where money goes. Set XETE_ALIAS_RPC to two working Solana endpoints run by "
+                "different providers, or pass the wallet address.") from e
         answers[url] = str(wallet)
     a, b = endpoints[0], endpoints[1]
     if answers[a] != answers[b]:
-        raise RuntimeError(
-            f"the %name '{expect_recipient}' resolves DIFFERENTLY on two endpoints: {a} says "
+        raise CorroborationUnavailable(
+            f"the %name '{recipient}' resolves DIFFERENTLY on two endpoints: {a} says "
             f"{answers[a]}, {b} says {answers[b]}. One of them is lying or stale and there is no "
             "way to tell which from here. DO NOT SIGN. Resolve the recipient's wallet address "
-            "out of band and pass it as base58.")
+            "OUT OF BAND — from the person being paid, not from another tool on this server — "
+            "and pass it as base58.")
     from solders.pubkey import Pubkey
     return Pubkey.from_string(answers[a]), (
         f"the %alias registry as reported by TWO independent endpoints that agree: {a} and {b}. "
         "This is not proof the registry says it — both could be wrong together — but no single "
-        "endpoint chose this answer.")
+        "endpoint chose this answer."), f"%{name}"
 
 
 @mcp.tool()
@@ -1726,7 +1912,8 @@ def xete_verify_settlement_tx(unsigned_tx_b64: str, expect_recipient: str, salt:
         if not DEPOSITOR_WALLET:
             return json.dumps({"status": "unconfigured",
                                "error": "XETE_DEPOSITOR_WALLET is not set; nothing to verify against."})
-        recipient_wallet, provenance = _resolve_for_verification(expect_recipient)
+        recipient_wallet, provenance, _handle = _resolve_recipient_corroborated(
+            expect_recipient, "verify")
         r = draft.verify_draft(
             unsigned_tx_b64,
             expect_recipient=recipient_wallet,

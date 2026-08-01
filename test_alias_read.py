@@ -499,3 +499,33 @@ def test_settlement_still_accepts_a_raw_wallet(net):
     assert wallet == Pubkey.from_string(CHAIN_OWNER)
     assert handle is None
     assert net.calls == []
+
+
+def test_xete_resolve_says_one_endpoint_chose_the_wallet(net):
+    """Found by the fresh-context pass on the endpoint-corroboration fix
+    (reviews/DDR-endpoint-corroboration-20260801.md, reviewer §1).
+
+    `verified: true` here means "read off the chain rather than off the permit server". It does
+    NOT mean corroborated: this path asks ONE endpoint, through a precedence chain that never
+    reads XETE_ALIAS_RPC, so the operator's ranked corroborators are not consulted. That made it
+    the cheap route around the settlement tools' two-endpoint rule — they refuse an
+    uncorroborated %name and tell the agent to pass a base58 wallet; the agent calls this tool to
+    get one; the wallet a single endpoint chose is deposited to two calls later, arriving as
+    base58 so nothing re-checks it. Refusing here would break a read tool with legitimate
+    non-money uses. Saying so in a key that is not a boolean does not."""
+    net.claim("bob", CHAIN_OWNER)
+
+    got = out(server.xete_resolve("%bob"))
+
+    assert got["verified"] is True, "unchanged: this IS the chain rather than the permit server"
+    assert got["wallet"] == CHAIN_OWNER
+    warn = got["WARNING_ONE_ENDPOINT_CHOSE_THIS_WALLET"]
+    assert "xete_settle_create" in warn, "name the tools this answer must not be pasted into"
+    assert "not corroborated" in warn
+
+
+def test_an_unclaimed_name_carries_no_one_endpoint_warning(net):
+    """The over-refusal guard: the warning attaches to an ANSWER, not to every call."""
+    got = out(server.xete_resolve("%nobodyhasthis"))
+    assert got["claimed"] is False
+    assert "WARNING_ONE_ENDPOINT_CHOSE_THIS_WALLET" not in got

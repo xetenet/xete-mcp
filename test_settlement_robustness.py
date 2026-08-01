@@ -708,25 +708,33 @@ def two_endpoints(monkeypatch, drafting):
 
 # ── [15] a hostile permit server chose the recipient, and the verifier agreed ─────────
 
-def test_a_lying_permit_server_can_no_longer_choose_who_gets_paid(chain, drafting):
+def test_a_lying_permit_server_can_no_longer_choose_who_gets_paid(chain, two_endpoints):
     """THE finding, end to end. A permit server returning an attacker pubkey used to make
     xete_draft_settlement_tx build a 1 SOL deposit naming the attacker, and
     xete_verify_settlement_tx then returned verified=true / 'SAFE TO REVIEW AND SIGN' with zero
     failed checks — because the 'independent' recipient it compared against came from the same
-    server. The registry is on chain; the server is not asked at all any more."""
+    server. The registry is on chain; the server is not asked at all any more.
+
+    Round 4: moved from `drafting` to `two_endpoints` because finding [G17] put the drafting
+    path under the same two-endpoint rule as the verifier — a %name now needs two agreeing
+    endpoints wherever it chooses a destination, not only where it is certified. The property
+    under test (the permit server has no say) is unchanged and the fixture still fails the test
+    if HTTP is touched."""
     chain["bob"] = str(RECIPIENT.pubkey())        # the truth, on chain
-    out = json.loads(drafting.xete_draft_settlement_tx("%bob", 1.0))
+    out = json.loads(two_endpoints.xete_draft_settlement_tx("%bob", 1.0))
     assert out["status"] == "drafted", out
     assert out["recipient_wallet"] == str(RECIPIENT.pubkey())
     assert str(ATTACKER.pubkey()) not in json.dumps(out)
 
 
-def test_the_draft_does_not_prefill_the_verifier_with_its_own_answer(chain, drafting):
+def test_the_draft_does_not_prefill_the_verifier_with_its_own_answer(chain, two_endpoints):
     """`verify_with.expect_recipient` used to be d.recipient — the draft's own resolution copied
     forward, so the verifier re-derived the commitment from the wallet that built it and agreed
-    with itself. The commitment check was tautological."""
+    with itself. The commitment check was tautological.
+
+    Round 4: `two_endpoints`, per [G17] — see the note above."""
     chain["bob"] = str(RECIPIENT.pubkey())
-    out = json.loads(drafting.xete_draft_settlement_tx("%bob", 1.0))
+    out = json.loads(two_endpoints.xete_draft_settlement_tx("%bob", 1.0))
     prefilled = out["verify_with"]["expect_recipient"]
     assert prefilled != out["recipient_wallet"], "the verifier is being fed the draft's own answer"
     assert prefilled != str(RECIPIENT.pubkey())
@@ -767,9 +775,12 @@ def test_an_unreadable_chain_fails_closed_instead_of_falling_back_to_a_server(ch
     assert "PERMIT_SERVER_WAS_ASKED" not in json.dumps(v)
 
 
-def test_an_unregistered_name_is_refused_not_guessed(chain, drafting):
+def test_an_unregistered_name_is_refused_not_guessed(chain, two_endpoints):
+    """Round 4: `two_endpoints`, per [G17]. Deliberately NOT `drafting` — with one endpoint the
+    draft now refuses for the endpoint-count reason, which would make this test pass while
+    proving nothing about unregistered names."""
     chain["bob"] = None
-    out = json.loads(drafting.xete_draft_settlement_tx("%bob", 1.0))
+    out = json.loads(two_endpoints.xete_draft_settlement_tx("%bob", 1.0))
     assert out["status"] == "failed"
     assert "no registration" in out["error"] or "not registered" in out["error"]
 
@@ -1261,15 +1272,24 @@ def test_a_single_endpoint_cannot_both_build_and_certify_a_payment(chain, drafti
     asked that same endpoint, re-derived the same commitment, and returned
     `verified: true / SAFE TO REVIEW AND SIGN / total_sol_out: 1.0` — the original permit-server
     finding, one layer down. The verifier must not accept a name it can only resolve through the
-    endpoint that built the draft."""
+    endpoint that built the draft.
+
+    ROUND 4, and the assertion got STRONGER, not weaker. The draft used to be built — the
+    hostile endpoint got its way and only the verifier stopped the payment. Finding [G17] put
+    the drafting path under the same rule, so the hostile endpoint no longer gets to choose a
+    destination at all, and the tool that would have handed a human a transaction to sign
+    refuses first. The verifier half is still asserted, against a draft the ATTACKER builds
+    directly — which is the honest model anyway, since an attacker who controls the endpoint
+    does not need this server's drafting tool to produce a transaction."""
     chain.at(ONE_RPC)["bob"] = str(ATTACKER.pubkey())
 
     d = json.loads(drafting.xete_draft_settlement_tx("%bob", 1.0))
-    assert d["status"] == "drafted"
-    assert d["recipient_wallet"] == str(ATTACKER.pubkey())      # the hostile endpoint got its way
+    assert d["status"] == "failed", "one endpoint chose the destination of a payment"
+    assert str(ATTACKER.pubkey()) not in json.dumps(d)
 
-    v = json.loads(drafting.xete_verify_settlement_tx(
-        d["unsigned_tx_b64"], "%bob", d["ticket"]["salt"], 1.0))
+    evil = _tx_b64([settlement._cb_limit(60_000), settlement._cb_price(1_000),
+                    _deposit_ix(recipient=ATTACKER.pubkey())])
+    v = json.loads(drafting.xete_verify_settlement_tx(evil, "%bob", SALT.hex(), 1.0))
     assert v["verified"] is False, "one endpoint certified a payment it chose itself"
     assert "SAFE TO REVIEW AND SIGN" not in json.dumps(v)
     # A refusal with no way forward is how a human ends up reaching for the tool that says yes.
@@ -1365,10 +1385,10 @@ def test_a_confusable_name_is_refused_on_the_money_path(chain, drafting, name):
     assert not chain.calls, "a confusable name must be refused before any lookup"
 
 
-def test_a_plain_ascii_name_is_unaffected(chain, drafting):
-    """The over-refusal guard for the check above."""
+def test_a_plain_ascii_name_is_unaffected(chain, two_endpoints):
+    """The over-refusal guard for the check above. Round 4: `two_endpoints`, per [G17]."""
     chain["john"] = str(RECIPIENT.pubkey())
-    out = json.loads(drafting.xete_draft_settlement_tx("%john", 1.0))
+    out = json.loads(two_endpoints.xete_draft_settlement_tx("%john", 1.0))
     assert out["status"] == "drafted"
     assert out["recipient_wallet"] == str(RECIPIENT.pubkey())
 
@@ -2245,3 +2265,536 @@ class _BreaksOnce:
             self._armed = False
             raise TypeError("Object of type _Weird is not JSON serializable")
         return self._real.dumps(*a, **k)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# FOURTH ADVERSARIAL PASS — the ENDPOINT-CORROBORATION group, findings [G10]/[G16]
+# (two spellings of one host filled both corroboration slots), [G17]/[G11] (the rule was
+# enforced on the advisory path and not on the spending path) and [G18] (a corroborator
+# that was silenced downgraded the answer with none of the WARNING_* keys every other
+# weaker condition gets).
+#
+# Two independent reviewers found [G10]/[G16] with the same control: byte-identical
+# duplicates DO collapse and the payment IS refused, so the mechanism works and only the
+# dedupe key is wrong. That control is `test_two_agreeing_endpoints_let_an_honest_name_
+# verify` and the byte-identical case below; the respelling cases are the finding.
+#
+# Every test here ASSERTING THE NEW BEHAVIOUR was run against the code with the fix
+# reverted and FAILS there — measured, 25 of 30 in the first batch. The other five are the
+# over-refusal guards and the reviewers' control, which are supposed to pass both ways;
+# they are named as such where they appear. A guard that only passes after the fix is not
+# a guard.
+# Still offline: no network, no mainnet, no wallet, nothing submitted.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+HOSTILE_RPC = "https://one-provider.example"
+HONEST_FALLBACK = "https://honest-fallback.example"
+
+# Every one of these names the SAME SERVER as HOSTILE_RPC. The last two are not typos:
+# "one provider, two API keys" is what a careful operator does when told to configure two
+# endpoints, and an explicit :443 is what a copy-paste from a provider dashboard looks like.
+SAME_HOST_SPELLINGS = [
+    HOSTILE_RPC + "/",                  # trailing slash
+    HOSTILE_RPC + "//",                 # doubled slash
+    HOSTILE_RPC + "/rpc",               # a path
+    "https://ONE-PROVIDER.example",     # host case
+    HOSTILE_RPC + "/?api-key=BBBB",     # one provider, second key
+    HOSTILE_RPC + ":443",               # the default port, spelled out
+    # Found by the fresh-context pass on this very fix, not by the original reviewers: the
+    # first cut keyed on urlsplit's hostname verbatim, so the FQDN root dot and the two IPv6
+    # spellings were still two "independent" endpoints. Same one-character shape as the bug.
+    "https://one-provider.example.",    # the FQDN root dot
+    "HTTPS://One-Provider.Example.:443/?api-key=CCCC",   # all of the above at once
+]
+
+
+@pytest.fixture()
+def one_hostile_provider(monkeypatch, drafting):
+    """ONE hostile host, plus an honest endpoint sitting behind it in the ranking.
+
+    The shape matters and the reviewer said so explicitly: a globally-hostile stub proves
+    nothing, because in reality the honest default is at position 2 and the question is whether
+    it gets ASKED. Only `HOSTILE_RPC` (under any spelling) lies; `alias_chain.DEFAULT_RPC` is an
+    honest endpoint that will contradict it the moment anything consults it.
+    """
+    monkeypatch.setattr(alias_chain, "DEFAULT_RPC", HONEST_FALLBACK)
+    monkeypatch.setattr(drafting, "RPC_URL", HONEST_FALLBACK)
+    return drafting
+
+
+# ── [G10]/[G16] the two-endpoint rule corroborating itself ────────────────────────────
+
+@pytest.mark.parametrize("second_spelling", SAME_HOST_SPELLINGS)
+def test_two_spellings_of_one_host_are_not_two_endpoints(chain, one_hostile_provider,
+                                                          monkeypatch, second_spelling):
+    """THE finding. One hostile host, listed twice under two spellings, used to fill both slots
+    of the two-of-two agreement rule: the honest fallback was never consulted, the two "sources"
+    were the same machine agreeing with itself, and xete_verify_settlement_tx returned
+    verified:true / SAFE TO REVIEW AND SIGN on a payment to an attacker. Defeated by one
+    character — a trailing slash, a second API key on the same provider, a capital letter."""
+    monkeypatch.setenv("XETE_ALIAS_RPC", f"{HOSTILE_RPC},{second_spelling}")
+    chain["bob"] = str(RECIPIENT.pubkey())                  # the truth, everywhere honest
+    for spelling in [HOSTILE_RPC] + SAME_HOST_SPELLINGS:    # the one host lies, however spelled
+        chain.at(spelling)["bob"] = str(ATTACKER.pubkey())
+
+    evil = _tx_b64([settlement._cb_limit(60_000), settlement._cb_price(1_000),
+                    _deposit_ix(recipient=ATTACKER.pubkey())])
+    v = json.loads(one_hostile_provider.xete_verify_settlement_tx(evil, "%bob", SALT.hex(), 1.0))
+
+    assert v["verified"] is False, "one host, spelled twice, certified a payment it chose itself"
+    assert "SAFE TO REVIEW AND SIGN" not in json.dumps(v)
+    asked = {rpc for name, rpc in chain.calls if name == "bob"}
+    assert HONEST_FALLBACK in asked, \
+        f"the honest endpoint was never consulted; only {asked} were asked"
+
+
+@pytest.mark.parametrize("spelling", SAME_HOST_SPELLINGS)
+def test_alias_endpoints_collapse_by_server_not_by_string(monkeypatch, server_mod, spelling):
+    """The unit under the end-to-end test. `alias_rpc_endpoints()` is what
+    `_resolve_recipient_corroborated` slices [:2] from, so the dedupe key IS the corroboration
+    guarantee."""
+    monkeypatch.setenv("XETE_ALIAS_RPC", f"{HOSTILE_RPC},{spelling}")
+    monkeypatch.delenv("XETE_SOLANA_RPC", raising=False)
+    monkeypatch.delenv("XETE_RPC_URL", raising=False)
+    monkeypatch.setattr(alias_chain, "DEFAULT_RPC", HONEST_FALLBACK)
+    monkeypatch.setattr(server_mod, "RPC_URL", HONEST_FALLBACK)
+
+    endpoints = server_mod.alias_rpc_endpoints()
+
+    assert endpoints == [HOSTILE_RPC, HONEST_FALLBACK], \
+        f"{spelling!r} was counted as a second, independent server"
+
+
+def test_genuinely_different_hosts_are_still_two_endpoints(monkeypatch, server_mod):
+    """The over-refusal guard, and the reason the key is (scheme, host, port) and not something
+    blunter: normalising must not collapse endpoints that really are two providers. Two hosts
+    that differ only in a subdomain, and one that differs only in port, stay distinct."""
+    monkeypatch.setenv("XETE_ALIAS_RPC",
+                       "https://a.provider.example,https://b.provider.example,"
+                       "https://a.provider.example:8899,http://a.provider.example")
+    monkeypatch.delenv("XETE_SOLANA_RPC", raising=False)
+    monkeypatch.delenv("XETE_RPC_URL", raising=False)
+    monkeypatch.setattr(alias_chain, "DEFAULT_RPC", HONEST_FALLBACK)
+    monkeypatch.setattr(server_mod, "RPC_URL", HONEST_FALLBACK)
+
+    assert server_mod.alias_rpc_endpoints() == [
+        "https://a.provider.example", "https://b.provider.example",
+        "https://a.provider.example:8899", "http://a.provider.example", HONEST_FALLBACK]
+
+
+@pytest.mark.parametrize("spelling", SAME_HOST_SPELLINGS)
+def test_the_corroborating_settlement_endpoint_is_keyed_on_the_server(monkeypatch, spelling):
+    """The second site, and it was found independently of the first. `second_rpc_url` rejected
+    only `v == primary`, so one respelling upgraded status() from a caveated one-source answer
+    to the uncaveated 'VERIFIED ... no single endpoint chose this answer'."""
+    monkeypatch.setenv(settlement.ENV_SECOND_RPC, spelling)
+    assert settlement.second_rpc_url(HOSTILE_RPC) is None, \
+        f"{spelling!r} was accepted as a second source for {HOSTILE_RPC}"
+    # Over-refusal guard: a real second provider still counts.
+    assert settlement.second_rpc_url("https://someone-else.example") == spelling
+
+
+def test_status_does_not_claim_two_sources_when_one_host_answered(monkeypatch):
+    """End to end through settlement.status: with XETE_RPC_URL_2 pointing at the primary host
+    under another spelling, the reply used to read 'VERIFIED — ... Two independently-configured
+    endpoints ... so no single endpoint chose this answer' with exactly one host contacted."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    monkeypatch.setenv(settlement.ENV_SECOND_RPC, HOSTILE_RPC + "/")
+    monkeypatch.setattr(settlement, "Client",
+                        _account_client(_state(DEPOSITOR.pubkey(), AMOUNT, mine)))
+
+    out = settlement.status(HOSTILE_RPC, ESCROW_ID.hex(), expect_commitment_hex=mine.hex())
+
+    assert out["corroborated"] is False
+    assert out["endpoints_asked"] == [HOSTILE_RPC]
+    assert not out["verdict"].startswith("VERIFIED")
+    assert "no single endpoint chose this answer" not in out["verdict"]
+
+
+def test_byte_identical_duplicates_still_collapse(chain, one_hostile_provider, monkeypatch):
+    """The reviewers' CONTROL, kept as a test. This case always worked — it is what proved the
+    mechanism is sound and only the key was wrong — so it must keep working after the change."""
+    monkeypatch.setenv("XETE_ALIAS_RPC", f"{HOSTILE_RPC},{HOSTILE_RPC}")
+    chain["bob"] = str(RECIPIENT.pubkey())
+    chain.at(HOSTILE_RPC)["bob"] = str(ATTACKER.pubkey())
+
+    evil = _tx_b64([settlement._cb_limit(60_000), settlement._cb_price(1_000),
+                    _deposit_ix(recipient=ATTACKER.pubkey())])
+    v = json.loads(one_hostile_provider.xete_verify_settlement_tx(evil, "%bob", SALT.hex(), 1.0))
+
+    assert v["verified"] is False
+    assert HONEST_FALLBACK in {rpc for name, rpc in chain.calls if name == "bob"}
+
+
+# ── [G17] the rule was enforced where it advises, not where it spends ─────────────────
+
+def _deposit_recorder(monkeypatch, sink):
+    """settlement.deposit replaced by a recorder. Records and RETURNS — it must not raise, because
+    the tools' `except Exception` would swallow an AssertionError from in here and the test would
+    read a reached spend as a refusal (the reviewer hit exactly that)."""
+    def _rec(_url, _dep, recipient, _lam, on_ticket=None):
+        sink.append(str(recipient))
+        if on_ticket:
+            on_ticket({"escrow_id": ESCROW_ID.hex(), "salt": SALT.hex()})
+        return ESCROW_ID.hex(), SALT.hex(), "PdA", "SiG"
+    monkeypatch.setattr(settlement, "deposit", _rec)
+
+
+def test_one_lying_endpoint_cannot_choose_the_destination_of_a_real_spend(
+        chain, two_endpoints, monkeypatch, spend_ok):
+    """THE finding. Endpoint A lies about %bob; endpoint B does not. The verifier already
+    refused this exact configuration ("resolves DIFFERENTLY on two endpoints") while
+    xete_settle_create asked endpoint A alone and deposited to the attacker — the tool that only
+    advises was strictly better defended than the tool that moves the money."""
+    _identity(monkeypatch, two_endpoints)
+    chain["bob"] = str(RECIPIENT.pubkey())
+    chain.at(RPC_A)["bob"] = str(ATTACKER.pubkey())
+    spent: list[str] = []
+    _deposit_recorder(monkeypatch, spent)
+
+    out = json.loads(two_endpoints.xete_settle_create("%bob", 1.0))
+
+    assert spent == [], f"a real deposit was built for {spent} on one endpoint's say-so"
+    assert out["status"] == "failed"
+    assert "resolves DIFFERENTLY" in json.dumps(out)
+
+
+def test_the_spender_asks_both_configured_endpoints(chain, two_endpoints, monkeypatch,
+                                                     spend_ok):
+    """Guards against the fix being cosmetic — two endpoints configured, one consulted, which is
+    what the spend path did before. Mirrors `test_both_endpoints_are_actually_asked` on the
+    verifier."""
+    _identity(monkeypatch, two_endpoints)
+    chain["bob"] = str(RECIPIENT.pubkey())
+    spent: list[str] = []
+    _deposit_recorder(monkeypatch, spent)
+
+    out = json.loads(two_endpoints.xete_settle_create("%bob", 1.0))
+
+    assert out["status"] == "open", out
+    assert spent == [str(RECIPIENT.pubkey())]        # the over-refusal guard: it still spends
+    asked = {rpc for name, rpc in chain.calls if name == "bob"}
+    assert asked == {RPC_A, RPC_B}, f"only {asked} were consulted before the money moved"
+
+
+def test_the_draft_asks_both_configured_endpoints(chain, two_endpoints):
+    """Same defect on xete_draft_settlement_tx, which chooses the destination a human then signs
+    for."""
+    chain["bob"] = str(RECIPIENT.pubkey())
+    chain.at(RPC_A)["bob"] = str(ATTACKER.pubkey())
+
+    out = json.loads(two_endpoints.xete_draft_settlement_tx("%bob", 1.0))
+
+    assert out["status"] == "failed"
+    assert "resolves DIFFERENTLY" in json.dumps(out)
+    # No transaction at all — the attacker's wallet appears only inside the refusal, naming who
+    # said what, never as a destination this tool chose.
+    assert "unsigned_tx_b64" not in out and "recipient_wallet" not in out
+
+
+def test_the_spender_refuses_a_name_it_cannot_corroborate(chain, drafting, monkeypatch,
+                                                           spend_ok):
+    """The same bargain the verifier already imposed, now imposed before a lamport moves: with
+    one distinct endpoint a %name is refused and the refusal leads with what to do about it."""
+    _identity(monkeypatch, drafting)
+    chain["bob"] = str(RECIPIENT.pubkey())
+    spent: list[str] = []
+    _deposit_recorder(monkeypatch, spent)
+
+    out = json.loads(drafting.xete_settle_create("%bob", 1.0))
+
+    assert spent == [], "one endpoint chose the destination of a real deposit"
+    assert out["status"] == "failed"
+    # The remediation must survive this tool's 300-char truncation of the error.
+    assert "BASE58" in out["error"] and "XETE_ALIAS_RPC" in out["error"]
+
+
+def test_a_raw_wallet_spend_never_needs_a_second_endpoint(chain, drafting, monkeypatch,
+                                                           spend_ok):
+    """The over-refusal guard, and the escape hatch the refusal points at. A base58 wallet
+    involves no oracle, so the endpoint count is irrelevant to it — one endpoint, still spends,
+    registry never touched."""
+    _identity(monkeypatch, drafting)
+    spent: list[str] = []
+    _deposit_recorder(monkeypatch, spent)
+
+    out = json.loads(drafting.xete_settle_create(str(RECIPIENT.pubkey()), 1.0))
+
+    assert out["status"] == "open", out
+    assert spent == [str(RECIPIENT.pubkey())]
+    assert chain.calls == [], "a raw wallet must not touch the registry at all"
+
+
+# ── [G11] status vouched for a beneficiary that one endpoint chose ────────────────────
+
+def test_status_will_not_vouch_for_a_beneficiary_one_endpoint_named(chain, two_endpoints,
+                                                                     monkeypatch):
+    """A victim naming their OWN alias got `beneficiary_verified: true` for an escrow that
+    genuinely paid the attacker: `expect_recipient` was resolved through alias_rpc_endpoints()[0]
+    — one endpoint, the exact tautology xete_verify_settlement_tx refuses by name, and under this
+    same config the verifier DOES refuse."""
+    attacker_escrow = settlement.commitment(ATTACKER.pubkey(), SALT)
+    chain["bob"] = str(RECIPIENT.pubkey())
+    chain.at(RPC_A)["bob"] = str(ATTACKER.pubkey())
+    monkeypatch.setattr(settlement, "Client",
+                        _account_client(_state(DEPOSITOR.pubkey(), AMOUNT, attacker_escrow)))
+
+    out = json.loads(two_endpoints.xete_settle_status(
+        ESCROW_ID.hex(), expect_recipient="%bob", salt=SALT.hex()))
+
+    assert out["beneficiary_verified"] is None, "one endpoint vouched for who gets paid"
+    assert "checked_against_wallet" not in out
+    assert "WARNING_RECIPIENT_WAS_NOT_INDEPENDENTLY_RESOLVED" in out
+    # Read-only availability is deliberately preserved: the open/determinate answer survives.
+    assert out["determinate"] is True and out["open"] is True
+
+
+def test_status_still_verifies_a_name_two_endpoints_agree_on(chain, two_endpoints, monkeypatch):
+    """The over-refusal guard for the check above."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    chain["bob"] = str(RECIPIENT.pubkey())
+    monkeypatch.setattr(settlement, "Client",
+                        _account_client(_state(DEPOSITOR.pubkey(), AMOUNT, mine)))
+
+    out = json.loads(two_endpoints.xete_settle_status(
+        ESCROW_ID.hex(), expect_recipient="%bob", salt=SALT.hex()))
+
+    assert out["beneficiary_verified"] is True
+    assert out["checked_against_wallet"] == str(RECIPIENT.pubkey())
+    assert "WARNING_RECIPIENT_WAS_NOT_INDEPENDENTLY_RESOLVED" not in out
+
+
+# ── [G18] a silenced corroborator downgraded the answer in silence ────────────────────
+
+def test_a_silenced_corroborator_is_as_loud_as_every_other_weak_answer(server_mod, monkeypatch):
+    """Two endpoints that DISAGREE fail closed; an endpoint that is merely silenced failed OPEN,
+    with no WARNING_* key at all — while determinate=false gets WARNING_STATUS_IS_INDETERMINATE
+    and half a claim ticket gets WARNING_NOTHING_WAS_VERIFIED. The adversary who can lie on
+    endpoint 1 is generally the one who can drop endpoint 2's connection, so the control was
+    disableable by the party it defends against. An agent branching on the boolean never reads
+    the verdict prose."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    real = _state(DEPOSITOR.pubkey(), AMOUNT, mine)
+    monkeypatch.setenv("XETE_RPC_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv(settlement.ENV_SECOND_RPC, "https://down.example")
+
+    class _C:
+        def __init__(self, url, *_a, **_k):
+            self.url = url
+
+        def get_account_info(self, _pda, commitment=None):
+            if self.url == "https://down.example":
+                raise ConnectionRefusedError("silenced")
+            return SimpleNamespace(value=SimpleNamespace(
+                data=real, lamports=1, owner=settlement.program_id()))
+
+    monkeypatch.setattr(settlement, "Client", _C)
+    out = json.loads(server_mod.xete_settle_status(
+        ESCROW_ID.hex(), expect_recipient=str(RECIPIENT.pubkey()), salt=SALT.hex()))
+
+    assert out["corroborated"] is False
+    assert "WARNING_CORROBORATION_REQUESTED_BUT_NOT_OBTAINED" in out, \
+        "the one weak condition with no warning key is the one an attacker can cause"
+    assert settlement.ENV_SECOND_RPC in out["WARNING_CORROBORATION_REQUESTED_BUT_NOT_OBTAINED"]
+    # The availability tradeoff is DELIBERATE and stays: a corroborator that is down costs
+    # confidence, not the answer. This test is about the volume of the downgrade, not the shape.
+    assert out["open"] is True and out["determinate"] is True
+    assert out["beneficiary_verified"] is True
+
+
+def test_a_corroborator_that_answers_raises_no_warning(server_mod, monkeypatch):
+    """The over-refusal guard: the new key must fire on a SILENCED corroborator, not on every
+    two-endpoint call."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    real = _state(DEPOSITOR.pubkey(), AMOUNT, mine)
+    monkeypatch.setenv("XETE_RPC_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv(settlement.ENV_SECOND_RPC, "https://up.example")
+    monkeypatch.setattr(settlement, "Client", _two_endpoint_client({
+        "http://127.0.0.1:1": (real, settlement.program_id()),
+        "https://up.example": (real, settlement.program_id()),
+    }))
+
+    out = json.loads(server_mod.xete_settle_status(
+        ESCROW_ID.hex(), expect_recipient=str(RECIPIENT.pubkey()), salt=SALT.hex()))
+
+    assert out["corroborated"] is True
+    assert "WARNING_CORROBORATION_REQUESTED_BUT_NOT_OBTAINED" not in out
+
+
+# ── the identity key itself, attacked directly ────────────────────────────────────────
+
+@pytest.mark.parametrize("a,b", [
+    ("https://h.example", "https://h.example/"),
+    ("https://h.example", "https://h.example//"),
+    ("https://h.example", "https://h.example/qn-token/"),
+    ("https://h.example", "https://h.example/?api-key=A"),
+    ("https://h.example/?api-key=A", "https://h.example/?api-key=B"),
+    ("https://h.example", "https://H.EXAMPLE"),
+    ("https://h.example", "https://h.example:443"),
+    ("https://h.example", "https://h.example:0443"),
+    ("https://h.example", "https://h.example."),          # the FQDN root dot
+    ("https://h.example", "https://user:pw@h.example"),
+    ("https://h.example", "https://h.example#frag"),
+    ("https://h.example", "  https://h.example  "),
+    ("https://[::1]:8899", "https://[0:0:0:0:0:0:0:1]:8899"),
+    ("https://bücher.example", "https://xn--bcher-kva.example"),
+    ("http://h.example", "http://h.example:80"),
+])
+def test_one_server_has_one_identity(a, b):
+    """The unit the whole corroboration story now rests on. Anything in here that produced two
+    keys would fill both slots of a two-of-two rule with one machine."""
+    from xete_mcp import safehttp
+    assert safehttp.endpoint_identity(a) == safehttp.endpoint_identity(b), \
+        f"{a!r} and {b!r} name the same server and must key the same"
+
+
+@pytest.mark.parametrize("a,b", [
+    ("https://a.example", "https://b.example"),
+    ("https://h.example", "https://sub.h.example"),
+    ("https://h.example", "http://h.example"),            # different transport
+    ("https://h.example", "https://h.example:8899"),
+    ("https://h.example:8899", "https://h.example:9988"),
+    ("nonsense one", "nonsense two"),                     # malformed keeps its own identity
+])
+def test_two_servers_keep_two_identities(a, b):
+    """The over-refusal side, and the reason the key is not blunter: collapsing real providers
+    would silently turn a two-source guarantee into a refusal an operator cannot satisfy."""
+    from xete_mcp import safehttp
+    assert safehttp.endpoint_identity(a) != safehttp.endpoint_identity(b)
+
+
+def test_the_identity_key_never_raises():
+    """It runs inside refusal paths and inside `distinct_endpoints`, which runs before every
+    money-path resolution. A key function that throws on a mistyped env var takes the tool down
+    instead of refusing it."""
+    from xete_mcp import safehttp
+    for bad in [None, "", "   ", "://", "https://", "https://h:notaport", "https://[unclosed",
+                "h.example", "//h.example/x", "https://" + "a" * 300 + ".example",
+                "https://exa mple", "\x00", "https://h.example:-1"]:
+        assert isinstance(safehttp.endpoint_identity(bad), tuple)
+
+
+def test_a_flaky_alias_endpoint_cannot_destroy_the_determinate_answer(chain, two_endpoints,
+                                                                       monkeypatch):
+    """Self-inflicted, caught by the fresh-context pass on this fix. Routing status's
+    expect_recipient through TWO endpoints doubles the chance one of them is down, and a raise
+    there used to unwind into the tool's generic handler — which returns status=failed with
+    open=null. That is finding [G19] reintroduced through the fix for [G11]: the escrow question
+    and the recipient question are different questions, and only one of them was asked."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    chain["bob"] = str(RECIPIENT.pubkey())
+    chain.at(RPC_B)["bob"] = alias_chain.AliasChainError("429 Too Many Requests")
+    monkeypatch.setattr(settlement, "Client",
+                        _account_client(_state(DEPOSITOR.pubkey(), AMOUNT, mine)))
+
+    out = json.loads(two_endpoints.xete_settle_status(
+        ESCROW_ID.hex(), expect_recipient="%bob", salt=SALT.hex()))
+
+    assert out.get("status") != "failed"
+    assert out["determinate"] is True and out["open"] is True, \
+        "a flaky alias endpoint took away the field the recovery guidance names"
+    assert out["beneficiary_verified"] is None
+    assert "WARNING_RECIPIENT_WAS_NOT_INDEPENDENTLY_RESOLVED" in out
+    assert "429" in out["WARNING_RECIPIENT_WAS_NOT_INDEPENDENTLY_RESOLVED"]
+
+
+def test_an_unreadable_second_endpoint_refuses_a_spend_with_a_way_out(chain, two_endpoints,
+                                                                       monkeypatch, spend_ok):
+    """The cost of requiring two sources, stated honestly. A flaky endpoint #2 now blocks a
+    %name spend that one endpoint alone would have completed — correct for money, but the
+    refusal must hand back the escape hatch or it reads as an outage rather than a choice."""
+    _identity(monkeypatch, two_endpoints)
+    chain["bob"] = str(RECIPIENT.pubkey())
+    chain.at(RPC_B)["bob"] = alias_chain.AliasChainError("429 Too Many Requests")
+    spent: list[str] = []
+    _deposit_recorder(monkeypatch, spent)
+
+    out = json.loads(two_endpoints.xete_settle_create("%bob", 1.0))
+
+    assert spent == []
+    assert out["status"] == "failed"
+    assert "BASE58" in out["error"] and RPC_B in out["error"] and "429" in out["error"]
+
+
+# ── found by the fresh-context pass ON THIS FIX (see reviews/DDR-endpoint-corroboration) ──
+
+@pytest.mark.parametrize("a,b", [
+    ("http://localhost:8899", "http://127.0.0.1:8899"),
+    ("http://localhost:8899", "http://[::1]:8899"),
+    ("http://127.0.0.1:8899", "https://127.0.0.1:8899"),
+    ("http://127.0.0.1:8899", "http://127.0.0.1:8900"),
+    ("http://localhost", "https://localhost.localdomain:7777/rpc"),
+    ("http://127.0.0.1", "http://127.0.0.2"),
+])
+def test_every_loopback_spelling_is_one_source(a, b):
+    """Reviewer §3. `localhost`, `127.0.0.1` and `[::1]` are the same box, and scheme cannot
+    separate them because require_secure_url admits plain http to loopback by design — so a
+    dev/staging config filled both corroboration slots with one machine and printed the
+    uncaveated "Two independently-configured endpoints ... no single endpoint chose this
+    answer". Two local validators on two ports IS one source: same machine, same adversary."""
+    from xete_mcp import safehttp
+    assert safehttp.endpoint_identity(a) == safehttp.endpoint_identity(b)
+
+
+def test_a_loopback_pair_cannot_corroborate_a_settlement(monkeypatch):
+    """The same defect end to end, which is how the reviewer demonstrated it."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    monkeypatch.setenv(settlement.ENV_SECOND_RPC, "http://127.0.0.1:8899")
+    monkeypatch.setattr(settlement, "Client",
+                        _account_client(_state(DEPOSITOR.pubkey(), AMOUNT, mine)))
+
+    out = settlement.status("http://localhost:8899", ESCROW_ID.hex(),
+                            expect_commitment_hex=mine.hex())
+
+    assert out["corroborated"] is False
+    assert out["endpoints_asked"] == ["http://localhost:8899"]
+    assert not out["verdict"].startswith("VERIFIED")
+
+
+def test_an_explicit_second_rpc_cannot_skip_the_identity_check(monkeypatch):
+    """Reviewer §4. The identity check lived in `second_rpc_url`, which the `second_rpc=`
+    parameter bypasses entirely — latent, since no in-tree caller passes it, but a guarantee
+    that depends on which door the caller came through is not a guarantee."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    monkeypatch.setattr(settlement, "Client",
+                        _account_client(_state(DEPOSITOR.pubkey(), AMOUNT, mine)))
+
+    out = settlement.status(HOSTILE_RPC, ESCROW_ID.hex(), expect_commitment_hex=mine.hex(),
+                            second_rpc=HOSTILE_RPC + "/")
+
+    assert out["corroborated"] is False
+    assert out["endpoints_asked"] == [HOSTILE_RPC]
+    assert "no single endpoint chose this answer" not in out["verdict"]
+
+
+def test_the_refusal_does_not_route_the_agent_into_a_one_endpoint_oracle(chain, drafting,
+                                                                         monkeypatch, spend_ok):
+    """Reviewer §1, the laundering route, and the half of it this server can actually close.
+
+    The spend refusal says "PASS THE RECIPIENT'S BASE58 WALLET ADDRESS". An agent obeys by
+    calling xete_resolve, which asks ONE endpoint through a precedence chain that does not even
+    read XETE_ALIAS_RPC, and pastes the answer back — arriving as base58, so the corroboration
+    short-circuits with "nothing was resolved, so no endpoint had any say in it". The refusal
+    must not be the thing that routes the agent around the control."""
+    _identity(monkeypatch, drafting)
+    chain["bob"] = str(RECIPIENT.pubkey())
+    spent: list[str] = []
+    _deposit_recorder(monkeypatch, spent)
+
+    err = json.loads(drafting.xete_settle_create("%bob", 1.0))["error"]
+
+    assert spent == []
+    assert "xete_resolve" in err, "the refusal must name the tool that would launder it"
+
+
+@pytest.mark.parametrize("name", ["%jo​hn", "%jоhn", "%jo‮hn", "%јohn"])
+def test_a_confusable_name_is_refused_on_the_verify_path_too(chain, drafting, name):
+    """Reviewer §8's untested gap. `_reject_confusable_name` moved ABOVE the endpoint-count
+    check so a confusable is refused for being confusable under every configuration — but the
+    confusable tests only ever drove xete_draft_settlement_tx, so the reorder's actual effect
+    (a one-endpoint verify install now gets the right message) had no coverage."""
+    chain["john"] = str(RECIPIENT.pubkey())
+    v = json.loads(drafting.xete_verify_settlement_tx(_honest(), name, SALT.hex(), 1.0))
+    assert v["verified"] is False
+    assert "ASCII" in json.dumps(v), "the endpoint-count refusal masked the real reason"
+    assert not chain.calls, "a confusable name must be refused before any lookup"
