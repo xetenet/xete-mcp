@@ -95,3 +95,9 @@ id_rsa*
 !.env.template
 # --- end xete estate secret hygiene ---
 uv.lock
+
+# Internal orientation docs. s1/growth-distribution flagged this for stripping before
+# the package push; it reached the public `integration` branch before that handoff
+# arrived. Nothing secret is in it (it says so itself), but internal architecture and
+# agent-fleet notes do not belong in a public package repo.
+knowledge/
