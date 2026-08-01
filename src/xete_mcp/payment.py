@@ -83,7 +83,7 @@ def _attempt_detail(payment_nonce: str, blob_count: int) -> str:
     return f"attempt={secrets.token_hex(8)} blobs={blob_count} nonce={payment_nonce}"
 
 
-def _release_recorded_spend(detail: str, charged: int) -> None:
+def _release_recorded_spend(detail: str, charged: int, path_label: str = SEND_PATH_LABEL) -> None:
     """Give back a spend that was recorded and then provably never happened.
 
     spendguard records at APPROVAL time and offers no release, deliberately: once a
@@ -105,6 +105,12 @@ def _release_recorded_spend(detail: str, charged: int) -> None:
     rollback can only ever return budget this same call consumed — it cannot lift the
     ceiling (test_rolling_the_ledger_back_does_not_grant_more_than_the_window).
 
+    `path_label` defaults to this module's own send path, which is what every existing
+    caller wants. It is a PARAMETER because the identical pre-submission window exists on
+    the %alias claim path, and hardcoding the label there meant the release matched nothing
+    and silently did not fire -- the entry stayed, the window still drained, and every test
+    that only checked "the code calls release" would have passed.
+
     Every failure is swallowed. If the entry cannot be given back the spend simply stays
     counted, which is the conservative direction and exactly the old behaviour.
     """
@@ -121,7 +127,7 @@ def _release_recorded_spend(detail: str, charged: int) -> None:
             entries = list(data["entries"])
             for i in range(len(entries) - 1, -1, -1):
                 e = entries[i]
-                if (e.get("path") == SEND_PATH_LABEL and e.get("detail") == stored
+                if (e.get("path") == path_label and e.get("detail") == stored
                         and e.get("lamports") == charged):
                     del entries[i]
                     break

@@ -116,6 +116,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from pathlib import Path
 
 import requests
@@ -1167,13 +1168,53 @@ def xete_alias_claim(name: str, max_price_lamports: int | None = None) -> str:
         from .spendguard import authorize as _authorize_spend
 
         charged = txguard_mod.spend_charge(quoted, inspection, simulated)
-        _authorize_spend(charged, "xete_alias_claim",
-                         detail=f"name=%{bare} quoted={quoted} observed={simulated}")
+        # A token unique to THIS attempt leads the detail string, exactly as payment.py
+        # does it: the release below must delete the entry this call wrote and no other,
+        # and everything else in the string (the name, the server-chosen price) repeats
+        # across attempts and across concurrent calls.
+        _attempt_token = uuid.uuid4().hex[:12]
+        _attempt_note = (f"attempt={_attempt_token} name=%{bare} "
+                         f"quoted={quoted} observed={simulated}")
+        _authorize_spend(charged, "xete_alias_claim", detail=_attempt_note)
 
-        # Signs the exact message that was inspected, and refuses any other.
-        txguard_mod.approve_and_sign(tx, inspection, claimer)
-        rpc = Client(_signing_rpc_url())
-        onchain = rpc.send_raw_transaction(bytes(tx)).value
+        # ── PRE-SUBMISSION: refundable, because nothing can have left ──────────────────
+        # The gate records at approval time and offers no release, which is right once a
+        # transaction is in flight -- "it failed" and "it landed and the receipt was lost"
+        # are the same observation from here. But it is WRONG before anything is signed.
+        # A hostile permit server returns a transaction with a stale blockhash: simulation
+        # passes (replaceRecentBlockhash), preflight then rejects it, and the charge stands.
+        # NINE such attempts at the stock cap locked the agent out of ALL spending --
+        # messaging included -- for 24 hours, having moved zero lamports. Attacker-chosen,
+        # free, repeatable.
+        try:
+            # Signs the exact message that was inspected, and refuses any other.
+            txguard_mod.approve_and_sign(tx, inspection, claimer)
+            rpc = Client(_signing_rpc_url())
+        except BaseException:
+            payment._release_recorded_spend(_attempt_note, charged, "xete_alias_claim")
+            raise
+
+        # ── FROM HERE THE TRANSACTION MAY BE LIVE. Nothing below is ever released. ─────
+        # The signature comes from the transaction WE built, not from the endpoint's reply,
+        # so a submit that raises after the write can still name what may be in flight.
+        _sig_local = tx.signatures[0]
+        try:
+            onchain = rpc.send_raw_transaction(bytes(tx)).value
+        except BaseException as _submit_exc:
+            # NOT a clean failure. send_raw_transaction can raise after the bytes are on the
+            # wire, and the generic handler below would report {"status": "failed"} with no
+            # signature -- telling an agent nothing happened and inviting a retry that pays
+            # the fee twice.
+            return json.dumps({
+                "status": "submitted_unconfirmed", "name": bare, "owner": pubkey,
+                "tx_signature": str(_sig_local),
+                "error": scrub(str(_submit_exc))[:300],
+                "verified_before_signing": inspection.as_dict(),
+                "DO_NOT_ASSUME_THE_NAME_IS_YOURS": (
+                    "Submission raised AFTER the transaction was signed, so it may be on "
+                    "chain. Check tx_signature with xete_alias_resolve before retrying -- a "
+                    "blind retry spends the fee again."),
+            }, indent=2)
         # wait for settlement, then ask the permit server to verify the on-chain owner
         import time as _t
         chain_error = None
