@@ -20,6 +20,7 @@ testing — never point it at an untrusted program with real funds.
 from __future__ import annotations
 
 import hashlib
+import uuid
 import os
 import struct
 import time
@@ -42,6 +43,7 @@ from solana.rpc.types import TxOpts
 # the MCP transcript and the host's logs, on every call. That is the precise defect
 # redact_url's own docstring says the alias path was hardened against; the fix never reached
 # here.
+from .payment import _release_recorded_spend
 from .safehttp import endpoint_identity, redact_url
 
 try:                                     # the JSON-RPC error type, as distinct from transport
@@ -232,9 +234,24 @@ def _blockhash_alive(client: Client, bh) -> bool | None:
 
 
 def _send(client: Client, signers, ixs, payer: Keypair, label: str,
-          ticket: dict | None = None, rpc_url: str | None = None) -> str:
-    bh = client.get_latest_blockhash().value.blockhash
-    tx = Transaction(signers, Message.new_with_blockhash([_cb_limit(60_000), _cb_price(1_000)] + ixs, payer.pubkey(), bh), bh)
+          ticket: dict | None = None, rpc_url: str | None = None,
+          on_presubmit_fail=None) -> str:
+    # `on_presubmit_fail` fires ONLY for a failure in the span below, which is a network READ
+    # and local signing -- nothing has been submitted and no lamport can have moved. It is a
+    # callback rather than a flag because the caller owns the ledger entry and its unique
+    # attempt token; this function has no business knowing how a spend is recorded.
+    #
+    # The boundary is exact and worth stating: get_latest_blockhash is a NETWORK call and it
+    # happens BEFORE Transaction() produces a signature. An unreachable or 429ing endpoint
+    # therefore burns budget for a transaction that never existed. Five such attempts at the
+    # stock cap exhausted the 24h window and locked the agent out of settlement entirely.
+    try:
+        bh = client.get_latest_blockhash().value.blockhash
+        tx = Transaction(signers, Message.new_with_blockhash([_cb_limit(60_000), _cb_price(1_000)] + ixs, payer.pubkey(), bh), bh)
+    except BaseException:
+        if on_presubmit_fail is not None:
+            on_presubmit_fail()
+        raise
     # THE SIGNATURE IS KNOWN HERE, BEFORE ANYTHING IS SUBMITTED. It is ed25519 over the signed
     # message, computed locally by Transaction() — it is the id the cluster will index this
     # transaction under, and it does not depend on any endpoint answering. Every recovery story
@@ -516,19 +533,46 @@ def deposit(rpc_url: str, depositor: Keypair, recipient: Pubkey, amount_lamports
     # one constant and raises.
     validate_deposit_amount(int(amount_lamports))
 
-    authorize(int(amount_lamports), "xete_settle_create", detail=f"recipient={recipient}")
+    # A token unique to THIS attempt leads the detail, because `recipient=` alone repeats
+    # across attempts and across concurrent calls -- a release keyed on it could delete an
+    # entry belonging to a call that HAD reached send_transaction.
+    attempt = uuid.uuid4().hex[:12]
+    attempt_note = f"attempt={attempt} recipient={recipient}"
+    authorize(int(amount_lamports), "xete_settle_create", detail=attempt_note)
 
-    client = Client(rpc_url)
-    prog = program_id()
-    eid = bytes(Keypair().pubkey())        # random 32-byte escrow id (never derived from the recipient)
-    salt = bytes(Keypair().pubkey())[:16]  # random salt; shared with the recipient out-of-band
-    pda = escrow_pda(prog, eid)
-    ix = deposit_ix(prog, depositor.pubkey(), eid, amount_lamports, commitment(recipient, salt))
-    ticket = {"escrow_id": eid.hex(), "salt": salt.hex(), "pda": str(pda), "program": str(prog)}
-    if on_ticket is not None:
-        on_ticket(dict(ticket))            # before send_transaction, deliberately
+    # ── PRE-SUBMISSION: refundable, because nothing can have left ──────────────────────
+    # Everything from here to send_transaction is a read, a local key draw, or local
+    # instruction building. The FIRST network call is get_latest_blockhash, inside _send,
+    # BEFORE the Transaction is constructed -- so on any failure in this span nothing was
+    # signed, nothing was submitted, and no lamport can have moved.
+    #
+    # Charging those anyway meant FIVE unreachable-RPC attempts at the stock per-transaction
+    # cap exhausted the 24h window and locked the agent out of settlement entirely, having
+    # moved zero lamports. The identical fix has been in payment.pay_herd for weeks; it was
+    # never swept to this, the higher-value site. The spendguard freeze does not block it --
+    # the release lives in the caller and uses spendguard's own lock.
+    try:
+        client = Client(rpc_url)
+        prog = program_id()
+        eid = bytes(Keypair().pubkey())        # random 32-byte escrow id (never derived from the recipient)
+        salt = bytes(Keypair().pubkey())[:16]  # random salt; shared with the recipient out-of-band
+        pda = escrow_pda(prog, eid)
+        ix = deposit_ix(prog, depositor.pubkey(), eid, amount_lamports, commitment(recipient, salt))
+        ticket = {"escrow_id": eid.hex(), "salt": salt.hex(), "pda": str(pda), "program": str(prog)}
+        if on_ticket is not None:
+            on_ticket(dict(ticket))            # before send_transaction, deliberately
+    except BaseException:
+        _release_recorded_spend(attempt_note, int(amount_lamports), "xete_settle_create")
+        raise
+
+    # ── FROM HERE THE TRANSACTION MAY BE LIVE. Nothing below is ever released. ─────────
+    # _send owns the boundary: it releases on a pre-signature failure via on_submit and
+    # never after. Do NOT wrap this call -- "it failed" and "it landed and the receipt was
+    # lost" are the same observation from out here.
     sig = _send(client, [depositor], [ix], depositor, "deposit", ticket=dict(ticket),
-                rpc_url=rpc_url)
+                rpc_url=rpc_url,
+                on_presubmit_fail=lambda: _release_recorded_spend(
+                    attempt_note, int(amount_lamports), "xete_settle_create"))
     return eid.hex(), salt.hex(), str(pda), sig
 
 

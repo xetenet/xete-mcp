@@ -104,3 +104,88 @@ def test_a_submit_that_raises_still_names_the_transaction(alias_server, monkeypa
     assert r.get("tx_signature"), "the locally-known signature was discarded on a submit raise"
     assert "DO_NOT_ASSUME_THE_NAME_IS_YOURS" in r
     assert "retry" in r["DO_NOT_ASSUME_THE_NAME_IS_YOURS"].lower()
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# The identical window on settlement.deposit. Same defect, higher-value site, and the fix
+# had been sitting in payment.pay_herd for weeks without being swept here.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+def _ledger_entries(path: Path):
+    if not path.exists():
+        return []
+    return json.loads(path.read_text()).get("entries", [])
+
+
+def test_a_deposit_that_never_reached_the_network_gives_the_spend_back(monkeypatch, tmp_path):
+    """Client() opens no socket and the first network call is get_latest_blockhash, INSIDE
+    _send and BEFORE Transaction() signs. So a failure here is unambiguously pre-submission:
+    nothing signed, nothing sent, no lamport moved."""
+    from xete_mcp import settlement, spendguard
+    ledger = tmp_path / "ledger.json"
+    monkeypatch.setenv("XETE_SPEND_LEDGER", str(ledger))
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+
+    class Boom:
+        def __init__(self, *a, **k):
+            raise RuntimeError("ConnectError")
+
+    monkeypatch.setattr(settlement, "Client", Boom)
+    with pytest.raises(RuntimeError):
+        settlement.deposit("http://127.0.0.1:1", object(), object(), 2_000_000)
+
+    assert _ledger_entries(ledger) == [], (
+        f"a deposit that never reached the network kept its charge: {_ledger_entries(ledger)}")
+
+
+def test_five_unreachable_attempts_do_not_exhaust_the_settlement_window(monkeypatch, tmp_path):
+    """The reported scenario: five attempts at the stock per-transaction cap against the
+    stock window locked the agent out of settlement entirely, having moved zero lamports."""
+    from xete_mcp import settlement, spendguard
+    ledger = tmp_path / "ledger.json"
+    monkeypatch.setenv("XETE_SPEND_LEDGER", str(ledger))
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "50000000")
+
+    class Boom:
+        def __init__(self, *a, **k):
+            raise RuntimeError("ConnectError")
+
+    monkeypatch.setattr(settlement, "Client", Boom)
+    for _ in range(5):
+        with pytest.raises(RuntimeError):
+            settlement.deposit("http://127.0.0.1:1", object(), object(), 10_000_000)
+
+    spent = sum(e.get("lamports", 0) for e in _ledger_entries(ledger))
+    assert spent == 0, f"five unreachable attempts consumed {spent} lamports of the window"
+
+
+def test_a_blockhash_failure_inside_send_is_still_refundable(monkeypatch, tmp_path):
+    """The subtler half. get_latest_blockhash is a NETWORK call that happens before
+    Transaction() produces a signature, so it is inside _send and still pre-submission. A
+    release that only covered the caller's span would miss it -- and an unreachable or
+    429ing endpoint fails exactly here."""
+    from xete_mcp import settlement, spendguard
+    ledger = tmp_path / "ledger.json"
+    monkeypatch.setenv("XETE_SPEND_LEDGER", str(ledger))
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_latest_blockhash(self):
+            raise RuntimeError("429 rate limited")
+
+    monkeypatch.setattr(settlement, "Client", FakeClient)
+    # Real keys: this test has to get PAST instruction building to reach the blockhash call,
+    # so object() stand-ins fail earlier and would prove nothing about the span under test.
+    from solders.keypair import Keypair
+    depositor = Keypair()
+    with pytest.raises(RuntimeError, match="429"):
+        settlement.deposit("http://127.0.0.1:1", depositor,
+                           Keypair().pubkey(), 2_000_000)   # a Pubkey, not str
+
+    assert _ledger_entries(ledger) == [], (
+        "a blockhash fetch that failed before signing kept its charge: "
+        f"{_ledger_entries(ledger)}")

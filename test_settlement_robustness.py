@@ -537,7 +537,10 @@ def test_deposit_hands_over_the_claim_ticket_before_submitting(spend_ok, monkeyp
     seen: list[dict] = []
     submitted: list[str] = []
 
-    def fake_send(_client, _signers, _ixs, _payer, label, ticket=None, rpc_url=None):
+    # **kw so this stub does not have to track _send's signature. It grew an
+    # on_presubmit_fail hook, and a positional-only stub turns that into a TypeError
+    # in a test that is about ticket ordering and has no opinion on either.
+    def fake_send(_client, _signers, _ixs, _payer, label, ticket=None, rpc_url=None, **kw):
         submitted.append(label)
         raise settlement.SettlementSubmitError("timed out", signature="SiG",
                                                outcome="unconfirmed", ticket=ticket)

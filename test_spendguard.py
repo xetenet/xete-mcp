@@ -1064,8 +1064,28 @@ def test_an_allowed_spend_passes_the_gate_and_is_recorded(ledger, monkeypatch):
         settlement.deposit("http://127.0.0.1:1", object(), object(), 2_000_000)
 
     assert reached, "the gate refused a spend that was within limits"
-    assert _entries(ledger)[0]["lamports"] == 2_000_000
-    assert _entries(ledger)[0]["path"] == "xete_settle_create"
+
+    # THE ASSERTION BELOW WAS INVERTED, DELIBERATELY, AND HERE IS WHY.
+    #
+    # It used to read `_entries(ledger)[0]["lamports"] == 2_000_000` -- i.e. the charge
+    # SURVIVES a failure at Client() construction. That was true, and it was the defect: a
+    # failure here is strictly pre-submission (Client() opens no socket; the first network
+    # call is get_latest_blockhash, inside _send, before Transaction() signs), so nothing
+    # was signed, nothing was submitted, and no lamport can have moved. Charging it meant
+    # five unreachable-RPC attempts at the stock cap exhausted the 24h window and locked
+    # the agent out of settlement having spent zero.
+    #
+    # The test's REAL point -- that the gate runs BEFORE any network work -- is unchanged
+    # and still asserted by `reached`. Only the claim about what happens to the entry
+    # afterwards has moved, because the behaviour it described is the one being fixed.
+    #
+    # The opposite direction is covered separately and must stay covered: a deposit that
+    # reaches the send call keeps its charge (test_a_deposit_that_reached_the_send_call_is
+    # _still_charged). Without that pair, "release on failure" could silently become
+    # "release always" and this file would not notice.
+    assert _entries(ledger) == [], (
+        "a deposit that failed before anything was signed kept its ledger entry; the "
+        f"window is being drained for a transaction that never existed: {_entries(ledger)}")
 
 
 def test_there_is_no_way_to_switch_the_gate_off():
