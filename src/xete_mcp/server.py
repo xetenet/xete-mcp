@@ -125,7 +125,8 @@ from .client import XeteClient, load_or_create_identity
 from . import alias_chain, draft, payment, settlement, signguard
 from . import txguard as txguard_mod
 from .safehttp import (EndpointError, as_bool, as_int, as_name, as_str, distinct_endpoints,
-                       get_json, project, redact_url, require_secure_url, sanitize_text)
+                       get_json, post_json, project, redact_url, require_secure_url,
+                       sanitize_text)
 
 SERVER_URL = os.environ.get("XETE_SERVER_URL", "https://xete.net")
 RPC_URL = os.environ.get("XETE_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -580,6 +581,20 @@ def _permit_get(path: str, params: dict) -> dict:
                     max_bytes=MAX_PERMIT_BYTES)
 
 
+def _permit_post(path: str, payload: dict, *, timeout: float = PERMIT_TIMEOUT) -> dict:
+    """POST to the permit server through safehttp. The sibling of `_permit_get`.
+
+    The three calls in the %alias claim flow used raw `requests.post(...).json()` and so
+    got NONE of what the rest of this module relies on: the https-or-loopback check, the
+    refusal to follow redirects, and the response size cap. That mattered most on exactly
+    this path, because it is the one alias tool that spends money and the claim POST
+    carries this agent's ed25519 signature -- a permit server answering 307 could send it
+    to a host of its choosing, and an unbounded body came straight back into the agent's
+    context. `_permit_url` scheme-checks the base on every call.
+    """
+    return post_json(_permit_url(path), payload, timeout=timeout, max_bytes=MAX_PERMIT_BYTES)
+
+
 def _endpoint_error(e: EndpointError, **extra) -> dict:
     """A permit-server failure as a specific, actionable object — not a stray exception string.
 
@@ -1004,9 +1019,18 @@ def xete_alias_claim(name: str, max_price_lamports: int = 0) -> str:
             }, indent=2)
         expect_record_key = hashlib.sha256(agent_id.encode("utf-8")).digest()
 
-        ch = requests.post(_permit_url("/alias/claim/challenge"), json={"pubkey": pubkey}, timeout=15).json()
+        # safehttp, not raw requests: https-or-loopback, NO redirects, and a size cap. A raw
+        # post here let the permit server 307 a request carrying this agent's ed25519
+        # signature to any host it named, and echo an unbounded body back into the output.
+        ch = _permit_post("/alias/claim/challenge", {"pubkey": pubkey}, timeout=15)
         if "message" not in ch or "nonce" not in ch:
-            return json.dumps({"status": "failed", "stage": "challenge", "detail": ch})
+            # `ch` is the permit server's object. Echoing it whole put ~2.5 KB of
+            # attacker-chosen text, newlines included, straight into the agent's context;
+            # boxed and capped instead, under a banner naming its author.
+            return json.dumps({"status": "failed", "stage": "challenge",
+                               "untrusted_server_text": _quarantine(
+                                   _UNTRUSTED_BANNER,
+                                   detail=sanitize_text(ch, 300))}, indent=2)
         # The identity key does not sign whatever the permit server sends. The challenge
         # must be the exact 4-line template, addressed to THIS wallet, carrying the nonce
         # the server also returned separately, timestamped now. Raises RefusedToSign
@@ -1016,17 +1040,24 @@ def xete_alias_claim(name: str, max_price_lamports: int = 0) -> str:
         # messaging relay, which uses base64. Different services, different convention; send
         # base58 here.
         sig = base58.b58encode(ident.signing_key.sign(ch["message"].encode("utf-8")).signature).decode()
-        claim = requests.post(
-            _permit_url("/alias/claim"),
-            json={"pubkey": pubkey, "nonce": ch["nonce"], "signature": sig, "name": bare},
+        claim = _permit_post(
+            "/alias/claim",
+            {"pubkey": pubkey, "nonce": ch["nonce"], "signature": sig, "name": bare},
             timeout=20,
-        ).json()
+        )
         if claim.get("status") != "approved":
-            reason = claim.get("reason") or claim.get("error")
+            raw_reason = claim.get("reason") or claim.get("error")
+            # The hint keys off an EXACT protocol token, so compare before sanitising and
+            # only against the literal — a 2 KB "reason" must not be able to steer this.
             hint = ("register a xete identity first (send a message, or call xete_my_identity), then claim"
-                    if reason == "no_agent_for_wallet" else None)
+                    if raw_reason == "no_agent_for_wallet" else None)
+            # `reason` sat flat beside `status` and `name`, unbounded and newline-bearing,
+            # reading to an agent as this client's own words. It is the permit server's.
             return json.dumps(
-                {"status": claim.get("status", "denied"), "reason": reason, "hint": hint, "name": bare},
+                {"status": sanitize_text(claim.get("status", "denied"), 40),
+                 "hint": hint, "name": bare,
+                 "untrusted_server_text": _quarantine(
+                     _UNTRUSTED_BANNER, reason=sanitize_text(raw_reason, 200))},
                 indent=2,
             )
 
@@ -1118,8 +1149,8 @@ def xete_alias_claim(name: str, max_price_lamports: int = 0) -> str:
                 }, indent=2)
             if st.confirmation_status:
                 break
-        conf = requests.post(_permit_url("/alias/claim/confirm"),
-                             json={"pubkey": pubkey, "name": bare}, timeout=20).json()
+        conf = _permit_post("/alias/claim/confirm",
+                            {"pubkey": pubkey, "name": bare}, timeout=20)
         out = {
             "status": "claimed" if conf.get("status") == "confirmed" else conf.get("status", "submitted"),
             "name": bare,
@@ -1127,7 +1158,7 @@ def xete_alias_claim(name: str, max_price_lamports: int = 0) -> str:
             "price_lamports": claim.get("price_lamports"),
             "free_grace": claim.get("free_grace"),
             "tx_signature": str(onchain),
-            "settled": conf.get("status"),
+            "settled": sanitize_text(conf.get("status"), 40),
             "verified_before_signing": inspection.as_dict(),
             "simulated_debit_lamports": simulated,
         }

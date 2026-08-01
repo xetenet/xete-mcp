@@ -30,17 +30,42 @@ IDENTITY_SIGNING_KEY = nacl.signing.SigningKey(SEED)
 # ── fakes ────────────────────────────────────────────────────────────────────────────
 
 class FakeResponse:
-    def __init__(self, payload, status_code=200):
+    """Enough of a `requests.Response` for BOTH the old raw-requests path and safehttp.
+
+    The %alias claim flow used raw `requests.post(...).json()` and now goes through
+    `safehttp.post_json`, which streams the body so it can be capped before parsing. That
+    reader needs a context manager, `headers`, `reason` and `iter_content` — none of which
+    a `.json()`-only stub has. Extended rather than replaced so the tests keep exercising
+    the real hardened client instead of a shape that only the old code would have accepted.
+    """
+
+    def __init__(self, payload, status_code=200, headers=None, reason="OK"):
         self._payload = payload
         self.status_code = status_code
         self.text = json.dumps(payload)
+        self.headers = headers or {}
+        self.reason = reason
 
     def json(self):
         return self._payload
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
+            import requests as _rq
+            raise _rq.HTTPError(f"HTTP {self.status_code}", response=self)
+
+    # -- streaming reader surface used by safehttp._read_json --
+    def iter_content(self, chunk_size=1):
+        yield self.text.encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def close(self):
+        pass
 
 
 class FakeSession:
@@ -219,6 +244,9 @@ def _fake_permit(server, monkeypatch, tx_b64, pubkey, price_lamports=0):
         raise AssertionError(f"unexpected permit call {url}")
 
     monkeypatch.setattr(server.requests, "post", fake_post)
+    # safehttp dispatches via requests.request, not requests.post.
+    monkeypatch.setattr(server.requests, "request",
+                        lambda method, url, **kw: fake_post(url, **kw))
     return calls
 
 
@@ -293,6 +321,9 @@ def test_alias_claim_refuses_a_permit_challenge_for_someone_elses_wallet(alias_s
         return FakeResponse({"status": "denied", "reason": "nope"})
 
     monkeypatch.setattr(server.requests, "post", fake_post)
+    # safehttp dispatches via requests.request, not requests.post.
+    monkeypatch.setattr(server.requests, "request",
+                        lambda method, url, **kw: fake_post(url, **kw))
     result = json.loads(server.xete_alias_claim("mcptestname"))
 
     assert not signed, "a challenge addressed to another wallet was signed and sent"
@@ -314,6 +345,9 @@ def test_alias_claim_refuses_the_derivation_constant_as_a_challenge(alias_server
         return FakeResponse({"status": "denied"})
 
     monkeypatch.setattr(server.requests, "post", fake_post)
+    # safehttp dispatches via requests.request, not requests.post.
+    monkeypatch.setattr(server.requests, "request",
+                        lambda method, url, **kw: fake_post(url, **kw))
     json.loads(server.xete_alias_claim("mcptestname"))
 
     import base58

@@ -92,7 +92,21 @@ class InsecureEndpoint(EndpointError):
 # left standing in `requests`' own exception text. The character class must therefore
 # describe what an operator can TYPE, not what the RFC allows. Over-redacting a stray
 # `@` in a query string is the harmless direction.
-_USERINFO_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*:[/\\]{2,})[^\s/\\]*@")
+# ZERO or more slashes, deliberately. This required `{2,}` and so did `_SCHEME_SEP_RE`
+# below, which meant every credential defence in this module keyed off the same guess
+# about how many slashes an operator typed. One missing slash -- `https:/user:pw@host`,
+# a plausible typo -- matched none of them, and the complete password was reprinted by
+# four tools in their refusal messages. The repair that introduced these said "three
+# defences keyed off one parser are one defence"; it replaced the parser and kept the
+# assumption. A scheme with no slashes at all still reaches a host in real stacks.
+_USERINFO_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*:[/\\]*)[^\s/\\]*@")
+
+# Userinfo with NO scheme in front of it: `user:pw@host/...`. `_authority_span` cannot see
+# this (there is no scheme separator to anchor on) and urlsplit reports no netloc, so it
+# fell through every check. Anchored at the start of the string or after whitespace so it
+# cannot chew through ordinary prose, and it requires a `:` inside the run, so a bare
+# email address in an error message is left alone.
+_BARE_USERINFO_RE = re.compile(r"(?:(?<=\s)|\A)([^\s/\\?#@:]+:)[^\s/\\?#@]*@")
 
 # A query string, recognised only by a real `key=value` after the `?` so that an ordinary
 # sentence ending in a question mark is not mangled. `?api-key=...` is where Helius and
@@ -109,6 +123,7 @@ def scrub(text) -> str:
     every library in the stack to redact for us.
     """
     out = _USERINFO_RE.sub(r"\1<redacted>@", "" if text is None else str(text))
+    out = _BARE_USERINFO_RE.sub(r"\1<redacted>@", out)
     return _QUERY_RE.sub("?<redacted>", out)
 
 
@@ -116,7 +131,10 @@ def scrub(text) -> str:
 # because a URL is read by more parsers than urlsplit — `https:/\/\user:pw@host/` is
 # treated as an authority by browsers and by several HTTP stacks, and was walking past a
 # `://`-only scan with the credential intact in the refusal message.
-_SCHEME_SEP_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*:[/\\]{2,}")
+# `[/\\]*` -- zero or more. See the note on `_USERINFO_RE`: requiring two slashes here
+# was the single assumption that all three credential defences shared, and one typo
+# defeated the lot of them.
+_SCHEME_SEP_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*:[/\\]*")
 
 
 def _authority_span(raw: str) -> tuple[int, int] | None:
@@ -140,6 +158,14 @@ def _authority_span(raw: str) -> tuple[int, int] | None:
     return start, len(raw)
 
 
+# `@`, percent-encoded any number of times over. Each extra round encodes the `%` of the
+# round below, so the nesting grows in the MIDDLE, not at the front:
+#   depth 1  %40        depth 2  %2540        depth 3  %252540
+# i.e. a literal `%`, then `25` repeated, then `40`. Writing it as `(?:%25)*%40` is the
+# natural-looking mistake and matches only depth 1 -- `%2540` slipped straight past it.
+_ENCODED_AT_RE = re.compile(r"%(?:25)*40", re.IGNORECASE)
+
+
 def _userinfo_end(authority: str) -> int:
     """Index just past the last userinfo separator in `authority`, or -1 if there is none.
 
@@ -152,9 +178,20 @@ def _userinfo_end(authority: str) -> int:
     at = authority.rfind("@")
     if at >= 0:
         end = at + 1
-    enc = authority.lower().rfind("%40")
-    if enc >= 0:
-        end = max(end, enc + 3)
+    # To a FIXED POINT, not once. A single `%40` pass is defeated by `%2540`, which decodes
+    # to `%40` and then to `@` -- and that spelling was not merely leaked, it was ACCEPTED,
+    # so a request went out. Each round shortens the string, so this terminates; the bound
+    # is belt-and-braces against a pathological input.
+    # `%40` may itself be encoded: `%2540` decodes to `%40` decodes to `@`, and that
+    # spelling was not merely leaked, it was ACCEPTED -- a request went out. Match the whole
+    # encoded run in the ORIGINAL string, so the cut lands in the right place and the HOST
+    # still survives. Cutting to `len(authority)` instead (the obvious fix) redacts the host
+    # too, and "which host answered" is the one diagnostic this package owes anyone.
+    enc = None
+    for m in _ENCODED_AT_RE.finditer(authority):
+        enc = m
+    if enc is not None:
+        end = max(end, enc.end())
     return end
 
 
@@ -193,9 +230,22 @@ def redact_url(url) -> str:
     except ValueError:
         return scrub(raw)
     if not parts.netloc:
-        # No authority at all, so there is no endpoint identity worth reconstructing and
-        # the markers below would only mangle it. Hand it to the text redactor instead.
-        return scrub(raw)
+        # No authority this parser can find. The OLD behaviour here was `return scrub(raw)`,
+        # which fails OPEN: `scrub` has a userinfo pass and a query pass and NO path pass, so
+        # `https:///qn-<token>/` and `https:/\/\host/qn-<token>/` came back byte-for-byte
+        # unchanged -- a redactor returning its own input. Whatever diagnostic value an
+        # unparseable URL has, it is not worth the disclosure: the scheme is kept because it
+        # is the part that explains the failure, and nothing else survives.
+        # Only the shapes that can HIDE something get the marker. A string with no `@`,
+        # no percent-escape, no query and no path separator has nowhere to keep a
+        # credential, and mangling it would throw away a real diagnostic ("not-a-url" is
+        # exactly what the operator typed). Anything else fails closed.
+        if not raw:
+            return ""
+        if not any(c in raw for c in "@%?/\\"):
+            return scrub(raw)
+        scheme = parts.scheme or (raw.split(":", 1)[0] if ":" in raw else "")
+        return f"{scheme}://<unparseable-url>" if scheme else "<unparseable-url>"
     netloc = parts.netloc
     if "@" in netloc:
         netloc = "<redacted>@" + netloc.rsplit("@", 1)[1]
