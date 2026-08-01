@@ -26,6 +26,12 @@ from nacl.bindings import crypto_scalarmult
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import os
 
+from .signguard import (
+    MESSAGING_KEY_DERIVATION_MESSAGE,
+    GuardedSigningKey,
+    validate_relay_auth_challenge,
+)
+
 
 # ── identity / keystore ─────────────────────────────────────────────────────
 
@@ -35,7 +41,10 @@ import os
 # the only input a browser wallet (Phantom signMessage) can reproduce — it never
 # exposes the seed — so signing this, not hashing the seed, is what lets desktop,
 # MCP, and browser all land on the SAME key. Changing it rotates everyone's key.
-MESSAGING_SIG_MESSAGE = b"xete messaging key derivation v1"
+#
+# It is DEFINED in signguard so the guard that refuses to sign it on request and the
+# derivation that legitimately signs it can never drift apart.
+MESSAGING_SIG_MESSAGE = MESSAGING_KEY_DERIVATION_MESSAGE
 
 
 def derive_x25519_secret(ed_seed: bytes) -> bytes:
@@ -46,6 +55,14 @@ def derive_x25519_secret(ed_seed: bytes) -> bytes:
     ed25519 is deterministic (RFC 8032), so this is byte-stable and identical
     across House Elf (ed25519-dalek), here (nacl), and the browser (tweetnacl /
     Phantom). One wallet -> one messaging key in every interface.
+
+    THIS IS THE ONLY PLACE THAT SIGNATURE IS EVER PRODUCED. It calls nacl directly,
+    deliberately bypassing `Identity.signing_key`, because that property returns a
+    GuardedSigningKey which refuses this exact constant: the signature is the
+    messaging secret, so handing it to a caller hands over the whole mailbox. The
+    derivation stays (browser wallets can only reproduce the key this way); what is
+    removed is the ability to ask for the signature itself. The result never leaves
+    this process — only SHA256 of it, as an x25519 secret, does.
     """
     sig = nacl.signing.SigningKey(ed_seed).sign(MESSAGING_SIG_MESSAGE).signature
     return hashlib.sha256(sig).digest()
@@ -71,8 +88,16 @@ class Identity:
         self.x_secret = derive_x25519_secret(self.ed_seed)
 
     @property
-    def signing_key(self) -> nacl.signing.SigningKey:
-        return nacl.signing.SigningKey(self.ed_seed)
+    def signing_key(self) -> GuardedSigningKey:
+        """The identity key, wrapped so it cannot be used as a blind signing oracle.
+
+        Callers use it exactly as before (`.sign(msg)`, `.verify_key`); the wrapper
+        refuses payloads that are not plausible challenges — anything binary (a
+        serialized transaction message), anything oversized, and above all the
+        messaging-key derivation constant.
+        """
+        return GuardedSigningKey(nacl.signing.SigningKey(self.ed_seed),
+                                 context="xete identity key")
 
     @property
     def pubkey_b58(self) -> str:
@@ -189,11 +214,29 @@ class XeteClient:
 
     # auth: cached token if fresh, else challenge -> sign -> login (bearer token)
     def login(self, force: bool = False) -> str:
+        """Authenticate to the relay.
+
+        The identity key does NOT sign whatever string the relay sends. The challenge
+        is parsed against the exact xete authentication template and refused if it is
+        anything else — see signguard.validate_relay_auth_challenge for what that does
+        and does not close.
+
+        A client-generated nonce is sent with the challenge request. The live relay
+        ignores unknown query parameters, so this is compatible today; the moment the
+        relay echoes it back inside the message, the validator requires it to be ours
+        and the challenge becomes half client-composed with no further client release.
+        """
         if not force and self._restore_token():
             return self.identity.agent_id
-        r = self.session.get(self._url("/auth/challenge"), timeout=15)
+        client_nonce = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
+        r = self.session.get(self._url("/auth/challenge"),
+                             params={"client_nonce": client_nonce}, timeout=15)
         r.raise_for_status()
         ch = r.json()
+        # Refuses before any signature exists if the relay sent anything but the
+        # template. Raises signguard.RefusedToSign.
+        validate_relay_auth_challenge(ch.get("message"), ch.get("nonce"),
+                                      client_nonce=client_nonce)
         sig = self.identity.signing_key.sign(ch["message"].encode("utf-8")).signature
         body = {
             "pubkey": self.identity.pubkey_b58,

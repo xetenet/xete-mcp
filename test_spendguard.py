@@ -487,7 +487,11 @@ EXPECTED_TOUCHPOINTS = {
     ("server.py", "_load_payer"):
         "EXEMPT — reads the payer keypair but spends nothing itself; every consumer is gated",
     ("server.py", "xete_alias_claim"):
-        "GATED — calls spendguard.authorize before tx.partial_sign",
+        "GATED — calls spendguard.authorize before txguard.approve_and_sign",
+    ("txguard.py", "approve_and_sign"):
+        "EXEMPT — the signing chokepoint itself. It signs nothing it was not handed a "
+        "matching ClaimInspection for, and its only caller in this package is "
+        "xete_alias_claim, which gates first (asserted in test_signing_regression.py)",
     ("server.py", "xete_settle_create"):
         "GATED indirectly — the spend happens inside settlement.deposit, which gates",
     ("server.py", "xete_settle_claim"):

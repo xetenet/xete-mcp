@@ -25,6 +25,7 @@ Run with:  python -m pytest test_alias_read_hardening.py -v
 from __future__ import annotations
 
 import json
+import time
 import sys
 from pathlib import Path
 
@@ -506,8 +507,28 @@ def test_claim_posts_the_normalised_name(net, throwaway_identity):
     The flow is stopped at the server's "denied" answer: no transaction is ever built,
     signed, or submitted.
     """
-    net.set_permit("/alias/claim/challenge", 200, {"message": "m", "nonce": "n"})
     net.set_permit("/alias/claim", 200, {"status": "denied", "reason": "test-stop"})
+
+    # A claim now PINS the 32-byte on-chain record key to the agent this wallet owns and
+    # refuses outright rather than let the permit server pick it, so the keystore must
+    # carry an agent_id to reach the POST at all. That refusal is the signing track's and
+    # is covered by its own tests; this test is about the NAME the POST carries.
+    from xete_mcp.client import load_or_create_identity
+    load_or_create_identity(server.IDENTITY_PATH)
+    _ident = json.loads(server.IDENTITY_PATH.read_text())
+    _ident["agent_id"] = "00000000-0000-4000-8000-000000000001"
+    server.IDENTITY_PATH.write_text(json.dumps(_ident))
+
+    # The challenge must now be the exact canonical 4-line template addressed to THIS
+    # wallet — the identity key no longer signs whatever the permit server sends. A stub
+    # "m" is refused before the claim is ever posted. That validator is the signing
+    # track's and has its own tests; here it just has to be satisfied.
+    _pub = load_or_create_identity(server.IDENTITY_PATH).pubkey_b58
+    _nonce = "d" * 64
+    net.set_permit("/alias/claim/challenge", 200, {
+        "message": "xete alias claim\npubkey:%s\nnonce:%s\nts:%d" % (_pub, _nonce, int(time.time())),
+        "nonce": _nonce,
+    })
 
     got = out(server.xete_alias_claim("%MyName"))
 
