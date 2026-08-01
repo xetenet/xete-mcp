@@ -37,8 +37,24 @@ def _encode_payherd(nonce: str, blob_count: int) -> bytes:
     return struct.pack("<I", len(nb)) + nb + struct.pack("<B", blob_count)
 
 
-def pay_herd(rpc_url: str, payer: Keypair, payment_nonce: str, blob_count: int) -> str:
-    """Build, sign, submit, and confirm the PayHerd tx. Returns the signature."""
+def pay_herd(rpc_url: str, payer: Keypair, payment_nonce: str, blob_count: int,
+             declared_lamports: int | None = None) -> str:
+    """Build, sign, submit, and confirm the PayHerd tx. Returns the signature.
+
+    SPEND GATE. The client-side limits are checked HERE, before anything is built or
+    signed, so every caller of this function is covered — not only the MCP tool.
+
+    `declared_lamports` is the amount the server quoted for this send. It is only ever
+    used to RAISE the figure the limits see. The baseline is derived on this side from
+    `blob_count`, which is what actually goes into the instruction being signed, so a
+    server that understates its own price cannot shrink the number that gets checked.
+    """
+    from .spendguard import authorize
+
+    derived = max(int(blob_count), 0) * LAMPORTS_PER_BLOB
+    authorize(max(int(declared_lamports or 0), derived), "xete_send_message",
+              detail=f"blobs={blob_count} nonce={payment_nonce}")
+
     client = Client(rpc_url)
     pda, _ = _derive_pda(payment_nonce)
     ix = Instruction(

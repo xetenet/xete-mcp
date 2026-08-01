@@ -1,0 +1,28 @@
+# gitleaks allowlist - xete-mcp
+# Added 2026-07-31 alongside .github/workflows/gitleaks.yml (audit finding "gitleaks").
+#
+# One line per finding, pinned by gitleaks fingerprint:
+#     <commit>:<file>:<rule-id>:<line>      for history (`gitleaks git`) scans
+#     <file>:<rule-id>:<line>               for tree     (`gitleaks dir`) scans
+#
+# A fingerprint is exact. It cannot suppress a different secret, a different
+# line, or the same line once it moves or changes commit - so an entry here
+# quietly stops working instead of quietly hiding something new.
+#
+# The tree-scan form is matched against the path gitleaks prints, so it only
+# lines up when the scan is invoked from the repo root ("gitleaks dir ." from
+# the checkout, which is what .github/workflows/gitleaks.yml does). Scanning
+# by absolute path produces absolute File values and these entries will not
+# match - that fails closed (noisy), not open, but it is worth knowing.
+#
+# RULE: every entry needs a written justification saying why the value is not
+# a credential. If you cannot write one, it is not a false positive - remove
+# the value and rotate it instead. Do not add blanket path or rule entries.
+
+# test_crypto_unification.py:36 - GOLD_SECRET is a cross-library golden test
+# vector, not a credential. It is SHA256(ed25519_sign(SEED7, MESSAGING_SIG_MESSAGE))
+# where SEED7 = bytes([7] * 32), both defined in plain sight in the same file,
+# so the value is fully derivable by anyone reading it and grants nothing.
+# Flagged only by the entropy-based generic-api-key heuristic.
+360489167c699c915f9931161dda6d384fb266e9:test_crypto_unification.py:generic-api-key:36
+test_crypto_unification.py:generic-api-key:36

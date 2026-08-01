@@ -33,3 +33,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/xete_mcp"]
+
+[tool.hatch.build.targets.sdist]
+# Keep the sdist lean — ship only the package + docs, not the dev repo junk
+# (archive/, test scripts, dist/, etc. that bloated the prior 0.1.1 sdist).
+include = ["src/xete_mcp", "README.md", "pyproject.toml", "LICENSE"]

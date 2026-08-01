@@ -1,0 +1,33 @@
+# gitleaks configuration - xete-mcp
+# Added 2026-07-31 with .github/workflows/gitleaks.yml (audit finding "gitleaks").
+
+[extend]
+# Keep the entire upstream ruleset. Everything below is additive.
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Why this file exists at all.
+#
+# gitleaks' default ruleset has no rule for a raw ed25519 / Solana keypair,
+# which on disk is just a bare JSON array of 64 bytes:
+#
+#     [123,45,6,...]        (64 integers, 0-255)
+#
+# There is no prefix, no keyword and no base64 to key off, so every default
+# rule misses it - verified against gitleaks 8.30.1, which scanned a planted
+# 64-int keypair file and reported "no leaks found". That is precisely the
+# shape of the loose identity/keypair JSON files that turned up untracked in
+# this repo's root (audit finding "mcp-keys"), so leaving it undetected would
+# make CI blind to the one leak this estate has actually had.
+#
+# The local .githooks/pre-commit secret scan checks the same shape, but a hook
+# can be skipped with --no-verify or simply never installed. This rule is the
+# copy that cannot be skipped.
+# ---------------------------------------------------------------------------
+[[rules]]
+id = "solana-ed25519-keypair-array"
+description = "Raw ed25519/Solana secret keypair (bare JSON array of 64 bytes)"
+# \s in Go's RE2 includes newlines, so pretty-printed arrays are caught too.
+# 63+ separators means 64+ elements: a 32-byte seed alone will not trip this,
+# which keeps ordinary small int arrays out of the results.
+regex = '''\[\s*\d{1,3}\s*(?:,\s*\d{1,3}\s*){63,}\]'''

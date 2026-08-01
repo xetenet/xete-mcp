@@ -1,0 +1,87 @@
+name: DDR Gate
+
+# Server-side enforcement of the doubt-driven-review gate. Mirrors .githooks/pre-commit
+# but cannot be skipped with --no-verify. Make this a required status check on main
+# (see README) and the gate is airtight regardless of local hook installation.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  ddr-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check protected paths against DDR artifacts
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -e
+          PATTERNS_FILE=".githooks/protected-paths"
+
+          if [ ! -f "$PATTERNS_FILE" ]; then
+            echo "::warning::$PATTERNS_FILE missing; DDR gate disabled for this repo."
+            exit 0
+          fi
+
+          MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          CHANGED=$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA")
+          echo "Files changed in PR:"
+          echo "$CHANGED" | sed 's/^/  /'
+
+          TOUCHED=""
+          while IFS= read -r pattern; do
+            case "$pattern" in ""|\#*) continue;; esac
+            MATCH=$(echo "$CHANGED" | grep -E "$pattern" || true)
+            [ -n "$MATCH" ] && TOUCHED="$TOUCHED$MATCH"$'\n'
+          done < "$PATTERNS_FILE"
+
+          if [ -z "$TOUCHED" ]; then
+            echo "No protected paths touched. Gate passes."
+            exit 0
+          fi
+
+          echo ""
+          echo "Protected paths touched:"
+          printf '%s' "$TOUCHED" | sort -u | sed 's/^/  - /'
+
+          # Require at least one DDR artifact added/modified in this PR
+          DDR=$(echo "$CHANGED" | grep -E '^reviews/DDR-.*\.md$' || true)
+
+          if [ -z "$DDR" ]; then
+            echo "::error::PR touches protected paths but adds/modifies no reviews/DDR-*.md. Run the doubt-driven-review skill and commit the artifact."
+            exit 1
+          fi
+
+          FAIL=0
+          for f in $DDR; do
+            if [ ! -f "$f" ]; then
+              # DDR was deleted in this PR — deleting review artifacts alongside protected changes is a block
+              echo "::error::$f was removed in this PR while protected paths changed."
+              FAIL=1
+              continue
+            fi
+            if ! grep -qiE '^##? *Verdict: *SHIP' "$f"; then
+              echo "::error file=$f::No 'Verdict: SHIP' line. Reconcile all doubts before merging."
+              FAIL=1
+            fi
+            if grep -qiE 'OPEN-GATE' "$f"; then
+              echo "::error file=$f::Contains OPEN-GATE markers from security review. Resolve or escalate."
+              FAIL=1
+            fi
+            if grep -qiE 'self-review-only' "$f"; then
+              echo "::error file=$f::Marked self-review-only. Contract paths require fresh-context adversarial review (subagent, second session, or cross-model)."
+              FAIL=1
+            fi
+          done
+
+          [ "$FAIL" -eq 0 ] && echo "DDR gate passed: artifact present, SHIP verdict, no open gates."
+          exit $FAIL

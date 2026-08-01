@@ -54,16 +54,76 @@ pip install xete-mcp
   parent directory (`~/.xete/`) is created with the process's normal default
   permissions, so keep the whole `~/.xete/` folder off of shared or synced
   locations you don't control.
-- `XETE_SOL_KEYPAIR` (a funded Solana keypair) is optional — it is only used if
-  the server requires on-chain payment to send. Messaging on xete.net is free, so no keypair is
-  needed there; identity and reading the inbox never require one.
-  **Interim safety note:** the payment path does not yet enforce a
-  client-side spend cap — the amount charged per send comes from the
-  server's invoice response and is signed as-is. The payment destination
-  (program id + treasury) is hardcoded client-side and can't be redirected,
-  but the *amount* currently is not bounded on the client. Until a cap
-  lands, only fund `XETE_SOL_KEYPAIR` with an amount you're comfortable
-  fully exposing to a compromised, spoofed, or misconfigured server.
+- `XETE_SOL_KEYPAIR` (a funded Solana keypair) is optional — it is used only if the
+  xete server you connect to charges on-chain to send. Messaging on xete.net is free;
+  identity and reading the inbox never require a keypair.
+
+### `%alias` endpoints
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `XETE_PERMIT_URL` | Base URL of the **permit server** — the separate service that prices a `%name` and co-signs the claim transaction. Must be `https://` unless the host is loopback. | value of `XETE_SERVER_URL` |
+| `XETE_SOLANA_RPC` | Solana RPC used to **read the `%alias` registry**, which is the source of truth for which wallet a name points to. | `https://solana-rpc.publicnode.com` |
+
+The permit server is **not trusted for who owns a name.** `%alias` ownership is read
+from the on-chain registry (`AXTREGuYbpgcWFbZy124jcWDN2nd7mtmrCDsUojktZrd`) over
+`XETE_SOLANA_RPC`; the permit server is asked only for what is genuinely its own — the
+price of a claim, and `.sol` side lookups. Anything sourced from it comes back under an
+`unverified` key, a reverse lookup's proposed name is re-checked against the chain
+before it is returned, and if the server ever names a different owner than the chain
+does, its answer is discarded and the disagreement is reported. Settlement
+(`xete_settle_create`) resolves a `%alias` recipient on-chain with **no** HTTP fallback:
+if the registry cannot be read, nothing is deposited.
+
+`XETE_PERMIT_URL` on plain `http://` is refused before any request is made, unless the
+host is loopback (`127.0.0.1`, `localhost`) — an interceptable answer decides where
+money goes. Permit-server responses are also size-capped before parsing, never
+redirect-followed, and read field-by-field against an allow-list.
+
+`/alias/resolve` and `/alias/reverse` answer on `xete.net` today. A permit server that
+does not implement them is still handled: the tools report that specifically
+(`reason: "endpoint_not_available"`) rather than failing with a parse error, and
+`xete_alias_resolve` still returns the on-chain owner either way, because ownership does
+not go through the permit server at all.
+
+Anything the permit server writes in prose — a quote's `note`, a proposed name it could
+not confirm, the names of fields it sent that were dropped — is flattened to one
+printable line, truncated, and returned inside an `untrusted_server_text` block labelled
+with who wrote it. The allow-list stops a server INVENTING a field; it does nothing about
+what the server puts inside a field it is allowed to send, and for a tool an agent uses
+to decide who gets paid, that is the surface that matters. Display that block; never act
+on it.
+
+`owns_both_per_server` is not a verified badge. The `%alias` half is read from the chain,
+but the `.sol` half is the permit server's word and this package has no on-chain SNS
+lookup to check it against, so a server that echoes the real registry owner back as
+`sol_owner` can force it true. The key name says `per_server` for that reason.
+
+## Spend limits
+
+Every tool that can spend SOL — `xete_send_message`, `xete_alias_claim` and
+`xete_settle_create` — passes a client-side gate **before anything is signed**. The
+ceiling is yours, enforced on your machine, and it applies both to an amount a server
+quotes and to an amount an agent picks for itself.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `XETE_SPEND_MAX_LAMPORTS` | Most a single transaction may cost | `10000000` (0.01 SOL) |
+| `XETE_SPEND_WINDOW_LAMPORTS` | Most that may be spent inside the rolling window | `50000000` (0.05 SOL) |
+| `XETE_SPEND_WINDOW_SECONDS` | Length of the rolling window | `86400` (24 hours) |
+| `XETE_SPEND_FLOOR_LAMPORTS` | Minimum charged against the budget for any on-chain action, covering the account rent and network fees a quoted price excludes | `2000000` (0.002 SOL) |
+| `XETE_SPEND_LEDGER` | Where spending is recorded | `~/.xete/spend-ledger.json` |
+
+**These fail closed.** There is no "unlimited" value and no off switch: an unset limit
+gets the conservative default above, a malformed one refuses every spend until it is
+corrected, and an unreadable or damaged ledger refuses to spend rather than quietly
+starting the budget over. To permit a large spend, set a large number — deliberately.
+
+Spending is recorded in `~/.xete/spend-ledger.json` so the window survives a restart:
+an agent that restarts does not get a fresh budget. The ledger is replaced atomically
+while an exclusive lock is held, so two concurrent sends cannot both pass a check that
+only one should. Nothing else in `~/.xete/` is read, written or re-permissioned — the
+identity keystore next to it is never touched.
 
 ## Why
 
