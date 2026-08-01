@@ -91,3 +91,51 @@ def test_the_input_cap_does_not_cut_a_credential_loose():
         u = f"https://user:{secret}@host.test/" + ("x" * tail)
         assert secret not in scrub(u), f"scrub leaked with a {tail}-char tail"
         assert secret not in redact_url(u), f"redact_url leaked with a {tail}-char tail"
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# The settlement module emitted the operator's RPC URLs RAW on the ORDINARY SUCCESS PATH.
+# No attacker, no error: the documented two-provider setup plus one xete_settle_status call
+# put both paid credentials into the agent's context, the MCP transcript and the host's
+# logs, re-emitted every call.
+#
+# The existing settlement tests do NOT pin this. They use "https://a.example" and
+# "http://localhost:8899", which redact to themselves because they carry no path, query or
+# userinfo -- so they pass identically with or without the fix. Real vendor URLs are the
+# only inputs that can tell the two apart, which is why this test uses them.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+HELIUS = "https://mainnet.helius-rpc.com/?api-key=hl-SECRET-KEY-4242"
+QUICKNODE = "https://weathered-x.solana-mainnet.quiknode.pro/qn-SECRETTOKEN99/"
+
+
+@pytest.mark.parametrize("url,secret", [(HELIUS, "hl-SECRET-KEY-4242"),
+                                        (QUICKNODE, "qn-SECRETTOKEN99")])
+def test_a_paid_rpc_credential_never_reaches_a_settlement_answer(url, secret):
+    """require_secure_url refuses USERINFO but by design admits a path or query credential --
+    which is exactly where Helius and QuickNode put theirs. So "the URL passed the security
+    check" is not evidence it is safe to print."""
+    from xete_mcp.safehttp import redact_url
+    out = redact_url(url)
+    assert secret not in out, f"{secret} survived redaction of {url!r} -> {out!r}"
+    host = url.split("//", 1)[1].split("/", 1)[0]
+    assert host in out, (
+        f"redaction removed the HOST as well ({out!r}). 'Which endpoint answered' is the one "
+        "diagnostic this field owes anyone; over-redacting is its own defect.")
+
+
+def test_the_settlement_module_cannot_emit_an_unredacted_endpoint():
+    """A static check, because the leak was on the SUCCESS path and a behavioural test only
+    covers the shapes someone thought to construct. Every f-string interpolation of an
+    endpoint variable in settlement.py must go through redact_url."""
+    import re
+    src = (REPO / "src" / "xete_mcp" / "settlement.py").read_text()
+    bare = []
+    for m in re.finditer(r"\{(rpc_url|second|url)\}", src):
+        line_start = src.rfind("\n", 0, m.start()) + 1
+        line = src[line_start:src.find("\n", m.end())]
+        if "redact_url" not in line:
+            bare.append(line.strip()[:100])
+    assert not bare, (
+        "settlement.py interpolates an endpoint variable without redact_url:\n  "
+        + "\n  ".join(bare))

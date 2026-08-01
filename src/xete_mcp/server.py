@@ -488,6 +488,11 @@ def xete_check_inbox(limit: int = 20) -> str:
 # returned under an `unverified` key, and where the chain can check it (a reverse lookup
 # proposes a name; the chain says who owns that name) it is checked and dropped if wrong.
 
+# Confirmed|Finalized only. Processed is one validator's opinion and can be forked away --
+# the same set settlement.py and payment.py already enforce.
+from solders.transaction_status import TransactionConfirmationStatus as _TCS
+_CLAIM_DURABLE = (_TCS.Confirmed, _TCS.Finalized)
+
 PERMIT_TIMEOUT = 15
 MAX_PERMIT_BYTES = 64 * 1024
 
@@ -1172,6 +1177,7 @@ def xete_alias_claim(name: str, max_price_lamports: int | None = None) -> str:
         # wait for settlement, then ask the permit server to verify the on-chain owner
         import time as _t
         chain_error = None
+        durable = False
         for _ in range(30):
             _t.sleep(0.5)
             st = rpc.get_signature_statuses([onchain]).value[0]
@@ -1190,10 +1196,42 @@ def xete_alias_claim(name: str, max_price_lamports: int | None = None) -> str:
                     "detail": "the transaction was submitted and the network rejected it; the "
                               "name was NOT claimed and the fee was spent.",
                 }, indent=2)
-            if st.confirmation_status:
+            # `in _DURABLE`, not truthiness. This was the LAST surviving truthy-commitment
+            # test in the package -- payment.py and settlement.py both already refuse
+            # Processed, and settlement.py says why in as many words: one validator's
+            # opinion, and it can still be forked away.
+            if st.confirmation_status in _CLAIM_DURABLE:
+                durable = True
                 break
         conf = _permit_post("/alias/claim/confirm",
                             {"pubkey": pubkey, "name": bare}, timeout=20)
+
+        # "claimed" REQUIRES DURABLE CHAIN EVIDENCE. It used to rest on the permit server's
+        # own /alias/claim/confirm -- asking the party that BUILT the transaction whether the
+        # transaction worked. server.py's own header promises the permit server "is NOT
+        # trusted for who owns a name", and that promise was false here: on 30 consecutive
+        # Nones, control fell straight through and reported whatever it said.
+        #
+        # The permit server's answer is still reported, under its own key, as its opinion.
+        # It just no longer decides.
+        if not durable:
+            out = {
+                "status": "submitted_unconfirmed", "name": bare, "owner": pubkey,
+                "tx_signature": str(onchain),
+                "permit_server_says": sanitize_text(conf.get("status"), 40),
+                "verified_before_signing": inspection.as_dict(),
+                "DO_NOT_ASSUME_THE_NAME_IS_YOURS": (
+                    "The transaction was SUBMITTED but this client never saw a durable "
+                    "(confirmed/finalized) status for it on chain. It may still land, it may "
+                    "have failed. Do NOT publish this %name or tell anyone to use it until "
+                    "xete_alias_resolve shows your wallet as the owner. The permit server's "
+                    "opinion is reported above and is not evidence -- it built this "
+                    "transaction."),
+            }
+            if simulation_note:
+                out["simulation_note"] = simulation_note
+            return json.dumps(out, indent=2)
+
         out = {
             "status": "claimed" if conf.get("status") == "confirmed" else conf.get("status", "submitted"),
             "name": bare,

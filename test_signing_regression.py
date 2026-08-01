@@ -14,6 +14,8 @@ import base64
 import hashlib
 import importlib
 import json
+
+from solders.transaction_status import TransactionConfirmationStatus as _TCS
 import os
 import struct
 import time
@@ -555,7 +557,7 @@ class _AcceptingRpcClient:
 
     def get_signature_statuses(self, *_a, **_kw):
         class _S:
-            confirmation_status = "confirmed"
+            confirmation_status = _TCS.Confirmed
 
         class _R:
             value = [_S()]
@@ -986,7 +988,7 @@ class _FailingOnChainRpc(_AcceptingRpcClient):
 
     def get_signature_statuses(self, *_a, **_kw):
         class _S:
-            confirmation_status = "confirmed"
+            confirmation_status = _TCS.Confirmed
             err = {"InstructionError": [0, "InvalidArgument"]}
 
         class _R:

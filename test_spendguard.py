@@ -12,6 +12,8 @@ import base64
 import hashlib
 import importlib
 import json
+
+from solders.transaction_status import TransactionConfirmationStatus as _TCS
 import os
 import stat
 import struct
@@ -1289,7 +1291,7 @@ def claim(tmp_path, monkeypatch):
 
         def get_signature_statuses(self, *_a, **_kw):
             class _S:
-                confirmation_status = "confirmed"
+                confirmation_status = _TCS.Confirmed
                 err = None
 
             class _R:

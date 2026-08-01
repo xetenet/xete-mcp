@@ -34,7 +34,15 @@ from solana.rpc.api import Client
 from solana.rpc.commitment import Confirmed
 from solana.rpc.types import TxOpts
 
-from .safehttp import endpoint_identity
+# redact_url, not just endpoint_identity. This module emitted the operator's RPC URLs RAW
+# into tool output on the ORDINARY SUCCESS PATH -- no attacker, no error. require_secure_url
+# refuses userinfo but by design accepts a path token or a query credential, which is exactly
+# where Helius (?api-key=) and QuickNode (/qn-TOKEN/) put theirs. The documented two-provider
+# setup plus one xete_settle_status call put BOTH paid credentials into the agent's context,
+# the MCP transcript and the host's logs, on every call. That is the precise defect
+# redact_url's own docstring says the alias path was hardened against; the fix never reached
+# here.
+from .safehttp import endpoint_identity, redact_url
 
 try:                                     # the JSON-RPC error type, as distinct from transport
     from solana.rpc.core import RPCException
@@ -339,12 +347,12 @@ def _corroborate_dropped(sig, bh, primary: str | None,
         c = Client(url, timeout=max(1.0, float(timeout)))
         st = c.get_signature_statuses([sig]).value[0]
     except Exception as e:
-        return "unknown", f"the second endpoint ({url}) did not answer: {type(e).__name__}"
+        return "unknown", f"the second endpoint ({redact_url(url)}) did not answer: {type(e).__name__}"
     if st is not None:
-        return "seen", f"the second endpoint ({url}) HAS a status for this signature"
+        return "seen", f"the second endpoint ({redact_url(url)}) HAS a status for this signature"
     if _blockhash_alive(c, bh) is not False:
-        return "unknown", f"the second endpoint ({url}) does not agree the blockhash is dead"
-    return "dropped", f"corroborated by a second, independently-configured endpoint ({url})"
+        return "unknown", f"the second endpoint ({redact_url(url)}) does not agree the blockhash is dead"
+    return "dropped", f"corroborated by a second, independently-configured endpoint ({redact_url(url)})"
 
 
 def _await_confirmation(client: Client, sig, bh, label: str, ticket: dict | None,
@@ -680,7 +688,7 @@ def status(rpc_url: str, escrow_id_hex: str, expect_commitment_hex: str | None =
     out: dict = {"escrow_id": escrow_id_norm, "pda": str(pda),
                  "open": False, "determinate": True, "is_escrow": False,
                  "account_owner": owner, "beneficiary_verified": None, "commitment": None,
-                 "endpoints_asked": [rpc_url] + ([second] if second else []),
+                 "endpoints_asked": [redact_url(rpc_url)] + ([redact_url(second)] if second else []),
                  "corroborated": False}
     if exists:
         out["lamports"] = lamports
@@ -699,7 +707,7 @@ def status(rpc_url: str, escrow_id_hex: str, expect_commitment_hex: str | None =
                 out["open"] = None
                 out["determinate"] = False
                 out["verdict"] = (
-                    f"ENDPOINTS DISAGREE — {rpc_url} and {second} returned different accounts for "
+                    f"ENDPOINTS DISAGREE — {redact_url(rpc_url)} and {redact_url(second)} returned different accounts for "
                     f"{pda}, so at least one of them is wrong or lying and there is no way to "
                     "tell which from here. NOTHING is concluded: do not treat this settlement as "
                     "open, do not treat it as settled, and DO NOT DISCARD A CLAIM TICKET over "
@@ -762,7 +770,7 @@ def status(rpc_url: str, escrow_id_hex: str, expect_commitment_hex: str | None =
     elif out["corroborated"]:
         out["verdict"] = (
             f"VERIFIED — the hidden beneficiary of this escrow is the wallet you named. Two "
-            f"independently-configured endpoints ({rpc_url} and {second}) returned the same "
+            f"independently-configured endpoints ({redact_url(rpc_url)} and {redact_url(second)}) returned the same "
             "account, so no single endpoint chose this answer.")
     else:
         out["verdict"] = (
