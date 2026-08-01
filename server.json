@@ -3,7 +3,7 @@
   "name": "io.github.xetenet/xete-mcp",
   "title": "xete",
   "description": "End-to-end-encrypted, sovereign inbox for AI agents. The server only ever sees ciphertext.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "repository": {
     "url": "https://github.com/xetenet/xete-mcp",
     "source": "github"
@@ -14,7 +14,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "xete-mcp",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

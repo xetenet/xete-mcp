@@ -40,6 +40,11 @@ CONFIGURATION (environment)
   (default)         https://solana-rpc.publicnode.com — api.mainnet-beta throttles and
                     times out on reads, which for a resolver means a payment that
                     cannot be addressed.
+  XETE_ALIAS_MAX_LAG_SLOTS
+                    How far an endpoint may fall below a slot IT ITSELF already served
+                    before its answer is refused as stale. Default 300 (~2 min). 0
+                    disables the check — the escape hatch for a local validator whose
+                    slot numbering is not mainnet's. See the freshness note below.
 
 The order matters and is not cosmetic. Introducing XETE_SOLANA_RPC with a new
 third-party default, and reading it FIRST with no fallback, silently moves
@@ -53,11 +58,13 @@ from __future__ import annotations
 import base64
 import os
 import re
+import threading
+import time
 
 from solders.pubkey import Pubkey
 
-from .safehttp import (EndpointError, post_json, redact_url, require_secure_url,
-                       sanitize_text)
+from .safehttp import (EndpointError, endpoint_identity, post_json, redact_url,
+                       require_secure_url, sanitize_text)
 
 AXTREG = Pubkey.from_string("AXTREGuYbpgcWFbZy124jcWDN2nd7mtmrCDsUojktZrd")
 
@@ -72,6 +79,69 @@ MAX_NAME_BYTES = 32                 # the name field is 32 bytes wide
 RPC_TIMEOUT = 15
 MAX_RPC_BYTES = 64 * 1024
 COMMITMENT = "finalized"            # ownership decides where money goes; take the settled answer
+
+# ── freshness ────────────────────────────────────────────────────────────────────────
+# Every Solana RPC reply carries the slot it answered at, in `result.context.slot`, and
+# every request may carry `minContextSlot` — "refuse rather than answer below this slot".
+# Used together they close the failure this module could not otherwise see: an endpoint
+# that is simply BEHIND returns a stale owner, with no error, and it is stale exactly when
+# it matters most — in the minutes after a %name is claimed or transferred, which is when
+# someone is most likely to be looking it up in order to pay it.
+#
+# What this does NOT do, and must never be described as doing: catch a LYING endpoint. A
+# dishonest node picks whatever slot it likes. There is no inclusion proof for an account
+# against the bank hash over standard Solana RPC — no `eth_getProof` equivalent — so the
+# node's word is the only thing on offer and freshness is a lag check, not an integrity
+# check. Corroboration across endpoints is the only tool that touches dishonesty.
+#
+# The floor is tracked PER ENDPOINT, and that is the load-bearing detail. A single global
+# high-water mark would let one endpoint reporting an absurd slot push the floor above
+# every honest node's real slot and lock the resolver out of all of them — trading a
+# wrong-answer risk for a denial-of-service, from data the endpoint controls. Per endpoint,
+# the worst a node can do with an inflated slot is refuse to answer itself.
+#
+# So the only refusal here is self-regression: this host answered at slot N and is now
+# more than the tolerance below N. That is not two nodes disagreeing (ordinary, benign,
+# and the reason mandatory two-endpoint agreement was backed out) — it is one host going
+# backwards, which means a stale replica behind a load balancer or a node in trouble.
+#
+# PER ENDPOINT MEANS `endpoint_identity`, NOT `redact_url`. That distinction is written
+# down in safehttp.endpoint_identity's own docstring and in
+# benchmarks/BM-a-control-that-identifies-a-source-by-the-string-you-typed.md, because this
+# package has already shipped it wrong once: `redact_url` keeps a `?<redacted>` marker,
+# does not lower-case the host, and leaves an explicit `:443` in place, so `https://H.test`,
+# `https://h.test` and `https://h.test:443` are three keys for one machine (the floor then
+# never establishes) while `localhost` and `127.0.0.1` are two keys for one box. The first
+# version of this code keyed on `redact_url` and the fresh-context pass caught it. That
+# `redact_url` remains the right thing for the `shown` string in messages, and the wrong
+# thing for identity, is the entire point of there being two functions.
+#
+# AND THE MARK MUST NOT LATCH. A recorded slot is a number the endpoint chose, so an
+# endpoint that answers once with 10**30 would pin its own floor above anything it can ever
+# serve again — a permanent, self-inflicted denial of every %name lookup through it, which
+# on the spending path (two-of-two corroboration) takes %name payments down for the whole
+# process even after the endpoint starts behaving. `head + 10_000` is the quiet version:
+# plausible-looking, and a ~70 minute outage. So every recorded slot is bounded by ELAPSED
+# TIME: a chain cannot advance faster than its slot rate, so from a known (slot, when) pair
+# there is a ceiling on what the next honest answer can be. An unseen endpoint is measured
+# from the chain's genesis, which bounds the first observation too. Anything above the
+# ceiling is not recorded and not reported — treated as "this endpoint did not tell us its
+# slot", which is a state the caller is told about rather than one that fails silently.
+ENV_MAX_LAG = "XETE_ALIAS_MAX_LAG_SLOTS"
+DEFAULT_MAX_LAG_SLOTS = 300         # ~2 min at 400ms slots; healthy nodes sit under 50
+RPC_ERR_MIN_CONTEXT_SLOT = -32016   # "Minimum context slot has not been reached"
+
+# Solana mainnet genesis, 2020-03-16. Only ever used to bound the FIRST slot an endpoint
+# reports, so it needs to be early, not exact.
+CHAIN_GENESIS_UNIX = 1_584_316_800
+# Real mainnet is ~2.5 slots/sec (400ms). 5 is double that: the ceiling is meant to reject
+# the absurd, never to second-guess a healthy node running a little ahead of the average.
+MAX_SLOTS_PER_SEC = 5
+
+_slot_lock = threading.Lock()
+# endpoint_identity -> (highest slot it has answered at, unix time we saw it)
+_slot_seen: dict[tuple, tuple[int, float]] = {}
+_SLOT_SEEN_MAX = 64                 # bound the map; distinct endpoints are single digits
 
 
 _PUBKEY_RE = re.compile(r"\A[1-9A-HJ-NP-Za-km-z]{32,44}\Z")   # base58, no 0OIl
@@ -137,6 +207,109 @@ def rpc_display() -> str:
     return redact_url(rpc_source()[0])
 
 
+def max_lag_slots() -> int:
+    """How far an endpoint may fall below its own high-water slot before it is refused.
+
+    `XETE_ALIAS_MAX_LAG_SLOTS = 0` disables the check entirely, which is the escape hatch
+    for an operator running a local validator whose slot numbering is not mainnet's. A
+    value that is not a non-negative integer is treated as unset rather than as an error:
+    this is a safety margin, and a typo in it must not take out alias resolution.
+    """
+    raw = (os.environ.get(ENV_MAX_LAG) or "").strip()
+    if not raw:
+        return DEFAULT_MAX_LAG_SLOTS
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_LAG_SLOTS
+    return parsed if parsed >= 0 else DEFAULT_MAX_LAG_SLOTS
+
+
+def _slot_floor(key: tuple) -> int | None:
+    """The `minContextSlot` to send this endpoint, or None to send none.
+
+    Derived only from slots THIS endpoint has already answered at, never from another's.
+    """
+    tolerance = max_lag_slots()
+    if tolerance == 0:
+        return None
+    with _slot_lock:
+        entry = _slot_seen.get(key)
+    if entry is None:
+        return None                                   # first call: nothing to compare to
+    floor = entry[0] - tolerance
+    return floor if floor > 0 else None
+
+
+def _plausible_ceiling(key: tuple, now: float) -> int:
+    """The highest slot this endpoint could honestly be at right now.
+
+    From a known (slot, when) pair a chain cannot have advanced faster than its slot rate,
+    so elapsed time is a hard ceiling on the next honest answer. An endpoint we have never
+    seen is measured from genesis, which bounds the very first observation — without that,
+    one absurd first answer pins the endpoint's own floor above anything it can ever serve
+    again, and the lockout outlives the attack for the life of the process.
+    """
+    with _slot_lock:
+        entry = _slot_seen.get(key)
+    base_slot, base_time = entry if entry is not None else (0, CHAIN_GENESIS_UNIX)
+    elapsed = max(0.0, now - base_time)
+    return base_slot + int(elapsed * MAX_SLOTS_PER_SEC) + max_lag_slots()
+
+
+def _record_slot(key: tuple, slot: int, now: float) -> bool:
+    """Remember the highest slot this endpoint has answered at. Monotonic, never lowered.
+
+    Returns False when the slot is above what elapsed time allows, in which case it is NOT
+    recorded — the caller treats it as "no usable slot" rather than as a fact.
+    """
+    if slot > _plausible_ceiling(key, now):
+        return False
+    with _slot_lock:
+        if len(_slot_seen) >= _SLOT_SEEN_MAX and key not in _slot_seen:
+            # Evict ONE, do not clear(). Clearing drops every honest endpoint's floor at
+            # once, so anything that could ever drive keys into this map would get a
+            # one-call reset of the whole process's protection. Nothing can today — no MCP
+            # tool takes an endpoint argument — and this keeps that from becoming a
+            # one-parameter mistake later.
+            _slot_seen.pop(next(iter(_slot_seen)), None)
+        prev = _slot_seen.get(key)
+        if prev is None or slot > prev[0]:
+            _slot_seen[key] = (slot, now)
+    return True
+
+
+def _forget_slot(key: tuple) -> None:
+    """Drop an endpoint's mark after it has told us, with -32016, that it is below it.
+
+    A confirmed regression re-baselines rather than latching. The high-water mark exists to
+    notice a host going backwards; once that has been noticed and reported, holding the old
+    peak forever means one blip locks the endpoint out permanently. The next call starts
+    with no floor and re-establishes from wherever the endpoint actually is. This hands a
+    hostile endpoint nothing: it could always have reported a low slot instead.
+    """
+    with _slot_lock:
+        _slot_seen.pop(key, None)
+
+
+def observed_slot_for(url: str) -> int | None:
+    """The highest slot seen from the endpoint `url` names. None if unseen.
+
+    Takes the URL and derives the key itself. Callers (and tests) must not rebuild the key,
+    or they pin whichever identity function they happened to copy — which is how the first
+    version of this code ended up keyed on `redact_url`.
+    """
+    with _slot_lock:
+        entry = _slot_seen.get(endpoint_identity(url))
+    return entry[0] if entry else None
+
+
+def _reset_slot_memory() -> None:
+    """Drop all remembered slots. For tests — process-lifetime state is otherwise sticky."""
+    with _slot_lock:
+        _slot_seen.clear()
+
+
 def normalize_name(name: str) -> str:
     """The canonical registry form of a %name: no leading %, no surrounding space, lower case.
 
@@ -184,16 +357,33 @@ def resolve_owner(name: str, rpc: str | None = None) -> str | None:
     i.e. the name is provably unclaimed. Raises AliasChainError when the answer could
     not be obtained or could not be trusted — never conflate the two.
     """
+    return resolve_owner_at(name, rpc)[0]
+
+
+def resolve_owner_at(name: str, rpc: str | None = None) -> tuple[str | None, int | None]:
+    """`resolve_owner`, plus the slot the endpoint answered at (None if it did not say).
+
+    Split out rather than changing `resolve_owner`'s return type, which a dozen callers
+    unpack directly. The slot is for REPORTING — "this answer is from slot N" — and for
+    the per-endpoint freshness floor. It is not evidence of anything: see the freshness
+    note at the top of this module.
+    """
     bare = normalize_name(name)
     pda = alias_pda(bare)
     url = rpc_url() if rpc is None else require_secure_url(rpc, ENV_RPC)
     shown = redact_url(url)     # every message below; the real url only goes on the wire
 
+    key = endpoint_identity(url)    # identity for the floor; `shown` is for humans only
+    cfg: dict = {"encoding": "base64", "commitment": COMMITMENT}
+    floor = _slot_floor(key)
+    if floor is not None:
+        cfg["minContextSlot"] = floor
+
     try:
         body = post_json(
             url,
             {"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
-             "params": [str(pda), {"encoding": "base64", "commitment": COMMITMENT}]},
+             "params": [str(pda), cfg]},
             timeout=RPC_TIMEOUT,
             max_bytes=MAX_RPC_BYTES,
         )
@@ -219,6 +409,30 @@ def resolve_owner(name: str, rpc: str | None = None) -> str | None:
         code = err.get("code") if isinstance(err, dict) else None
         code_txt = (f" (code {code})" if isinstance(code, int) and not isinstance(code, bool)
                     else "")
+        # The endpoint refused because it could not reach the freshness floor WE sent — it
+        # is behind a slot it itself already served. Reported as its own sentence because
+        # the remedy is completely different from every other RPC error: nothing is
+        # misconfigured and nothing is under attack, this host is lagging and should either
+        # be given a moment or replaced. Folding it into the generic error would send an
+        # operator hunting a problem that does not exist.
+        # `floor is not None` is load-bearing, not belt-and-braces: an endpoint can return
+        # -32016 when we sent NO floor at all, and the message below would then accuse it of
+        # being "behind slot None" — manufacturing exactly the phantom problem this branch
+        # exists to prevent, and nudging the operator to repoint their RPC or disable the
+        # check on the endpoint's say-so. Unprompted -32016 is unexplained behaviour, which
+        # is what the generic branch is for. `isinstance(code, int)` is equally load-bearing:
+        # `-32016.0` compares equal to `-32016`, so a float is a second spelling into here.
+        if (floor is not None and isinstance(code, int) and not isinstance(code, bool)
+                and code == RPC_ERR_MIN_CONTEXT_SLOT):
+            _forget_slot(key)       # re-baseline; a noticed regression must not latch
+            seen = floor + max_lag_slots()
+            raise AliasChainError(
+                f"{shown} is behind: it already answered at slot {seen} but now cannot serve slot "
+                f"{floor}, so it would have returned a stale owner for %{bare}. Refusing a stale "
+                f"answer rather than returning one. This is lag, not a wrong answer — retry, or "
+                f"point {ENV_RPC} at a node that keeps up. Set {ENV_MAX_LAG}=0 to disable the "
+                f"check.",
+                server_text=sanitize_text(detail, 200))
         raise AliasChainError(
             f"{shown} returned a JSON-RPC error{code_txt} resolving %{bare}, so the registry was "
             "not read and no owner is being guessed. Any text that endpoint sent is quarantined, "
@@ -230,9 +444,24 @@ def resolve_owner(name: str, rpc: str | None = None) -> str | None:
         raise AliasChainError(
             f"{shown} returned a getAccountInfo response with no result value for %{bare}.")
 
+    # Recorded before the account is inspected, and for the unclaimed answer too: the slot
+    # describes how current the ENDPOINT is, which is true whatever it found at the address.
+    # Skipping it on the None path would leave the floor un-raised on exactly the lookups a
+    # resolver does most (names that do not exist yet).
+    ctx = result.get("context")
+    raw_slot = ctx.get("slot") if isinstance(ctx, dict) else None
+    slot = (raw_slot if isinstance(raw_slot, int) and not isinstance(raw_slot, bool)
+            and raw_slot >= 0 else None)
+    # A slot above what elapsed time allows is not a slot, it is a number the endpoint made
+    # up. It is neither recorded nor reported: reporting it would put an authoritative-
+    # looking figure in front of an agent, and recording it would pin this endpoint's own
+    # floor above anything it could ever serve again.
+    if slot is not None and not _record_slot(key, slot, time.time()):
+        slot = None
+
     value = result["value"]
     if value is None:
-        return None                                   # provably unclaimed
+        return None, slot                             # provably unclaimed
     if not isinstance(value, dict):
         raise AliasChainError(f"{shown} returned a non-object account for %{bare}.")
 
@@ -280,4 +509,4 @@ def resolve_owner(name: str, rpc: str | None = None) -> str | None:
             f"the registry account at {pda} holds the name {stored!r}, not {bare!r}. Refusing to "
             "return its owner.")
 
-    return str(Pubkey.from_bytes(bytes(data[A_OWNER:A_OWNER + 32])))
+    return str(Pubkey.from_bytes(bytes(data[A_OWNER:A_OWNER + 32]))), slot

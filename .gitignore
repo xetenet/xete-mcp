@@ -94,3 +94,4 @@ id_rsa*
 !.env.sample
 !.env.template
 # --- end xete estate secret hygiene ---
+uv.lock

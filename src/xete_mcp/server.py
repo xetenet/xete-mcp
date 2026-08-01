@@ -610,9 +610,19 @@ def _endpoint_error(e: EndpointError, **extra) -> dict:
     return out
 
 
-def _chain_source() -> dict:
+def _chain_source(rpc: str | None = None) -> dict:
+    """`resolution` for an answer read off the chain. `rpc` is the endpoint that ACTUALLY
+    answered, when the caller picked one.
+
+    Passing it matters. `alias_chain.rpc_display()` re-derives the precedence
+    XETE_SOLANA_RPC -> XETE_RPC_URL -> default and never reads XETE_ALIAS_RPC, so once
+    `_alias_view` started honouring the operator's ranked list, this field began naming a
+    host that was never contacted — while `rpc_display`'s own docstring says "which host
+    answered" is the entire diagnostic it owes anyone. Reporting a slot next to a wrong
+    endpoint name is worse than reporting neither: both halves look precise and agree.
+    """
     return {"source": "chain", "verified": True, "program": str(alias_chain.AXTREG),
-            "rpc": alias_chain.rpc_display()}
+            "rpc": redact_url(rpc) if rpc else alias_chain.rpc_display()}
 
 
 def _chain_error(bare: str, e: Exception) -> dict:
@@ -669,14 +679,35 @@ def _alias_view(name: str) -> dict:
         _ranked = distinct_endpoints(alias_rpc_endpoints())
     except Exception:
         _ranked = []
+    _used = _ranked[0] if _ranked else None
     try:
-        owner = alias_chain.resolve_owner(bare, _ranked[0] if _ranked else None)
+        owner, _slot = alias_chain.resolve_owner_at(bare, _used)
     except (alias_chain.AliasChainError, EndpointError) as e:
         return _chain_error(bare, e)
 
     out["alias_owner"] = owner
     out["claimed"] = owner is not None
-    out["resolution"] = _chain_source()
+    out["resolution"] = _chain_source(_used)
+    # Which slot the answer came from. A caller comparing two answers, or wondering why a
+    # name it just claimed still reads as unclaimed, has no other way to tell a stale reply
+    # from a wrong one. Reported, never asserted: the endpoint chose this number and a
+    # dishonest one picks whatever it likes (see the freshness note in alias_chain).
+    #
+    # ALWAYS emitted, null included. An endpoint that omits `context.slot` — or reports one
+    # that elapsed time says it cannot be at — silently opts out of the freshness check, and
+    # a key that simply vanishes is invisible to the agent reading this: it sees
+    # `verified: true` and no caveat, which is the exact shape of the [G18] finding (a
+    # corroborator that merely did not answer emitted no WARNING key while every weaker
+    # condition had one). The unclaimed path needs this most, because the
+    # one-endpoint warning below is gated on there being an owner.
+    out["answered_at_slot"] = _slot
+    if _slot is None:
+        out["WARNING_ENDPOINT_DID_NOT_STATE_A_USABLE_SLOT"] = (
+            "This endpoint did not say which slot it answered at, or named one it cannot "
+            "honestly be at, so there is NO staleness check on this answer at all — it "
+            "could have been served from a node minutes or hours behind the chain. That "
+            "matters most right after a %name is claimed or transferred. Treat `claimed` "
+            "and `alias_owner` here as this one host's current opinion, not as settled.")
     if owner is not None:
         # `verified: true` on this path means "read off the chain instead of taken from the
         # permit server". It does NOT mean corroborated, and one endpoint chose this wallet —

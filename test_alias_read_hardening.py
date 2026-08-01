@@ -1104,12 +1104,16 @@ def test_the_read_path_honours_the_operators_ranked_alias_endpoints(monkeypatch)
 
     def _spy(name, rpc=None):
         used.append(rpc)
-        return None
+        return None, None            # (owner, answered-at slot) — see resolve_owner_at
 
-    monkeypatch.setattr(alias_chain, "resolve_owner", _spy)
+    # The spy sits on `resolve_owner_at`, which is what `_alias_view` calls: it needs the
+    # answering slot as well as the owner. `resolve_owner` still exists and still returns a
+    # bare owner for its other callers, but patching THAT here would spy on a function this
+    # path no longer touches, and the test would pass while asserting nothing.
+    monkeypatch.setattr(alias_chain, "resolve_owner_at", _spy)
     server._alias_view("somename")
 
-    assert used, "resolve_owner was never called"
+    assert used, "resolve_owner_at was never called"
     assert used[0] == "https://operators-own-validator.internal", (
         f"the read used {used[0]!r} instead of the endpoint the operator ranked first — "
         "XETE_ALIAS_RPC is being ignored")
