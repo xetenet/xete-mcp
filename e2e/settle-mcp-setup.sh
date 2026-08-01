@@ -6,7 +6,7 @@ set -uo pipefail
 export PATH="$HOME/solana-release/bin:$HOME/.cargo/bin:$PATH"
 source "$HOME/.cargo/env" 2>/dev/null || true
 RPC="http://127.0.0.1:8899"
-SO=/home/jshedrick/escrow-pin-rebuild/target/deploy/xete_escrow_pin.so
+SO="${XETE_ESCROW_SO:-$HOME/escrow-pin-rebuild/target/deploy/xete_escrow_pin.so}"
 D=/tmp/xete-settle-test
 mkdir -p "$D"
 [ -f "$SO" ] || { echo "MISSING_SO $SO"; exit 1; }

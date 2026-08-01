@@ -23,5 +23,5 @@ if ! pgrep -x ollama >/dev/null 2>&1; then
   setsid nohup ollama serve >>"$HOME/.ollama-serve.log" 2>&1 &
   for _ in $(seq 1 20); do curl -s --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1 && break; sleep 1; done
 fi
-cd /mnt/c/Users/jshed/xete-mcp
+cd "$(cd "$(dirname "$0")" && pwd)"
 exec "$HOME/.xete-agent-venv/bin/python" run_agent.py --handler ollama-tools --name ollama

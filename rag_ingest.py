@@ -10,8 +10,8 @@ Query it with rag_query.py.
 """
 import os, re, sys, time, pickle, math, json, subprocess, urllib.request
 
-ROOT = os.environ.get("RAG_ROOT", "/mnt/c/Users/jshed")
-STORE = os.environ.get("RAG_STORE", "/mnt/c/Users/jshed/xete-mcp/rag_store.pkl")
+ROOT = os.environ.get("RAG_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+STORE = os.environ.get("RAG_STORE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "rag_store.pkl"))
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 

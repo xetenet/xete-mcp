@@ -33,11 +33,11 @@ Design notes (why it's built this way):
 import os, sys, json, pickle, math, random, time, argparse, urllib.request
 from datetime import datetime, timezone
 
-STORE = os.environ.get("RAG_STORE", "/mnt/c/Users/jshed/xete-mcp/rag_store.pkl")
+STORE = os.environ.get("RAG_STORE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "rag_store.pkl"))
 OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "llama3.1:8b")
 NUM_CTX = int(os.environ.get("NUM_CTX", "8192"))
-DEFAULT_LOG = os.environ.get("BRAINSTORM_LOG", "/mnt/c/Users/jshed/xete-mcp/brainstorm_insights.md")
+DEFAULT_LOG = os.environ.get("BRAINSTORM_LOG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "brainstorm_insights.md"))
 
 LENSES = [
     ("mechanism", "What underlying MECHANISM, process, or structural pattern do these two things "
