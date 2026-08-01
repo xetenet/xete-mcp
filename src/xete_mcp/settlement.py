@@ -72,6 +72,30 @@ def _send(client: Client, signers, ixs, payer: Keypair, label: str) -> str:
     raise RuntimeError(f"{label} not confirmed")
 
 
+def deposit_ix(program: Pubkey, depositor: Pubkey, escrow_id: bytes, amount_lamports: int,
+               commitment_bytes: bytes, unlock: int = 0) -> Instruction:
+    """The deposit (tag 0) instruction, on its own. Factored out so the signing path (`deposit`)
+    and the unsigned-draft path (draft.py) build byte-identical instruction data from one source —
+    a drift between them would be a silent-loss bug on an IMMUTABLE program."""
+    if len(escrow_id) != 32:
+        raise ValueError(f"escrow_id must be 32 bytes, got {len(escrow_id)}")
+    if len(commitment_bytes) != 32:
+        raise ValueError(f"commitment must be 32 bytes, got {len(commitment_bytes)}")
+    if amount_lamports <= 0:
+        raise ValueError("amount_lamports must be > 0")
+    data = (bytes([0]) + escrow_id + struct.pack("<Q", amount_lamports)
+            + commitment_bytes + struct.pack("<q", unlock))
+    return Instruction(
+        program_id=program,
+        data=data,
+        accounts=[
+            AccountMeta(depositor, True, True),
+            AccountMeta(escrow_pda(program, escrow_id), False, True),
+            AccountMeta(SYS, False, False),
+        ],
+    )
+
+
 def deposit(rpc_url: str, depositor: Keypair, recipient: Pubkey, amount_lamports: int):
     """Open a settlement: lock `amount_lamports` for `recipient` (hidden as a commitment). Returns
     (escrow_id_hex, salt_hex, pda_str, sig). The recipient needs escrow_id + salt to claim.
@@ -89,16 +113,7 @@ def deposit(rpc_url: str, depositor: Keypair, recipient: Pubkey, amount_lamports
     eid = bytes(Keypair().pubkey())        # random 32-byte escrow id (never derived from the recipient)
     salt = bytes(Keypair().pubkey())[:16]  # random salt; shared with the recipient out-of-band
     pda = escrow_pda(prog, eid)
-    data = bytes([0]) + eid + struct.pack("<Q", amount_lamports) + commitment(recipient, salt) + struct.pack("<q", 0)
-    ix = Instruction(
-        program_id=prog,
-        data=data,
-        accounts=[
-            AccountMeta(depositor.pubkey(), True, True),
-            AccountMeta(pda, False, True),
-            AccountMeta(SYS, False, False),
-        ],
-    )
+    ix = deposit_ix(prog, depositor.pubkey(), eid, amount_lamports, commitment(recipient, salt))
     sig = _send(client, [depositor], [ix], depositor, "deposit")
     return eid.hex(), salt.hex(), str(pda), sig
 

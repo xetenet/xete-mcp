@@ -36,7 +36,7 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from .client import XeteClient, load_or_create_identity
-from . import payment, settlement
+from . import draft, payment, settlement
 
 SERVER_URL = os.environ.get("XETE_SERVER_URL", "https://xete.net")
 RPC_URL = os.environ.get("XETE_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -45,6 +45,12 @@ SOL_KEYPAIR_PATH = os.environ.get("XETE_SOL_KEYPAIR", "")
 # The %alias permit server. Separate service from the messaging relay, though in prod it may be
 # proxied under the same host — so it defaults to SERVER_URL and is overridable.
 PERMIT_URL = os.environ.get("XETE_PERMIT_URL", SERVER_URL)
+# Custody-T1 draft path (SPEC-unsigned-settlement-draft-20260729). The depositor is read from
+# operator config and NEVER from a tool argument — a tool argument is attacker-reachable through
+# any message the agent reads, and it decides who pays.
+DEPOSITOR_WALLET = os.environ.get("XETE_DEPOSITOR_WALLET", "")
+NONCE_ACCOUNT = os.environ.get("XETE_NONCE_ACCOUNT", "")
+NONCE_AUTHORITY = os.environ.get("XETE_NONCE_AUTHORITY", "")
 
 mcp = FastMCP("xete")
 
@@ -483,6 +489,92 @@ def xete_settle_status(escrow_id: str) -> str:
     except Exception as e:
         return json.dumps({"status": "failed", "error": str(e)[:300]})
 
+
+@mcp.tool()
+def xete_draft_settlement_tx(recipient: str, amount_sol: float) -> str:
+    """Draft an UNSIGNED settlement transaction paying `recipient` `amount_sol` — for review and
+    signing by a HUMAN in their own wallet. This tool CANNOT move funds: it holds no key and
+    submits nothing. Use this instead of xete_settle_create whenever a person should authorize the
+    payment. Recipient may be a wallet address or a %alias. Returns base64 unsigned transaction, a
+    plain-English summary, the claim ticket (escrow_id + salt) the recipient will need, and the
+    exact arguments to pass to xete_verify_settlement_tx. The beneficiary is HIDDEN on-chain as a
+    hash, so the raw transaction does not show who gets paid — always verify before signing."""
+    try:
+        from solders.pubkey import Pubkey
+
+        if not DEPOSITOR_WALLET:
+            return json.dumps({"status": "unconfigured", "error":
+                               "XETE_DEPOSITOR_WALLET is not set. The operator must configure the "
+                               "wallet that will sign; it is deliberately not a tool argument."})
+        depositor = Pubkey.from_string(DEPOSITOR_WALLET)
+        recipient_wallet, handle = _resolve_recipient_wallet(recipient)
+        lamports = int(round(amount_sol * 1_000_000_000))
+        if lamports <= 0:
+            return json.dumps({"status": "failed", "error": "amount_sol must be > 0"})
+
+        nonce_acct = Pubkey.from_string(NONCE_ACCOUNT) if NONCE_ACCOUNT else None
+        nonce_auth = Pubkey.from_string(NONCE_AUTHORITY) if NONCE_AUTHORITY else None
+        d = draft.draft_deposit(RPC_URL, depositor, recipient_wallet, lamports,
+                                nonce_account=nonce_acct, nonce_authority=nonce_auth)
+
+        summary = (f"Pay {amount_sol} SOL to {recipient}"
+                   f"{'' if str(recipient_wallet) == recipient else f' ({recipient_wallet})'} "
+                   f"from {depositor}. The beneficiary is hidden on-chain behind commitment "
+                   f"{d.commitment_hex[:16]}…; funds sit in escrow {d.pda} until the recipient "
+                   f"claims with the ticket below, and you can reclaim them until they do. "
+                   f"{d.expires_note}")
+        return json.dumps({
+            "status": "drafted", "signed": False, "custody": "T1 — no key held; a human signs",
+            "unsigned_tx_b64": d.unsigned_tx_b64,
+            "summary": summary,
+            "depositor": d.depositor, "recipient_wallet": d.recipient, "amount_sol": amount_sol,
+            "amount_lamports": d.amount_lamports, "pda": d.pda, "program": d.program,
+            "blockhash_kind": d.blockhash_kind, "nonce_account": d.nonce_account,
+            "ticket": {"escrow_id": d.escrow_id_hex, "salt": d.salt_hex,
+                       "deliver_to": handle or "recipient (no xete handle found)"},
+            "verify_with": {"tool": "xete_verify_settlement_tx",
+                            "unsigned_tx_b64": "<the value above>",
+                            "expect_recipient": d.recipient, "salt": d.salt_hex,
+                            "amount_sol": amount_sol},
+            "next_step": "Have a human verify, then sign and submit from their own wallet. "
+                         "Do not deliver the claim ticket until the deposit confirms on-chain.",
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"status": "failed", "error": str(e)[:300]})
+
+
+@mcp.tool()
+def xete_verify_settlement_tx(unsigned_tx_b64: str, expect_recipient: str, salt: str,
+                              amount_sol: float) -> str:
+    """Independently check that an unsigned settlement transaction really pays who you think it
+    pays, before a human signs it. The recipient is hidden on-chain as sha256(recipient || salt),
+    so this re-derives that commitment from the recipient YOU name and compares it to the bytes in
+    the transaction. Returns a per-check pass/fail table. A `verified: false` result means DO NOT
+    SIGN — the transaction does not match the stated intent."""
+    try:
+        from solders.pubkey import Pubkey
+
+        if not DEPOSITOR_WALLET:
+            return json.dumps({"status": "unconfigured",
+                               "error": "XETE_DEPOSITOR_WALLET is not set; nothing to verify against."})
+        recipient_wallet, _ = _resolve_recipient_wallet(expect_recipient)
+        r = draft.verify_draft(
+            unsigned_tx_b64,
+            expect_recipient=recipient_wallet,
+            expect_salt_hex=salt,
+            expect_amount_lamports=int(round(amount_sol * 1_000_000_000)),
+            expect_depositor=Pubkey.from_string(DEPOSITOR_WALLET),
+        )
+        return json.dumps({
+            "verified": r.ok,
+            "verdict": "SAFE TO REVIEW AND SIGN" if r.ok else "DO NOT SIGN — verification failed",
+            "failed_checks": r.failures,
+            "checks": r.checks,
+            "recipient_checked": str(recipient_wallet),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"verified": False, "verdict": "DO NOT SIGN — verifier errored",
+                           "error": str(e)[:300]})
 
 def main():
     mcp.run()
