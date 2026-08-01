@@ -219,7 +219,16 @@ that is a change to the shared skills repo and is left to the human as well.
 | [5] asymmetric hardening + ignored node | medium | **fixed** | `test_plain_http_is_refused_for_the_rpc_that_signs`, `test_a_read_only_settlement_tool_refuses_a_plain_http_rpc`, `test_loopback_is_still_allowed_*`, `test_alias_reads_inherit_the_operators_already_configured_node`, `test_the_dedicated_variable_still_wins_*`, `test_the_public_default_applies_only_*`, `test_the_tool_reports_the_endpoint_it_actually_used` |
 | [6] claim posts raw name | low | **fixed** | `test_claim_posts_the_normalised_name`, `test_claim_refuses_an_impossible_name_*` |
 | [7] stale README | low | **fixed** | `test_readme_does_not_claim_the_live_alias_endpoints_are_undeployed` |
-| [8] no DDR on a protected path | medium | **fixed** — this file, staged with the change; hooks enabled via `git config core.hooksPath .githooks` | n/a |
+| [8] no DDR on a protected path | medium | **fixed** — this file; hooks enabled via `git config core.hooksPath .githooks`, and see below | n/a |
+
+On [8], the finding understates the problem. Setting `core.hooksPath` was not sufficient:
+`.githooks/pre-commit` and `.githooks/pre-merge-commit` were committed mode `100644`, so
+git skipped them with `hint: the hook was ignored because it's not set as executable`.
+The gate was decorative for a second, independent reason that survives any
+`git config` fix and reappears in every fresh clone. Both are now mode `100755`
+(`.githooks/pre-push` already was). Verified by observing the hook's own
+`[xete-gate] Protected paths staged on branch ...` output on the commit that carries this
+line — before the chmod, that line did not appear at all.
 
 One defect found by me, not by the reviewer, and fixed in the same pass: `xete_alias_quote`
 reported the permit server's echoed `name` rather than the name asked about, so a server

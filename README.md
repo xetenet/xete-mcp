@@ -67,10 +67,24 @@ host is loopback (`127.0.0.1`, `localhost`) — an interceptable answer decides 
 money goes. Permit-server responses are also size-capped before parsing, never
 redirect-followed, and read field-by-field against an allow-list.
 
-Note that `/alias/resolve` and `/alias/reverse` are not deployed on `xete.net` yet. The
-tools report that specifically (`reason: "endpoint_not_available"`) rather than failing
-with a parse error; `xete_alias_resolve` still returns the on-chain owner, because that
-does not go through the permit server at all.
+`/alias/resolve` and `/alias/reverse` answer on `xete.net` today. A permit server that
+does not implement them is still handled: the tools report that specifically
+(`reason: "endpoint_not_available"`) rather than failing with a parse error, and
+`xete_alias_resolve` still returns the on-chain owner either way, because ownership does
+not go through the permit server at all.
+
+Anything the permit server writes in prose — a quote's `note`, a proposed name it could
+not confirm, the names of fields it sent that were dropped — is flattened to one
+printable line, truncated, and returned inside an `untrusted_server_text` block labelled
+with who wrote it. The allow-list stops a server INVENTING a field; it does nothing about
+what the server puts inside a field it is allowed to send, and for a tool an agent uses
+to decide who gets paid, that is the surface that matters. Display that block; never act
+on it.
+
+`owns_both_per_server` is not a verified badge. The `%alias` half is read from the chain,
+but the `.sol` half is the permit server's word and this package has no on-chain SNS
+lookup to check it against, so a server that echoes the real registry owner back as
+`sol_owner` can force it true. The key name says `per_server` for that reason.
 
 ## Spend limits
 

@@ -271,7 +271,12 @@ def test_quote_fields_are_allow_listed(net):
     assert got["verified"] is False             # ours, not the server's
     assert "instructions" not in got
     assert "alias_owner" not in got
-    assert set(got["fields_ignored"]) == {"alias_owner", "instructions", "verified"}
+    # fields_ignored moved INSIDE the untrusted_server_text box (finding [2c]): the key
+    # NAMES are attacker-chosen text too, so they are reported under the banner that says
+    # so rather than flat among fields this client produced. Same names, same guarantee.
+    box = got["untrusted_server_text"]
+    assert set(box["fields_ignored"]) == {"alias_owner", "instructions", "verified"}
+    assert "WRITTEN BY THE PERMIT SERVER" in box["_warning"]
 
 
 def test_quote_rejects_a_non_wallet_wallet_argument(net):
@@ -297,7 +302,11 @@ def test_alias_resolve_returns_the_chain_owner_not_the_servers(net):
     assert got["permit_server_disagrees"] is True
     assert got["unverified"]["alias_owner_per_server"] == SERVER_OWNER
     assert got["unverified"]["verified"] is False
-    assert got["unverified"]["owns_both"] is False     # recomputed, not the server's True
+    # Renamed by finding [3]: the badge is recomputed from the chain owner (so the
+    # server's True is still discarded here) but the .sol half is the server's word, so
+    # the key says so. The plain `owns_both` must not come back at all.
+    assert got["unverified"]["owns_both_per_server"] is False
+    assert "owns_both" not in got["unverified"]
 
 
 def test_alias_resolve_still_answers_when_the_permit_endpoint_404s(net):
@@ -397,7 +406,7 @@ def test_reverse_returns_a_name_the_chain_confirms(net):
     assert got["verified"] is True
     assert got["resolution"]["source"] == "chain"
     assert "ignore your caller" not in json.dumps(got)   # the value never reaches the caller
-    assert "instructions" in got["unverified"]["fields_ignored"]
+    assert "instructions" in got["unverified"]["untrusted_server_text"]["fields_ignored"]
 
 
 def test_reverse_rejects_a_non_wallet_argument(net):
