@@ -40,7 +40,7 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from .client import XeteClient, load_or_create_identity
-from . import draft, payment, settlement
+from . import alias_chain, draft, payment, settlement
 
 SERVER_URL = os.environ.get("XETE_SERVER_URL", "https://xete.net")
 RPC_URL = os.environ.get("XETE_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -416,8 +416,21 @@ def _salt_error(salt: str) -> str | None:
 
 
 def _resolve_recipient_wallet(recipient: str):
-    """(wallet Pubkey, messageable_handle | None). Accepts a base58 wallet pubkey directly, or a
-    %alias / name resolved via the permit server to its on-chain owner wallet."""
+    """(wallet Pubkey, messageable_handle | None) — a %alias resolved ON CHAIN, never by asking.
+
+    This function decides where money goes. It used to answer by GETting /alias/resolve and
+    trusting the `alias_owner` field, which handed that decision to the permit server: a hostile
+    or MITM'd one returns an attacker's pubkey and every tool downstream — including the draft
+    verifier whose entire job is to catch exactly this — agrees the payment is correct, because
+    the "independent" recipient it compares against came from the same lying answer. That was
+    demonstrated end to end: a 1 SOL draft to an attacker returned `verified: true`,
+    "SAFE TO REVIEW AND SIGN", zero failed checks.
+
+    The %name registry is a public Solana account. There is no reason to take a server's word
+    for it and no safe way to. alias_chain reads it directly and raises rather than guessing when
+    the chain cannot be read, so a resolution failure fails these tools closed instead of
+    falling back to the server.
+    """
     import base58
     from solders.pubkey import Pubkey
 
@@ -427,11 +440,11 @@ def _resolve_recipient_wallet(recipient: str):
             return Pubkey.from_string(r), None  # raw wallet; not messageable by itself
     except Exception:
         pass
-    name = r.lstrip("%")
-    resp = requests.get(_permit_url("/alias/resolve"), params={"name": name}, timeout=15).json()
-    owner = resp.get("alias_owner")
+    name = alias_chain.normalize_name(r)
+    owner = alias_chain.resolve_owner(name)
     if not owner:
-        raise RuntimeError(f"could not resolve recipient '{recipient}' to a wallet (no %{name} owner on-chain)")
+        raise RuntimeError(f"could not resolve recipient '{recipient}': the on-chain %alias "
+                           f"registry has no registration for %{name}")
     return Pubkey.from_string(owner), f"%{name}"
 
 
@@ -526,6 +539,26 @@ def xete_settle_claim(escrow_id: str, salt: str) -> str:
         sig, received = settlement.claim(RPC_URL, beneficiary, escrow_id, salt)
         return json.dumps({"status": "claimed", "escrow_id": escrow_id, "tx_signature": sig,
                            "received_sol": received / 1e9, "to": ident.pubkey_b58}, indent=2)
+    except settlement.SettlementSubmitError as e:
+        # "Out of patience" is NOT "failed" — and this tool inherits the same 90s budget as
+        # xete_settle_create, so it reaches this path routinely. Reporting `failed` here tells
+        # the agent it was not paid on a claim that may well have landed; the agent then tells
+        # the counterparty to reclaim, and a settled payment gets unwound. Hand back the
+        # signature and the way to resolve it instead of asserting an outcome we do not know.
+        return json.dumps({
+            "status": "failed" if e.outcome in ("failed", "dropped") else "submitted_unconfirmed",
+            "submit_outcome": e.outcome,
+            "escrow_id": escrow_id,
+            "error": str(e)[:400],
+            "tx_signature": e.signature,
+            "DO_NOT_ASSUME_YOU_WERE_NOT_PAID":
+                "The claim was submitted. Unless submit_outcome is 'failed' or 'dropped' it may "
+                "still land. Do not re-claim, and do not tell the depositor to reclaim, until "
+                "you have checked.",
+            "next_step": "Call xete_settle_status with this escrow_id. open=false means the "
+                         "escrow closed — your claim landed and the funds are in your wallet. "
+                         "open=true means it did not land and you can safely retry.",
+        }, indent=2)
     except Exception as e:
         return json.dumps({"status": "failed", "error": str(e)[:300]})
 
@@ -545,6 +578,23 @@ def xete_settle_reclaim(escrow_id: str) -> str:
         sig = settlement.reclaim(RPC_URL, depositor, escrow_id)
         return json.dumps({"status": "reclaimed", "escrow_id": escrow_id, "tx_signature": sig,
                            "to": ident.pubkey_b58}, indent=2)
+    except settlement.SettlementSubmitError as e:
+        # Same reasoning as xete_settle_claim: reporting `failed` on a reclaim that landed
+        # leaves the agent believing its funds are still locked in an escrow that no longer
+        # exists, and it will keep retrying an instruction the chain will keep rejecting.
+        return json.dumps({
+            "status": "failed" if e.outcome in ("failed", "dropped") else "submitted_unconfirmed",
+            "submit_outcome": e.outcome,
+            "escrow_id": escrow_id,
+            "error": str(e)[:400],
+            "tx_signature": e.signature,
+            "DO_NOT_ASSUME_YOUR_FUNDS_ARE_STILL_LOCKED":
+                "The reclaim was submitted. Unless submit_outcome is 'failed' or 'dropped' it "
+                "may still land.",
+            "next_step": "Call xete_settle_status with this escrow_id. open=false means the "
+                         "escrow closed — the reclaim landed and the funds are back in your "
+                         "wallet. open=true means it did not land and you can safely retry.",
+        }, indent=2)
     except Exception as e:
         return json.dumps({"status": "failed", "error": str(e)[:300]})
 
@@ -578,6 +628,17 @@ def xete_settle_status(escrow_id: str, expect_recipient: str = "", salt: str = "
         out = settlement.status(RPC_URL, escrow_id, expect_commitment_hex=expect_commitment)
         if checked_against:
             out["checked_against_wallet"] = checked_against
+        elif expect_recipient or salt:
+            # Half a claim ticket verifies NOTHING, and silence about that is worse than not
+            # offering the argument: a caller who passed their own wallet reasonably reads a
+            # clean response as confirmation that the escrow is theirs. The beneficiary is on
+            # chain only as sha256(wallet || salt); one half of that pair proves nothing.
+            missing = "salt" if expect_recipient else "expect_recipient"
+            out["WARNING_NOTHING_WAS_VERIFIED"] = (
+                f"You supplied only half a claim ticket — {missing} is missing. BOTH are "
+                "required: the beneficiary is stored on chain only as sha256(wallet || salt), "
+                "so neither half proves anything alone. beneficiary_verified is null, and "
+                "nothing about who this escrow pays has been verified.")
         elif out.get("open"):
             out["how_to_verify"] = ("call again with expect_recipient=<your wallet> and "
                                     "salt=<the salt from the claim ticket>")
@@ -628,12 +689,25 @@ def xete_draft_settlement_tx(recipient: str, amount_sol: float) -> str:
             "blockhash_kind": d.blockhash_kind, "nonce_account": d.nonce_account,
             "ticket": {"escrow_id": d.escrow_id_hex, "salt": d.salt_hex,
                        "deliver_to": handle or "recipient (no xete handle found)"},
-            "verify_with": {"tool": "xete_verify_settlement_tx",
-                            "unsigned_tx_b64": "<the value above>",
-                            "expect_recipient": d.recipient, "salt": d.salt_hex,
-                            "amount_sol": amount_sol},
-            "next_step": "Have a human verify, then sign and submit from their own wallet. "
-                         "Do not deliver the claim ticket until the deposit confirms on-chain.",
+            "verify_with": {
+                "tool": "xete_verify_settlement_tx",
+                "unsigned_tx_b64": "<the value above>",
+                # NOT pre-filled with d.recipient, deliberately. A verifier handed the draft's
+                # own answer is not an independent check of that answer — it re-derives the
+                # commitment from the same wallet that built it and agrees with itself. Whoever
+                # is authorising the payment must supply the destination from their own
+                # knowledge for this tool to mean anything.
+                "expect_recipient": "<SUPPLY THIS YOURSELF — do not copy recipient_wallet from "
+                                    "this response. The point of verifying is to compare the "
+                                    "transaction against a destination this draft did not "
+                                    "choose; fed its own answer the verifier always passes.>",
+                "expect_escrow_id": d.escrow_id_hex,
+                "salt": d.salt_hex,
+                "amount_sol": amount_sol,
+            },
+            "next_step": "Have a human verify — supplying expect_recipient themselves — then "
+                         "sign and submit from their own wallet. Do not deliver the claim "
+                         "ticket until the deposit confirms on-chain.",
         }, indent=2)
     except Exception as e:
         return json.dumps({"status": "failed", "error": str(e)[:300]})
@@ -641,7 +715,7 @@ def xete_draft_settlement_tx(recipient: str, amount_sol: float) -> str:
 
 @mcp.tool()
 def xete_verify_settlement_tx(unsigned_tx_b64: str, expect_recipient: str, salt: str,
-                              amount_sol: float) -> str:
+                              amount_sol: float, expect_escrow_id: str = "") -> str:
     """Independently check that an unsigned settlement transaction really pays who you think it
     pays — and ONLY that — before a human signs it. The recipient is hidden on-chain as
     sha256(recipient || salt), so this re-derives that commitment from the recipient YOU name and
@@ -649,7 +723,13 @@ def xete_verify_settlement_tx(unsigned_tx_b64: str, expect_recipient: str, salt:
     itemises every lamport that would leave the signer (`lamport_movements`), totals them, and
     prices the compute-budget priority fee — so a bolted-on system transfer or an inflated fee
     cannot hide behind a familiar program id. Returns a per-check pass/fail table. A
-    `verified: false` result means DO NOT SIGN — the transaction does not match the stated intent."""
+    `verified: false` result means DO NOT SIGN — the transaction does not match the stated intent.
+
+    `expect_recipient` MUST come from whoever is authorising the payment, not from the draft's
+    own `recipient_wallet` output. Copying the draft's answer back in makes every check pass by
+    construction and verifies nothing. Pass `expect_escrow_id` from the claim ticket too, so a
+    transaction that funds a different escrow than the ticket names is caught rather than
+    certified — the recipient could never claim that one."""
     try:
         from solders.pubkey import Pubkey
 
@@ -663,6 +743,7 @@ def xete_verify_settlement_tx(unsigned_tx_b64: str, expect_recipient: str, salt:
             expect_salt_hex=salt,
             expect_amount_lamports=int(round(amount_sol * 1_000_000_000)),
             expect_depositor=Pubkey.from_string(DEPOSITOR_WALLET),
+            expect_escrow_id_hex=expect_escrow_id or None,
         )
         return json.dumps({
             "verified": r.ok,
@@ -672,8 +753,12 @@ def xete_verify_settlement_tx(unsigned_tx_b64: str, expect_recipient: str, salt:
             "total_lamports_out": r.total_lamports_out,
             "total_sol_out": r.total_lamports_out / 1e9,
             "max_fee_lamports": r.fee_lamports,
+            "escrow_id_funded": r.escrow_id_hex,
             "checks": r.checks,
             "recipient_checked": str(recipient_wallet),
+            "recipient_resolved_from": ("the base58 wallet you supplied"
+                                        if str(recipient_wallet) == expect_recipient.strip()
+                                        else "the on-chain %alias registry"),
         }, indent=2)
     except Exception as e:
         return json.dumps({"verified": False, "verdict": "DO NOT SIGN — verifier errored",
