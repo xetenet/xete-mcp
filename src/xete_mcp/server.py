@@ -968,7 +968,7 @@ def xete_alias_reverse(wallet: str) -> str:
 
 
 @mcp.tool()
-def xete_alias_claim(name: str, max_price_lamports: int = 0) -> str:
+def xete_alias_claim(name: str, max_price_lamports: int | None = None) -> str:
     """Claim a xete %name for THIS agent — its identity wallet (see xete_my_identity →
     wallet_pubkey) becomes the owner. Runs the full flow: get a challenge, sign it with your
     identity key, receive the permit co-signed transaction, add your signature, submit it
@@ -979,9 +979,17 @@ def xete_alias_claim(name: str, max_price_lamports: int = 0) -> str:
     registered (claiming binds the name to your agent).
 
     Pass max_price_lamports to cap what you are willing to pay: call xete_alias_quote first
-    and echo the figure it returns. Leave it 0 only if any price under your spend limit is
-    acceptable — the price is otherwise chosen entirely by the permit server, and the quote
-    tool and the claim are two separate calls that can disagree.
+    and echo the figure it returns. The price is otherwise chosen entirely by the permit
+    server, and the quote tool and the claim are two separate calls that can disagree.
+
+      max_price_lamports=0   this claim MUST BE FREE — refuse at any price. Correct for the
+                             6+ character names that are free by the length rule.
+      max_price_lamports=N   refuse above N lamports.
+      omitted                no opinion; only the configured spend cap applies.
+
+    0 and omitted are NOT the same. They used to be — both disabled the check — so an agent
+    that explicitly demanded a free claim silently got no ceiling and paid whatever it was
+    quoted.
 
     The permit server's transaction is DECODED and allow-listed before your key touches it:
     the registry instruction must be the CLAIM operation, must name the canonical form of the
@@ -1095,18 +1103,31 @@ def xete_alias_claim(name: str, max_price_lamports: int = 0) -> str:
         # self-consistent: quote and claim are separate calls, and nothing on chain
         # bounds the price either, so without this the only limit is the blanket
         # per-transaction spend cap rather than a decision anyone made about THIS name.
-        cap = int(max_price_lamports or 0)
-        if cap < 0:
+        # `None` means "no opinion, fall back to the blanket spend cap". `0` means
+        # "THIS MUST BE FREE" and is a real ceiling.
+        #
+        # It used to be `cap = int(max_price_lamports or 0)` followed by `if cap and ...`,
+        # so 0 and None were the same value and BOTH disabled the check. A caller who
+        # explicitly asked for a zero ceiling -- the natural thing to pass for the 6+
+        # character names this tool advertises as free -- silently got no ceiling at all
+        # and paid whatever was quoted. The repair DDR claims the opposite in writing
+        # ("supplied and exceeded -> refused"); it was never true for 0.
+        cap = None if max_price_lamports is None else int(max_price_lamports)
+        if cap is not None and cap < 0:
             return json.dumps({"status": "refused", "name": bare, "signed": False,
                                "submitted": False,
-                               "reason": f"REFUSED: max_price_lamports={cap} is negative."},
+                               "reason": f"REFUSED: max_price_lamports={cap} is negative. "
+                                         "Pass 0 to require the claim be free, or omit it "
+                                         "to fall back to the configured spend cap."},
                               indent=2)
-        if cap and quoted > cap:
+        if cap is not None and quoted > cap:
             return json.dumps({
                 "status": "refused", "name": bare, "signed": False, "submitted": False,
                 "price_lamports": quoted, "max_price_lamports": cap,
-                "reason": f"REFUSED: the permit server wants {quoted} lamports to claim %{bare}, "
-                          f"above the {cap} you allowed. Nothing was signed.",
+                "reason": (f"REFUSED: the permit server wants {quoted} lamports to claim "
+                           f"%{bare}, above the {cap} you allowed. Nothing was signed."
+                           + (" You asked for a FREE claim; this name is priced."
+                              if cap == 0 else "")),
             }, indent=2)
 
         # ── DECODE BEFORE SIGNING ───────────────────────────────────────────────────
