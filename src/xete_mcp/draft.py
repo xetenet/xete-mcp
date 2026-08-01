@@ -174,6 +174,15 @@ def _system_movement(data: bytes, accts: list) -> dict:
     treats as a failure. Only AdvanceNonceAccount is a legitimate part of a settlement draft —
     every other system instruction here either moves lamports or does something we did not ask
     for, and both deserve a refusal rather than a shrug.
+
+    "Anything" means ANYTHING, so the guard is `except Exception`, not a tuple of the error
+    types that happened to come to mind. This is hand-rolled binary parsing of bytes an attacker
+    chose, and the tuple was already wrong: CreateAccountWithSeed's bincode String length is a
+    u64 read straight out of the instruction and then used as an OFFSET, so a declared length of
+    0xFFFFFFFFFFFFFFFF makes `struct.unpack_from` raise OverflowError — not struct.error, not
+    IndexError, not ValueError. It unwound out of verify_draft and broke its documented contract
+    of always returning a VerifyResult. The length is now bounded against the data before it is
+    used as an offset as well, so the overflow is unreachable rather than merely caught.
     """
     def acct(i: int) -> str:
         return str(accts[i]) if len(accts) > i else "<missing>"
@@ -200,10 +209,15 @@ def _system_movement(data: bytes, accts: list) -> dict:
                     "lamports": _u64(data, 4), "from": acct(0), "to": acct(2), "decoded": True}
         if tag == _SYS_CREATE_ACCOUNT_WITH_SEED:
             seed_len = _u64(data, 36)                       # bincode String: u64 length + bytes
+            # Bound it BEFORE it becomes an offset. An unbounded attacker-chosen u64 here is an
+            # arbitrary offset into struct.unpack_from, which is how the OverflowError above got
+            # out. `44 + seed_len + 8` is where the lamports field ends.
+            if seed_len > len(data) or 44 + seed_len + 8 > len(data):
+                raise ValueError(f"seed length {seed_len} does not fit in {len(data)} bytes")
             return {"program": "system", "kind": "system:create_account_with_seed",
                     "lamports": _u64(data, 44 + seed_len), "from": acct(0), "to": acct(1),
                     "decoded": True}
-    except (struct.error, IndexError, ValueError):
+    except Exception:
         return {"program": "system", "kind": f"system:tag{tag}:truncated", "lamports": None,
                 "from": None, "to": None, "decoded": False}
     return {"program": "system", "kind": f"system:tag{tag}:unrecognised", "lamports": None,
@@ -245,7 +259,10 @@ def _transaction_fee(msg, keys) -> tuple[int, dict, list[str]]:
                 pass
             else:
                 unknown.append(f"compute_budget:tag{tag}")
-        except struct.error:
+        except Exception:
+            # Same reasoning as _system_movement: a named-exception tuple over attacker-chosen
+            # bytes is a list of the failures someone thought of. An undecodable compute-budget
+            # instruction is recorded as unknown, which fails the draft — never raised.
             unknown.append(f"compute_budget:tag{tag}:truncated")
     effective_cu = min(limit, MAX_CU_LIMIT) if limit is not None else min(DEFAULT_CU_PER_IX * n_ix,
                                                                           MAX_CU_LIMIT)
@@ -386,8 +403,12 @@ def draft_deposit(rpc_url: str, depositor: Pubkey, recipient: Pubkey, amount_lam
 def _find_deposit_ix(tx: Transaction, program: Pubkey) -> tuple[bytes, list[Pubkey]]:
     """Locate the settlement deposit instruction and return (data, resolved account pubkeys).
 
-    Raises ValueError — and ONLY ValueError — on anything malformed, because ValueError is what
-    verify_draft catches to fail closed. `keys[i] for i in cix.accounts` was an unguarded
+    Raises ValueError on anything malformed, because ValueError is what `_verify_draft` catches
+    at this call site to fail closed. (It used to claim ValueError was the ONLY thing that could
+    escape this module's parsing. That was never a property anyone had established — an
+    OverflowError out of `_system_movement` disproved the same claim next door — so the
+    guarantee now lives in `verify_draft`'s outer guard, where it is structural rather than
+    asserted.) `keys[i] for i in cix.accounts` was an unguarded
     IndexError path: `Transaction.from_bytes` does not bounds-check compiled account indices
     against the account-key array (verified), so an attacker-supplied transaction carrying an
     out-of-range index unwound an IndexError straight out of verify_draft and broke its
@@ -414,6 +435,38 @@ def verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt_
                  expect_program: Pubkey | None = None,
                  expect_escrow_id_hex: str | None = None,
                  max_fee_lamports: int = MAX_TX_FEE_LAMPORTS) -> VerifyResult:
+    """ALWAYS returns a VerifyResult — see `_verify_draft` for the actual verification.
+
+    This wrapper is the structural guarantee behind that "always". Everything inside is
+    hand-rolled binary parsing of bytes an attacker chose, and the contract had already been
+    broken twice by exception types nobody had thought of (an unguarded IndexError on an
+    out-of-range account index; an OverflowError from a u64 bincode length used as an offset).
+    Patching each one as it is found leaves the contract resting on the completeness of a list.
+    An escape is turned into a FAILED result, never a pass and never a raise, so the worst a
+    novel parser bug can do to a human holding a key is refuse a legitimate draft.
+    """
+    try:
+        return _verify_draft(
+            unsigned_tx_b64, expect_recipient=expect_recipient, expect_salt_hex=expect_salt_hex,
+            expect_amount_lamports=expect_amount_lamports, expect_depositor=expect_depositor,
+            expect_program=expect_program, expect_escrow_id_hex=expect_escrow_id_hex,
+            max_fee_lamports=max_fee_lamports)
+    except Exception as e:                      # noqa: BLE001 — deliberate, see above
+        return VerifyResult(
+            ok=False,
+            checks=[{"name": "verifier_internal_error", "ok": False,
+                     "expected": "the verifier to decode this transaction in full",
+                     "actual": f"{type(e).__name__}: {str(e)[:200]} — the verifier could not "
+                               "finish. This is NOT a pass: nothing about this transaction has "
+                               "been checked. DO NOT SIGN IT."}],
+            failures=["verifier_internal_error"])
+
+
+def _verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt_hex: str,
+                  expect_amount_lamports: int, expect_depositor: Pubkey,
+                  expect_program: Pubkey | None = None,
+                  expect_escrow_id_hex: str | None = None,
+                  max_fee_lamports: int = MAX_TX_FEE_LAMPORTS) -> VerifyResult:
     """Independently check that a drafted transaction does what its summary claims.
 
     Every expectation is supplied by the CALLER, not read out of the draft — that is the whole
@@ -509,7 +562,10 @@ def verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt_
         salt = bytes.fromhex(expect_salt_hex)
         expected_commitment = hashlib.sha256(bytes(expect_recipient) + salt).digest()
         ok = expected_commitment == commitment_in_tx
-    except ValueError:
+    except Exception:
+        # A non-hex salt raises ValueError; a salt that is not a string at all raises TypeError.
+        # Both mean "the commitment could not be re-derived", which is a FAILED check, not an
+        # exception out of a function whose contract is to return a VerifyResult.
         expected_commitment, ok = b"", False
     record("recipient_commitment", ok,
            f"sha256({expect_recipient} || salt) = {expected_commitment.hex() or '<bad salt>'}",

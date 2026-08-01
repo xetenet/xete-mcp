@@ -45,6 +45,19 @@ _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 # depositor[0:32] amount[32:40] commitment[40:72] unlock[72:80] bump[80]. An account at the
 # escrow PDA that is not EXACTLY this long is not this program's state, whatever else it is.
+#
+# VERIFIED AGAINST THE DEPLOYED PROGRAM, 2026-08-01, not inherited from a docstring. This
+# constant gates "did my money land", so an unchecked value would be a hard dependency on a
+# comment. Read-only from mainnet, via getSignaturesForAddress on the program id:
+#   deposit  4zAVuxHQ3ve3NkzTbr1Nvb4AAUEXoKo5ZXkX45VegGy5cXmhoWVR724aMtZrimhqErU9SA4Eq2GxxJrrcAPSyqig
+#            inner CPI createAccount -> {"newAccount": "27hLEGELtNKbQTqKfcV2YcRLj9FLHf3j3DCUBEpMs311",
+#                                        "owner": "GPCsJ6kv...", "space": 81}
+#   claim    5fwM657mN3n3LXbMeGSttmUG3N147sHcmn775i3kZ92Afrx3iVGStXMnSyVzpD39t6H3L7e3mz8Sb4zP4iTc4MM7
+#            closed it; getAccountInfo on that PDA now returns null.
+# The program is IMMUTABLE, so this cannot drift underneath us — the deployment that allocated
+# 81 bytes is the only deployment there will ever be. If that ever stops being true, `status()`
+# answers `open: null` (indeterminate) rather than `open: false`, so a layout change costs a
+# refusal to conclude, never a discarded claim ticket.
 STATE_LEN = 81
 
 # How long to keep asking the cluster about a submitted transaction. RPC nodes rebroadcast a
@@ -52,6 +65,14 @@ STATE_LEN = 81
 # not observing a failure, it is looking away while the transaction is still alive.
 ENV_CONFIRM_SECONDS = "XETE_CONFIRM_SECONDS"
 DEFAULT_CONFIRM_SECONDS = 90.0
+
+# A SECOND, independently-operated Solana RPC. Optional, and the only thing on this path that can
+# turn "an endpoint told me" into "the chain says". Every field `status()` reads — including the
+# `owner` field it uses to decide whether the bytes are this program's state — arrives inside one
+# JSON document from one endpoint, so a hostile endpoint sets all of them together. Owner checks
+# do not fix that; a second source that has to agree does. Set it to a different provider than
+# XETE_RPC_URL, or it is the same source twice and buys nothing.
+ENV_SECOND_RPC = "XETE_RPC_URL_2"
 _POLL_SECONDS = 0.3
 # Only these are durable. `Processed` is one validator's opinion and can still be forked away.
 _DURABLE = (TransactionConfirmationStatus.Confirmed, TransactionConfirmationStatus.Finalized)
@@ -170,6 +191,31 @@ def _send(client: Client, signers, ixs, payer: Keypair, label: str,
     bh = client.get_latest_blockhash().value.blockhash
     tx = Transaction(signers, Message.new_with_blockhash([_cb_limit(60_000), _cb_price(1_000)] + ixs, payer.pubkey(), bh), bh)
     sig = client.send_transaction(tx, opts=TxOpts(skip_preflight=False, preflight_commitment=Confirmed)).value
+    # ── FROM HERE ON THE TRANSACTION IS LIVE ON THE CLUSTER ────────────────────────────────
+    # Everything below only WATCHES it. No failure of the watching can un-submit it, so no
+    # failure of the watching may be reported as a failure of the transaction. This try/except
+    # is the whole guarantee: without it, the very first `get_signature_statuses` call raising —
+    # a 429 from api.mainnet-beta, which is this repo's default RPC and rate-limits routinely, a
+    # dropped socket, a DNS blip — unwound past every SettlementSubmitError handler into the
+    # tools' bare `except Exception`, which reported {"status": "failed"} AND discarded the
+    # signature, leaving the caller with no way to find a transaction that was already landing.
+    # Catching it here fixes create, claim and reclaim at one site and keeps the signature.
+    try:
+        return _await_confirmation(client, sig, bh, label, ticket)
+    except SettlementSubmitError:
+        raise
+    except Exception as e:                      # noqa: BLE001 — deliberate, see above
+        raise SettlementSubmitError(
+            f"{label} was SUBMITTED, then the RPC stopped answering ({type(e).__name__}: "
+            f"{str(e)[:160]}). This says nothing about the transaction — it MAY WELL HAVE "
+            f"LANDED. Check signature {sig} on chain before retrying or discarding anything.",
+            signature=str(sig), outcome="unconfirmed", ticket=ticket) from e
+
+
+def _await_confirmation(client: Client, sig, bh, label: str, ticket: dict | None) -> str:
+    """Poll until `sig` reaches a durable status, or raise SettlementSubmitError describing what
+    is and is not known. Split out of `_send` so the submit boundary is a syntactic one: every
+    line in here runs with a live transaction on the cluster."""
     budget = confirm_seconds()
 
     # A WALL CLOCK, not a poll count. The previous shape was
@@ -286,9 +332,19 @@ def claim(rpc_url: str, beneficiary: Keypair, escrow_id_hex: str, salt_hex: str)
         data=data,
         accounts=[AccountMeta(beneficiary.pubkey(), True, True), AccountMeta(pda, False, True)],
     )
-    b0 = client.get_balance(beneficiary.pubkey(), Confirmed).value
+    try:
+        b0 = client.get_balance(beneficiary.pubkey(), Confirmed).value
+    except Exception:
+        b0 = None                    # pre-submit, so a failure here costs only the receipt
     sig = _send(client, [beneficiary], [ix], beneficiary, "claim")
-    received = client.get_balance(beneficiary.pubkey(), Confirmed).value - b0
+    # The claim is CONFIRMED. This read is a receipt, nothing more, and a 429 on it must not be
+    # allowed to become "your claim failed" — the money is already in the wallet. Same rule as
+    # _send's post-submit guard: never let a reporting failure be reported as a money failure.
+    try:
+        received = None if b0 is None else client.get_balance(
+            beneficiary.pubkey(), Confirmed).value - b0
+    except Exception:
+        received = None
     return sig, received
 
 
@@ -314,62 +370,149 @@ UNVERIFIED_NOTE = (
     "perfectly. Pass expect_commitment_hex = sha256(your_wallet || salt) to actually check."
 )
 
+# Appended to any positive answer that rests on a single endpoint. It is not boilerplate: it is
+# the difference between what this function can prove and what it used to claim.
+_ONE_SOURCE_CAVEAT = (
+    " Only ONE endpoint ({endpoint}) answered, so this is that endpoint's account of the chain, "
+    "not the chain. Every field it rests on — the account bytes, and the `owner` field used to "
+    "decide those bytes are this program's state — came out of the same JSON document, so an "
+    "endpoint that wanted to lie would set them together. Set " + ENV_SECOND_RPC + " to a "
+    "DIFFERENT provider and this becomes a two-source answer that a single hostile or MITM'd "
+    "endpoint cannot forge.")
 
-def status(rpc_url: str, escrow_id_hex: str, expect_commitment_hex: str | None = None) -> dict:
-    """Is a settlement still open (unclaimed/unreclaimed)? Reads the PDA. A closed account == settled
-    (claimed or reclaimed). Returns the depositor + amount + commitment while it's open.
 
-    The commitment is the ONLY field that says who the escrow pays, and it is the reason this
-    function will not call an escrow yours on its own: everything else about an attacker's escrow
-    is indistinguishable from yours. Supply `expect_commitment_hex` (use `commitment(you, salt)`)
-    and `beneficiary_verified` becomes a real True/False; leave it out and it stays None, meaning
-    nothing has been verified.
+def second_rpc_url(primary: str | None = None) -> str | None:
+    """The corroborating endpoint, or None. Same endpoint twice is not two sources, so a value
+    equal to the primary is treated as unset rather than silently counted as agreement."""
+    v = (os.environ.get(ENV_SECOND_RPC) or "").strip()
+    if not v or (primary is not None and v == str(primary).strip()):
+        return None
+    return v
 
-    `open` IS THE MACHINE-READABLE ANSWER and it is only ever True for an account that this
-    program owns and that is exactly the escrow layout. Two reasons that matters:
 
-      * Agents branch on `open`, not on the English in `verdict` — and the timeout guidance in
-        xete_settle_create names `open` as the "did my deposit land" signal. A field that says
-        True for anything sitting at the address is not that signal. Anyone can pay the rent
-        minimum to create a 0-data, system-owned account at a known PDA, and before this it read
-        back as an open escrow.
-      * The account is bytes from an RPC, and the RPC is the untrusted party. `owner` is what
-        makes the rest of the struct mean anything: without it, `commitment` — the whole value of
-        this function — is compared against 32 bytes a hostile or MITM'd endpoint chose. The
-        owner check is what turns "these bytes say so" into "the chain says so".
+def _read_account(rpc: str, pda: Pubkey) -> tuple[tuple[bool, str | None, bytes | None], int | None]:
+    """((exists, owner, data), lamports) for one endpoint. Raises whatever the client raises.
 
-    Both checks fail CLOSED: a response with no owner field at all is not an escrow either.
+    The first element is the AUTHENTICATED part — what two endpoints have to agree on. lamports
+    is reported but deliberately excluded from that comparison: the balance at a PDA can move
+    under rent-epoch sweeps and a fresh deposit, so requiring it to match would turn ordinary
+    endpoint skew into a false "ENDPOINTS DISAGREE" and make the corroboration useless.
+    """
+    info = Client(rpc).get_account_info(pda, commitment=Confirmed).value
+    if info is None:
+        return (False, None, None), None
+    owner = getattr(info, "owner", None)
+    return (True, (None if owner is None else str(owner)), bytes(info.data)), info.lamports
+
+
+def status(rpc_url: str, escrow_id_hex: str, expect_commitment_hex: str | None = None,
+           second_rpc: str | None = None) -> dict:
+    """Is a settlement still open (unclaimed/unreclaimed)? Reads the PDA.
+
+    THREE-VALUED, DELIBERATELY. `open` is True, False, or None, and `determinate` says which
+    kind of answer you are holding:
+
+        open=True,  determinate=True   an escrow this program owns is sitting there, unclaimed.
+        open=False, determinate=True   nothing is there: it settled, or was never opened.
+        open=None,  determinate=False  THE READ COULD NOT BE AUTHENTICATED. Not "no", not "yes".
+
+    The third state is the whole point of this signature. `open` is what the agent branches on,
+    and the guidance around it says an escrow that is not open means the deposit never happened
+    and the ticket can be discarded. Two branches used to reach `open=False` without knowing
+    anything of the sort — an account whose length is not STATE_LEN, and an account whose owner
+    the endpoint reports as something else. A funded, genuinely-open escrow that hit either
+    branch (layout drift, a mis-set XETE_SETTLEMENT_PROGRAM, a lying or stale endpoint) told the
+    agent its money never left, and the agent then discarded the only copy of the salt. The salt
+    is not on chain — only sha256(recipient || salt) is — so that deposit becomes unclaimable by
+    anyone, forever. "I could not authenticate what I read" and "it settled" must never be the
+    same value.
+
+    WHAT THE OWNER CHECK IS AND IS NOT. `owner` is a field of the same JSON the endpoint
+    returned. Requiring it to equal the settlement program stops a stale or buggy endpoint, a
+    mis-set program id, and an unrelated account genuinely squatting the PDA. It does NOT stop a
+    hostile endpoint, which simply writes the settlement program into the field it controls — an
+    earlier version of this docstring claimed the check "turns 'these bytes say so' into 'the
+    chain says so'", and that was false. The only thing here that constrains a hostile endpoint
+    is `second_rpc`: two independently-operated endpoints that must agree. Without one, positive
+    answers are labelled "ONE ENDPOINT SAYS" and carry _ONE_SOURCE_CAVEAT, because that is what
+    they are worth. Defaults to XETE_RPC_URL_2; pass "" to suppress it explicitly.
+
+    `beneficiary_verified` stays None unless you supply `expect_commitment_hex` (use
+    `commitment(you, salt)`) — the commitment is the only field that says who is paid, and
+    everything else about an attacker's escrow is indistinguishable from yours.
     """
     eid = parse_escrow_id(escrow_id_hex)
     # Echo the canonical form, never the caller's raw string. parse_escrow_id tolerates
     # surrounding space and upper case, so echoing the input back hands a caller who is string
     # comparing this field against their ticket a spurious mismatch.
     escrow_id_norm = eid.hex()
-    client = Client(rpc_url)
     prog = program_id()
     pda = escrow_pda(prog, eid)
-    info = client.get_account_info(pda, commitment=Confirmed).value
-    if info is None:
-        return {"escrow_id": escrow_id_norm, "pda": str(pda), "open": False, "is_escrow": False,
-                "beneficiary_verified": None, "note": "settled or never opened"}
-    data = bytes(info.data)
-    owner = getattr(info, "owner", None)
-    out = {"escrow_id": escrow_id_norm, "pda": str(pda), "open": False, "is_escrow": False,
-           "lamports": info.lamports, "account_owner": None if owner is None else str(owner),
-           "beneficiary_verified": None, "commitment": None}
 
-    if owner is None or str(owner) != str(prog):
+    second = second_rpc_url(rpc_url) if second_rpc is None else (second_rpc or None)
+    authenticated, lamports = _read_account(rpc_url, pda)
+    exists, owner, data = authenticated
+
+    out: dict = {"escrow_id": escrow_id_norm, "pda": str(pda),
+                 "open": False, "determinate": True, "is_escrow": False,
+                 "account_owner": owner, "beneficiary_verified": None, "commitment": None,
+                 "endpoints_asked": [rpc_url] + ([second] if second else []),
+                 "corroborated": False}
+    if exists:
+        out["lamports"] = lamports
+
+    # ── corroboration, before anything is concluded from the bytes ──────────────────────────
+    if second:
+        try:
+            second_authenticated, _ = _read_account(second, pda)
+        except Exception as e:
+            out["second_endpoint_error"] = f"{type(e).__name__}: {str(e)[:160]}"
+        else:
+            if second_authenticated == authenticated:
+                out["corroborated"] = True
+            else:
+                e2, o2, d2 = second_authenticated
+                out["open"] = None
+                out["determinate"] = False
+                out["verdict"] = (
+                    f"ENDPOINTS DISAGREE — {rpc_url} and {second} returned different accounts for "
+                    f"{pda}, so at least one of them is wrong or lying and there is no way to "
+                    "tell which from here. NOTHING is concluded: do not treat this settlement as "
+                    "open, do not treat it as settled, and DO NOT DISCARD A CLAIM TICKET over "
+                    "it. Retry, or ask an endpoint you control.")
+                out["disagreement"] = {
+                    rpc_url: {"exists": exists, "owner": owner,
+                              "len": None if data is None else len(data)},
+                    second: {"exists": e2, "owner": o2,
+                             "len": None if d2 is None else len(d2)}}
+                return out
+
+    if not exists:
+        out["note"] = "settled or never opened"
+        if not out["corroborated"]:
+            out["note"] += _ONE_SOURCE_CAVEAT.format(endpoint=rpc_url)
+        return out
+
+    if owner is None or owner != str(prog):
+        out["open"] = None
+        out["determinate"] = False
         out["verdict"] = (
-            f"NOT AN ESCROW — the account at {pda} is owned by "
-            f"{'no program the RPC would name' if owner is None else str(owner)}, not the "
-            f"settlement program {prog}. Its contents are NOT this program's state, so no "
-            "depositor, amount or commitment is read out of them. Anyone can put an account at a "
-            "known address; only the program can put escrow state in one.")
+            f"INDETERMINATE — the account at {pda} is reported as owned by "
+            f"{'no program the endpoint would name' if owner is None else owner}, not the "
+            f"settlement program {prog}. No depositor, amount or commitment is read out of it. "
+            "This is NOT 'your deposit never happened': a stale or hostile endpoint, or a "
+            "mis-set XETE_SETTLEMENT_PROGRAM, reaches this same answer while a real escrow sits "
+            "at that address. KEEP YOUR CLAIM TICKET and re-check against an endpoint you trust.")
         return out
     if len(data) != STATE_LEN:
-        out["verdict"] = (f"UNKNOWN ACCOUNT — {len(data)} bytes at this address, which is not a "
-                          f"settlement escrow ({STATE_LEN} expected). Treat it as unrelated, not "
-                          "as yours.")
+        out["open"] = None
+        out["determinate"] = False
+        out["verdict"] = (
+            f"INDETERMINATE — UNKNOWN ACCOUNT: {len(data)} bytes at this address, and this "
+            f"program's escrow state is {STATE_LEN}. The settlement program owns it, so it is "
+            "not an unrelated squatter, but nothing here can be decoded as escrow state. This is "
+            "NOT 'your deposit never happened' — a funded, claimable escrow whose layout this "
+            "client does not know reads exactly like this. KEEP YOUR CLAIM TICKET.")
         return out
 
     out["open"] = True
@@ -379,15 +522,26 @@ def status(rpc_url: str, escrow_id_hex: str, expect_commitment_hex: str | None =
     out["commitment"] = data[40:72].hex()
     if expect_commitment_hex is None:
         out["verdict"] = UNVERIFIED_NOTE
+        if not out["corroborated"]:
+            out["verdict"] += _ONE_SOURCE_CAVEAT.format(endpoint=rpc_url)
         return out
     expected = str(expect_commitment_hex).strip().lower()
     out["expected_commitment"] = expected
     out["beneficiary_verified"] = (expected == out["commitment"])
-    out["verdict"] = (
-        "VERIFIED — the hidden beneficiary of this escrow is the wallet you named."
-        if out["beneficiary_verified"] else
-        "MISMATCH — this escrow DOES NOT pay the wallet you named. Its on-chain commitment is for "
-        "someone else, so the id you were given is not a settlement you can claim. Do not treat "
-        "it as money owed to you, and do not release anything in exchange for it."
-    )
+    if not out["beneficiary_verified"]:
+        # A mismatch is the safe direction — it tells you not to release anything — so it is
+        # stated plainly whether or not a second endpoint confirmed it.
+        out["verdict"] = (
+            "MISMATCH — this escrow DOES NOT pay the wallet you named. Its on-chain commitment "
+            "is for someone else, so the id you were given is not a settlement you can claim. Do "
+            "not treat it as money owed to you, and do not release anything in exchange for it.")
+    elif out["corroborated"]:
+        out["verdict"] = (
+            f"VERIFIED — the hidden beneficiary of this escrow is the wallet you named. Two "
+            f"independently-configured endpoints ({rpc_url} and {second}) returned the same "
+            "account, so no single endpoint chose this answer.")
+    else:
+        out["verdict"] = (
+            "ONE ENDPOINT SAYS the hidden beneficiary of this escrow is the wallet you named."
+            + _ONE_SOURCE_CAVEAT.format(endpoint=rpc_url))
     return out

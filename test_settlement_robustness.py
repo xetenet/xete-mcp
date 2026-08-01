@@ -330,13 +330,21 @@ def test_status_flags_an_escrow_that_pays_someone_else(monkeypatch):
 
 
 def test_status_confirms_an_escrow_that_really_is_yours(monkeypatch):
+    """CALIBRATION CHANGE, round 2. This used to assert the verdict starts with "VERIFIED" off a
+    SINGLE endpoint. It cannot: every byte behind that word, including the owner field, came out
+    of one JSON document from one endpoint. The property being tested — a matching commitment is
+    recognised and reported as matching — is unchanged and still asserted; only the unearned
+    authenticity claim is gone. `test_two_agreeing_endpoints_earn_the_verified_verdict` covers
+    the case where "VERIFIED" is actually warranted."""
     mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
     monkeypatch.setattr(settlement, "Client",
                         _account_client(_state(DEPOSITOR.pubkey(), AMOUNT, mine)))
     out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex(),
                             expect_commitment_hex=mine.hex())
     assert out["beneficiary_verified"] is True
-    assert out["verdict"].startswith("VERIFIED")
+    assert out["open"] is True and out["determinate"] is True
+    assert out["verdict"].startswith("ONE ENDPOINT SAYS")
+    assert out["corroborated"] is False
 
 
 def test_status_does_not_call_a_foreign_account_an_open_escrow(monkeypatch):
@@ -567,16 +575,46 @@ from xete_mcp import alias_chain                                             # n
 SYSTEM_PROGRAM = settlement.SYS
 
 
+class _Chain(dict):
+    """What each RPC endpoint claims the %alias registry says.
+
+    `chain["bob"] = wallet` is what every endpoint answers. `chain.at(url)["bob"] = other` makes
+    ONE endpoint lie while the others stay honest — which is the whole adversary for finding
+    [15] round 2 and cannot be expressed at all if the fixture models "the chain" as a single
+    dict. `chain.calls` records (name, rpc) so a test can prove WHICH endpoint was asked.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.per_endpoint: dict[str, dict] = {}
+        self.calls: list[tuple[str, str | None]] = []
+
+    def at(self, url: str) -> dict:
+        return self.per_endpoint.setdefault(url, {})
+
+    def answer(self, name: str, rpc: str | None):
+        self.calls.append((name, rpc))
+        table = self.per_endpoint.get(rpc, {})
+        return table[name] if name in table else self.get(name)
+
+
 @pytest.fixture()
 def chain(monkeypatch):
-    """Control what the on-chain %alias registry says, and fail the test if anything reaches
-    the permit server over HTTP — asking a server who owns a name is the bug."""
+    """Control what each endpoint says the %alias registry holds, and fail the test if anything
+    reaches the permit server over HTTP — asking a server who owns a name is the bug.
+
+    ROUND-2 REBUILD. The old fixture patched `alias_chain.resolve_owner` with a function that
+    ignored its `rpc` argument, so every endpoint agreed by construction and the tests could not
+    see the tautology the reviewer demonstrated: draft and verify asking the SAME oracle. It now
+    answers per endpoint, so a hostile RPC is expressible.
+    """
     from xete_mcp import server as server_mod
 
-    state: dict = {"bob": None}
+    state = _Chain()
+    state["bob"] = None
 
     def fake_resolve(name, rpc=None):
-        owner = state.get(alias_chain.normalize_name(name))
+        owner = state.answer(alias_chain.normalize_name(name), rpc)
         if isinstance(owner, Exception):
             raise owner
         return owner
@@ -593,9 +631,21 @@ def chain(monkeypatch):
     return state
 
 
+ONE_RPC = "https://only-endpoint.example"
+RPC_A = "https://endpoint-a.example"
+RPC_B = "https://endpoint-b.example"
+
+
 @pytest.fixture()
 def drafting(monkeypatch, server_mod):
-    """A configured depositor wallet and an RPC that only ever hands out a blockhash."""
+    """A configured depositor wallet, an RPC that only ever hands out a blockhash, and — by
+    default — exactly ONE %alias endpoint.
+
+    One endpoint is the deliberate default: it is the configuration in which a %name cannot be
+    verified independently, and every test that wants an alias-based verification to succeed has
+    to say so by asking for `two_endpoints`. The old fixture left this implicit, which is how a
+    single-oracle verifier passed its own test suite.
+    """
     class _C:
         def __init__(self, *_a, **_k):
             pass
@@ -606,8 +656,20 @@ def drafting(monkeypatch, server_mod):
     monkeypatch.setattr(server_mod, "DEPOSITOR_WALLET", str(DEPOSITOR.pubkey()))
     monkeypatch.setattr(server_mod, "NONCE_ACCOUNT", "")
     monkeypatch.setattr(server_mod, "NONCE_AUTHORITY", "")
+    monkeypatch.setattr(server_mod, "RPC_URL", ONE_RPC)
     monkeypatch.setattr(draft, "Client", _C)
+    monkeypatch.setenv("XETE_ALIAS_RPC", ONE_RPC)
+    monkeypatch.setattr(alias_chain, "DEFAULT_RPC", ONE_RPC)
+    monkeypatch.delenv("XETE_SOLANA_RPC", raising=False)
+    monkeypatch.delenv("XETE_RPC_URL", raising=False)
     return server_mod
+
+
+@pytest.fixture()
+def two_endpoints(monkeypatch, drafting):
+    """An operator who configured two independently-run Solana endpoints."""
+    monkeypatch.setenv("XETE_ALIAS_RPC", f"{RPC_A},{RPC_B}")
+    return drafting
 
 
 # ── [15] a hostile permit server chose the recipient, and the verifier agreed ─────────
@@ -637,29 +699,37 @@ def test_the_draft_does_not_prefill_the_verifier_with_its_own_answer(chain, draf
     assert "SUPPLY THIS YOURSELF" in prefilled
 
 
-def test_verification_uses_the_chain_not_the_draft(chain, drafting):
-    """An attacker-built draft paying ATTACKER, verified against %bob, must fail — the chain says
-    %bob is RECIPIENT and the commitment cannot match."""
+def test_verification_uses_the_chain_not_the_draft(chain, two_endpoints):
+    """An attacker-built draft paying ATTACKER, verified against %bob, must fail — the registry
+    says %bob is RECIPIENT and the commitment cannot match.
+
+    Round 2: now runs on `two_endpoints`, because with one endpoint the tool refuses the %name
+    outright and this check never gets to fire. The property is unchanged; the configuration it
+    needs is now explicit."""
     chain["bob"] = str(RECIPIENT.pubkey())
     evil = _tx_b64([settlement._cb_limit(60_000), settlement._cb_price(1_000),
                     _deposit_ix(recipient=ATTACKER.pubkey())])
-    v = json.loads(drafting.xete_verify_settlement_tx(evil, "%bob", SALT.hex(), 1.0))
+    v = json.loads(two_endpoints.xete_verify_settlement_tx(evil, "%bob", SALT.hex(), 1.0))
     assert v["verified"] is False
     assert "recipient_commitment" in v["failed_checks"]
     assert v["recipient_checked"] == str(RECIPIENT.pubkey())
     assert "SAFE TO REVIEW AND SIGN" not in json.dumps(v)
 
 
-def test_an_unreadable_chain_fails_closed_instead_of_falling_back_to_a_server(chain, drafting):
+def test_an_unreadable_chain_fails_closed_instead_of_falling_back_to_a_server(chain, two_endpoints):
     """A chain read that fails must refuse, not quietly ask the permit server instead — that
-    fallback is how a hostile server gets to answer whenever it can also cause a timeout."""
+    fallback is how a hostile server gets to answer whenever it can also cause a timeout.
+
+    Round 2: `two_endpoints`, so the verify half genuinely exercises the chain-error path
+    instead of being short-circuited by the single-endpoint refusal."""
     chain["bob"] = alias_chain.AliasChainError("RPC timed out")
-    out = json.loads(drafting.xete_draft_settlement_tx("%bob", 1.0))
+    out = json.loads(two_endpoints.xete_draft_settlement_tx("%bob", 1.0))
     assert out["status"] == "failed"
     assert "PERMIT_SERVER_WAS_ASKED" not in out["error"]
     assert "RPC timed out" in out["error"]
-    v = json.loads(drafting.xete_verify_settlement_tx(_honest(), "%bob", SALT.hex(), 1.0))
+    v = json.loads(two_endpoints.xete_verify_settlement_tx(_honest(), "%bob", SALT.hex(), 1.0))
     assert v["verified"] is False
+    assert "RPC timed out" in json.dumps(v)
     assert "PERMIT_SERVER_WAS_ASKED" not in json.dumps(v)
 
 
@@ -737,10 +807,18 @@ def test_a_definitely_dropped_claim_is_still_reported_as_failed_with_its_signatu
 def test_an_account_that_is_not_an_escrow_is_not_reported_as_open(monkeypatch, n):
     """`open` is the machine-readable answer, and xete_settle_create's own timeout guidance
     names it as the 'did my deposit land' signal. Anyone can pay the rent minimum to create a
-    0-data account at a known PDA; before this it read back as {open: true}."""
+    0-data account at a known PDA; before this it read back as {open: true}.
+
+    CALIBRATION CHANGE, round 2: `is False` -> `is not True`. The property this test defends is
+    "an account that is not a decodable escrow must not be reported as an open escrow", and that
+    is asserted exactly as before. What changed is that the round-1 fix expressed it as
+    open=False, which the tools' own guidance reads as "settled — discard your ticket" (finding
+    [17], round 2). The answer is now the third state, and `determinate is False` is asserted
+    here so the test fails if anything ever collapses it back to a boolean."""
     monkeypatch.setattr(settlement, "Client", _account_client(b"\x00" * n))
     out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex())
-    assert out["open"] is False, f"a {n}-byte account is not an open escrow"
+    assert out["open"] is not True, f"a {n}-byte account is not an open escrow"
+    assert out["determinate"] is False, "nor is it a determinate 'no' — see finding [17]"
     assert out["is_escrow"] is False
     assert out["commitment"] is None
     assert out["beneficiary_verified"] is None
@@ -757,10 +835,16 @@ def test_a_real_escrow_is_still_reported_open(monkeypatch):
 
 # ── [18] the commitment was compared against unauthenticated, unowned bytes ───────────
 
-def test_a_hostile_rpc_cannot_forge_a_verified_escrow(monkeypatch):
-    """Perfectly-formed 81 bytes whose commitment matches — served from an account the settlement
-    program does not own. This used to return beneficiary_verified=True and 'VERIFIED — the
-    hidden beneficiary of this escrow is the wallet you named'."""
+def test_a_foreign_account_at_the_pda_is_not_a_verified_escrow(monkeypatch):
+    """RENAMED, round 2. It was `test_a_hostile_rpc_cannot_forge_a_verified_escrow`, and that
+    name claimed something the code cannot do: the only adversary it models is an endpoint that
+    volunteers the WRONG owner (SYSTEM_PROGRAM), and a hostile endpoint has no reason to. What
+    the owner check really stops is a stale or buggy endpoint, a mis-set XETE_SETTLEMENT_PROGRAM,
+    and an unrelated account genuinely squatting the PDA — all real, none hostile. The hostile
+    case is `test_an_endpoint_that_forges_the_owner_field_is_caught_by_the_second_endpoint`.
+
+    Perfectly-formed 81 bytes whose commitment matches, at an account the settlement program does
+    not own: this used to return beneficiary_verified=True and 'VERIFIED'."""
     mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
     forged = _state(ATTACKER.pubkey(), 5_000_000_000, mine)
     monkeypatch.setattr(settlement, "Client",
@@ -768,13 +852,16 @@ def test_a_hostile_rpc_cannot_forge_a_verified_escrow(monkeypatch):
     out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex(),
                             expect_commitment_hex=mine.hex())
     assert out["beneficiary_verified"] is not True
-    assert out["open"] is False and out["is_escrow"] is False
-    assert "VERIFIED" not in out["verdict"].replace("NOT AN ESCROW", "")
+    assert out["open"] is not True and out["is_escrow"] is False
+    assert out["determinate"] is False, "an owner we cannot match is not a determinate 'settled'"
+    assert "VERIFIED" not in out["verdict"]
     assert "depositor" not in out, "no field may be read out of an account this program does not own"
 
 
 def test_an_rpc_that_omits_the_owner_fails_closed(monkeypatch):
-    """No owner field at all is not a pass. Fail closed."""
+    """No owner field at all is not a pass. Fail closed — and, since round 2, fail INDETERMINATE
+    rather than fail 'settled': an endpoint too old to report an owner tells you nothing about
+    whether your money is sitting there."""
     mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
 
     class _C:
@@ -788,11 +875,14 @@ def test_an_rpc_that_omits_the_owner_fails_closed(monkeypatch):
     monkeypatch.setattr(settlement, "Client", _C)
     out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex(),
                             expect_commitment_hex=mine.hex())
-    assert out["open"] is False
+    assert out["open"] is not True
+    assert out["determinate"] is False
     assert out["beneficiary_verified"] is not True
 
 
-def test_the_owner_is_surfaced_so_a_human_can_see_what_answered(monkeypatch):
+def test_the_owner_field_is_surfaced_as_the_endpoints_claim(monkeypatch):
+    """Surfaced so a human can see what answered — but it is the endpoint's own claim about
+    itself, and round 2 stopped pretending otherwise anywhere in the output."""
     monkeypatch.setattr(settlement, "Client",
                         _account_client(b"\x00" * 81, owner=SYSTEM_PROGRAM))
     out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex())
@@ -1096,3 +1186,551 @@ def test_half_a_claim_ticket_says_plainly_that_nothing_was_verified(server_mod, 
     assert out["beneficiary_verified"] is None
     assert "WARNING_NOTHING_WAS_VERIFIED" in out, \
         "a caller who passed their own wallet reads a clean response as confirmation"
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# THIRD ADVERSARIAL PASS — the repair round.
+#
+# Three reviewers attacked the fixes above and DEMONSTRATED that [15], [17], [18] and
+# half of [16] were still open, plus three smaller defects. Every test below was run
+# against the code as it stood at dd03750 and fails there. Still offline.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+# ── [15] round 2: the tautology moved to the RPC; the operator could not escape it ────
+
+def test_the_operators_own_endpoint_is_used_for_money_path_resolution(chain, monkeypatch,
+                                                                      server_mod):
+    """`resolve_owner` was called with no endpoint at all, so alias_chain picked one from
+    XETE_SOLANA_RPC or a hard-coded third party. An operator running their own validator — the
+    one party with an actual reason to be trusted about where their money goes — had no way to
+    put it on the money path. XETE_RPC_URL now counts, and the endpoint is passed explicitly."""
+    monkeypatch.setenv("XETE_RPC_URL", "https://my-private-validator.example")
+    monkeypatch.delenv("XETE_ALIAS_RPC", raising=False)
+    monkeypatch.delenv("XETE_SOLANA_RPC", raising=False)
+    chain["bob"] = str(RECIPIENT.pubkey())
+
+    server_mod._resolve_recipient_wallet("%bob")
+
+    asked = [rpc for _n, rpc in chain.calls]
+    assert asked == ["https://my-private-validator.example"], \
+        f"the operator's endpoint was not the one asked; got {asked}"
+    assert server_mod.alias_rpc_endpoints()[0] == "https://my-private-validator.example"
+
+
+def test_a_single_endpoint_cannot_both_build_and_certify_a_payment(chain, drafting):
+    """THE finding, end to end, verbatim from the reviewer's a1.py.
+
+    One hostile endpoint answers %bob -> ATTACKER. The draft builds a 1 SOL deposit to the
+    attacker; the human, holding only the payee's NAME (the thing a human actually has, and what
+    the tool's own docstring invites), verifies against '%bob'. Before this fix the verifier
+    asked that same endpoint, re-derived the same commitment, and returned
+    `verified: true / SAFE TO REVIEW AND SIGN / total_sol_out: 1.0` — the original permit-server
+    finding, one layer down. The verifier must not accept a name it can only resolve through the
+    endpoint that built the draft."""
+    chain.at(ONE_RPC)["bob"] = str(ATTACKER.pubkey())
+
+    d = json.loads(drafting.xete_draft_settlement_tx("%bob", 1.0))
+    assert d["status"] == "drafted"
+    assert d["recipient_wallet"] == str(ATTACKER.pubkey())      # the hostile endpoint got its way
+
+    v = json.loads(drafting.xete_verify_settlement_tx(
+        d["unsigned_tx_b64"], "%bob", d["ticket"]["salt"], 1.0))
+    assert v["verified"] is False, "one endpoint certified a payment it chose itself"
+    assert "SAFE TO REVIEW AND SIGN" not in json.dumps(v)
+    # A refusal with no way forward is how a human ends up reaching for the tool that says yes.
+    # The remediation must survive the tool's error truncation, so it is asserted, not assumed.
+    assert "base58" in json.dumps(v).lower(), "the refusal must say how to proceed safely"
+    assert "XETE_ALIAS_RPC" in json.dumps(v)
+
+
+def test_a_hostile_endpoint_is_outvoted_by_the_second_one(chain, two_endpoints):
+    """The same attack against a two-endpoint operator: endpoint A lies, endpoint B does not.
+    The disagreement itself is the signal — the tool does not have to know which one lied."""
+    chain["bob"] = str(RECIPIENT.pubkey())
+    chain.at(RPC_A)["bob"] = str(ATTACKER.pubkey())
+
+    evil = _tx_b64([settlement._cb_limit(60_000), settlement._cb_price(1_000),
+                    _deposit_ix(recipient=ATTACKER.pubkey())])
+    v = json.loads(two_endpoints.xete_verify_settlement_tx(evil, "%bob", SALT.hex(), 1.0))
+    assert v["verified"] is False
+    assert "resolves DIFFERENTLY" in json.dumps(v)
+    assert str(ATTACKER.pubkey()) in json.dumps(v) and str(RECIPIENT.pubkey()) in json.dumps(v)
+
+
+def test_two_agreeing_endpoints_let_an_honest_name_verify(chain, two_endpoints):
+    """The over-refusal guard: the fix must not be 'never accept a %name'. Two endpoints that
+    agree on an honest draft still produce SAFE TO REVIEW AND SIGN."""
+    chain["bob"] = str(RECIPIENT.pubkey())
+    v = json.loads(two_endpoints.xete_verify_settlement_tx(
+        _honest(), "%bob", SALT.hex(), 1.0, expect_escrow_id=ESCROW_ID.hex()))
+    assert v["verified"] is True, v["failed_checks"]
+    assert v["recipient_checked"] == str(RECIPIENT.pubkey())
+    assert RPC_A in v["recipient_resolved_from"] and RPC_B in v["recipient_resolved_from"]
+
+
+def test_both_endpoints_are_actually_asked(chain, two_endpoints):
+    """Guards against the fix being cosmetic — two configured endpoints, one consulted."""
+    chain["bob"] = str(RECIPIENT.pubkey())
+    json.loads(two_endpoints.xete_verify_settlement_tx(_honest(), "%bob", SALT.hex(), 1.0))
+    asked = {rpc for name, rpc in chain.calls if name == "bob"}
+    assert asked == {RPC_A, RPC_B}, f"only {asked} were consulted"
+
+
+def test_the_verifier_never_claims_the_chain_answered(chain, two_endpoints, drafting):
+    """`recipient_resolved_from: the on-chain %alias registry` was an authenticity claim nothing
+    in the answer could back — the bytes came from whichever URL was configured. Say which
+    endpoint answered, or say nothing."""
+    chain["bob"] = str(RECIPIENT.pubkey())
+    v = json.loads(two_endpoints.xete_verify_settlement_tx(_honest(), "%bob", SALT.hex(), 1.0))
+    assert v["recipient_resolved_from"] != "the on-chain %alias registry"
+    assert "endpoint" in v["recipient_resolved_from"].lower()
+
+    raw = json.loads(two_endpoints.xete_verify_settlement_tx(
+        _honest(), str(RECIPIENT.pubkey()), SALT.hex(), 1.0))
+    assert "nothing was resolved" in raw["recipient_resolved_from"]
+
+
+def test_a_raw_wallet_still_verifies_with_a_single_endpoint(chain, drafting):
+    """Non-regression, and the escape hatch the refusal points at: a base58 wallet involves no
+    oracle at all, so one endpoint is irrelevant to it."""
+    v = json.loads(drafting.xete_verify_settlement_tx(
+        _honest(), str(RECIPIENT.pubkey()), SALT.hex(), 1.0, expect_escrow_id=ESCROW_ID.hex()))
+    assert v["verified"] is True, v["failed_checks"]
+    assert not [c for c in chain.calls], "a raw wallet must not touch the registry at all"
+
+
+def test_listing_the_same_endpoint_twice_does_not_manufacture_agreement(chain, drafting,
+                                                                        monkeypatch):
+    """The trivial bypass of a two-source rule."""
+    monkeypatch.setenv("XETE_ALIAS_RPC", f"{ONE_RPC},{ONE_RPC}")
+    chain.at(ONE_RPC)["bob"] = str(ATTACKER.pubkey())
+    v = json.loads(drafting.xete_verify_settlement_tx(_honest(), "%bob", SALT.hex(), 1.0))
+    assert v["verified"] is False
+    assert "only one Solana endpoint" in json.dumps(v)
+
+
+# ── [15] round 2, tail: confusable Unicode reached the money path ─────────────────────
+
+@pytest.mark.parametrize("name", [
+    "%jo​hn",          # zero-width space
+    "%jоhn",           # Cyrillic o
+    "%jo‮hn",          # right-to-left override
+    "%јohn",           # Cyrillic je
+])
+def test_a_confusable_name_is_refused_on_the_money_path(chain, drafting, name):
+    """`%john` and these render identically in an agent transcript and in a human's approval
+    prompt, but derive DIFFERENT registry PDAs. A chain-authoritative resolution of the wrong
+    name is still the wrong name — authoritative is not the same as unambiguous. Refused, not
+    folded together: folding would make two separately-registrable on-chain names resolve to one
+    wallet, which is the same bug pointing the other way."""
+    chain["john"] = str(RECIPIENT.pubkey())
+    out = json.loads(drafting.xete_draft_settlement_tx(name, 1.0))
+    assert out["status"] == "failed"
+    assert "ASCII" in out["error"]
+    assert not chain.calls, "a confusable name must be refused before any lookup"
+
+
+def test_a_plain_ascii_name_is_unaffected(chain, drafting):
+    """The over-refusal guard for the check above."""
+    chain["john"] = str(RECIPIENT.pubkey())
+    out = json.loads(drafting.xete_draft_settlement_tx("%john", 1.0))
+    assert out["status"] == "drafted"
+    assert out["recipient_wallet"] == str(RECIPIENT.pubkey())
+
+
+# ── [18] round 2: `owner` is a field the hostile endpoint controls ────────────────────
+
+def _two_endpoint_client(answers: dict):
+    """A fake Client dispatching on URL: {url: (data|None, owner)}."""
+    class _C:
+        def __init__(self, url, *_a, **_k):
+            self.url = url
+
+        def get_account_info(self, _pda, commitment=None):
+            data, owner = answers[self.url]
+            if data is None:
+                return SimpleNamespace(value=None)
+            return SimpleNamespace(value=SimpleNamespace(data=data, lamports=5_000_000_000,
+                                                         owner=owner))
+    return _C
+
+
+def test_an_endpoint_that_forges_the_owner_field_is_caught_by_the_second_endpoint(monkeypatch):
+    """THE finding. The round-1 fix required `info.owner == program_id()` and its test only
+    modelled an endpoint volunteering the WRONG owner — an adversary with no reason to exist. A
+    hostile endpoint writes the settlement program into the field it controls and everything
+    downstream believes it: the reviewer got `open True / beneficiary_verified True / VERIFIED`
+    for an escrow that does not exist. Nothing in one JSON document can fix that; a second
+    endpoint that has to agree can."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    forged = _state(ATTACKER.pubkey(), 5_000_000_000, mine)
+    prog = settlement.program_id()
+    monkeypatch.setattr(settlement, "Client", _two_endpoint_client({
+        "https://hostile.example": (forged, prog),      # perfect forgery, correct owner
+        "https://honest.example": (None, None),         # no such account
+    }))
+    out = settlement.status("https://hostile.example", ESCROW_ID.hex(),
+                            expect_commitment_hex=mine.hex(),
+                            second_rpc="https://honest.example")
+    assert out["beneficiary_verified"] is not True
+    assert out["open"] is None and out["determinate"] is False
+    assert "ENDPOINTS DISAGREE" in out["verdict"]
+    assert "VERIFIED" not in out["verdict"]
+
+
+def test_a_single_endpoint_answer_does_not_claim_to_be_the_chain(monkeypatch):
+    """With one source the honest answer is 'one endpoint says', because that is all it is."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    monkeypatch.setattr(settlement, "Client",
+                        _account_client(_state(DEPOSITOR.pubkey(), AMOUNT, mine)))
+    out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex(),
+                            expect_commitment_hex=mine.hex(), second_rpc="")
+    assert out["beneficiary_verified"] is True
+    assert out["corroborated"] is False
+    assert not out["verdict"].startswith("VERIFIED")
+    assert settlement.ENV_SECOND_RPC in out["verdict"], "say how to get a real answer"
+
+
+def test_two_agreeing_endpoints_earn_the_verified_verdict(monkeypatch):
+    """The over-refusal guard: corroboration must be reachable, not theoretical."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    real = _state(DEPOSITOR.pubkey(), AMOUNT, mine)
+    prog = settlement.program_id()
+    monkeypatch.setattr(settlement, "Client", _two_endpoint_client({
+        "https://a.example": (real, prog),
+        "https://b.example": (real, prog),
+    }))
+    out = settlement.status("https://a.example", ESCROW_ID.hex(),
+                            expect_commitment_hex=mine.hex(), second_rpc="https://b.example")
+    assert out["corroborated"] is True
+    assert out["open"] is True and out["determinate"] is True
+    assert out["verdict"].startswith("VERIFIED")
+
+
+def test_the_second_endpoint_is_read_from_the_environment(monkeypatch):
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    real = _state(DEPOSITOR.pubkey(), AMOUNT, mine)
+    prog = settlement.program_id()
+    monkeypatch.setenv(settlement.ENV_SECOND_RPC, "https://b.example")
+    monkeypatch.setattr(settlement, "Client", _two_endpoint_client({
+        "https://a.example": (real, prog),
+        "https://b.example": (real, prog),
+    }))
+    out = settlement.status("https://a.example", ESCROW_ID.hex(), expect_commitment_hex=mine.hex())
+    assert out["corroborated"] is True
+    assert out["endpoints_asked"] == ["https://a.example", "https://b.example"]
+
+
+def test_the_same_endpoint_twice_is_not_two_sources(monkeypatch):
+    monkeypatch.setenv(settlement.ENV_SECOND_RPC, "https://a.example")
+    assert settlement.second_rpc_url("https://a.example") is None
+    assert settlement.second_rpc_url("https://other.example") == "https://a.example"
+
+
+def test_a_second_endpoint_that_errors_degrades_instead_of_failing(monkeypatch):
+    """A corroborating endpoint that is down must cost confidence, not availability — the
+    settlement is still readable, it just cannot be called corroborated."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    real = _state(DEPOSITOR.pubkey(), AMOUNT, mine)
+
+    class _C:
+        def __init__(self, url, *_a, **_k):
+            self.url = url
+
+        def get_account_info(self, _pda, commitment=None):
+            if self.url == "https://down.example":
+                raise RuntimeError("429 Too Many Requests")
+            return SimpleNamespace(value=SimpleNamespace(
+                data=real, lamports=1, owner=settlement.program_id()))
+
+    monkeypatch.setattr(settlement, "Client", _C)
+    out = settlement.status("https://a.example", ESCROW_ID.hex(),
+                            expect_commitment_hex=mine.hex(), second_rpc="https://down.example")
+    assert out["open"] is True and out["determinate"] is True
+    assert out["corroborated"] is False
+    assert "429" in out["second_endpoint_error"]
+    assert not out["verdict"].startswith("VERIFIED")
+
+
+# ── [17] round 2: open=False meant both "settled" and "I could not authenticate" ──────
+
+def test_a_program_owned_escrow_of_an_unexpected_length_is_indeterminate(monkeypatch):
+    """THE finding's money path. A real, funded, genuinely-open escrow whose layout is not
+    STATE_LEN read back as open=False — and xete_settle_create's timeout guidance says a
+    settlement that is not open means 'the deposit did not happen and your funds never left'.
+    The agent follows that, discards the only copy of the salt, and the deposit becomes
+    unclaimable by anyone, forever."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    eighty_two = _state(DEPOSITOR.pubkey(), AMOUNT, mine) + b"\x00"
+    monkeypatch.setattr(settlement, "Client", _account_client(eighty_two, lamports=1_002_039_280))
+    out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex())
+    assert out["open"] is None, "open=False here tells the agent its money never left"
+    assert out["determinate"] is False
+    assert "KEEP YOUR CLAIM TICKET" in out["verdict"]
+    assert out["lamports"] == 1_002_039_280, "the funds visibly at the PDA must still be shown"
+
+
+def test_an_owner_mismatch_is_indeterminate_not_settled(monkeypatch):
+    """Needs no layout drift at all — a lying or stale endpoint, or a mis-set
+    XETE_SETTLEMENT_PROGRAM, reaches it."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    monkeypatch.setattr(settlement, "Client",
+                        _account_client(_state(DEPOSITOR.pubkey(), AMOUNT, mine),
+                                        owner=SYSTEM_PROGRAM))
+    out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex())
+    assert out["open"] is None and out["determinate"] is False
+    assert "KEEP YOUR CLAIM TICKET" in out["verdict"]
+
+
+def test_an_absent_account_is_still_a_determinate_settled(monkeypatch):
+    """The other half: the tri-state must not make everything mushy. Nothing at the PDA is a
+    real answer and has to stay one, or reclaim/claim flows never conclude."""
+    monkeypatch.setattr(settlement, "Client", _account_client(None))
+    out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex())
+    assert out["open"] is False and out["determinate"] is True
+
+
+def test_a_real_escrow_is_a_determinate_open(monkeypatch):
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    monkeypatch.setattr(settlement, "Client",
+                        _account_client(_state(DEPOSITOR.pubkey(), AMOUNT, mine)))
+    out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex())
+    assert out["open"] is True and out["determinate"] is True
+
+
+def test_the_status_tool_shouts_when_the_answer_is_indeterminate(server_mod, monkeypatch):
+    """`open: null` is falsey in every language an agent might post-process this in, so the
+    warning has to live in a key that cannot be read as a boolean."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    monkeypatch.setattr(settlement, "Client",
+                        _account_client(_state(DEPOSITOR.pubkey(), AMOUNT, mine) + b"\x00"))
+    out = json.loads(server_mod.xete_settle_status(ESCROW_ID.hex()))
+    assert out["open"] is None and out["determinate"] is False
+    assert "WARNING_STATUS_IS_INDETERMINATE" in out
+    assert "Do NOT discard a claim ticket" in out["WARNING_STATUS_IS_INDETERMINATE"]
+
+
+@pytest.mark.parametrize("tool,fn,args", [
+    ("xete_settle_create", "deposit", (str(RECIPIENT.pubkey()), 1.0)),
+    ("xete_settle_claim", "claim", (ESCROW_ID.hex(), SALT.hex())),
+    ("xete_settle_reclaim", "reclaim", (ESCROW_ID.hex(),)),
+])
+def test_no_timeout_guidance_authorises_a_conclusion_from_open_alone(server_mod, monkeypatch,
+                                                                     tool, fn, args):
+    """The instruction the agent actually follows. All three said open=false means X — and
+    open=false is now also what an unauthenticated read produces. Every one of them must gate
+    its conclusion on `determinate` first."""
+    monkeypatch.setattr(server_mod, "load_or_create_identity",
+                        lambda _p: SimpleNamespace(ed_seed=bytes([1] * 32),
+                                                   pubkey_b58=str(DEPOSITOR.pubkey())))
+
+    def timeout(*_a, **_k):
+        raise settlement.SettlementSubmitError("not confirmed within 90s", signature="SiG",
+                                               outcome="unconfirmed")
+
+    monkeypatch.setattr(settlement, fn, timeout)
+    step = json.loads(getattr(server_mod, tool)(*args))["next_step"]
+    assert "determinate" in step, f"{tool} still reads a conclusion off `open` alone"
+    assert "determinate=false" in step and "null" in step
+
+
+def test_state_len_is_the_length_the_deployed_program_allocates():
+    """Pinned to a READ-ONLY mainnet observation, not to this module's own docstring — the
+    reviewer's standing objection was that nobody had ever checked it, and it now gates 'did my
+    money land'. Deposit 4zAVuxHQ... on GPCsJ6kv... emitted an inner createAccount CPI with
+    space=81 and owner=GPCsJ6kv...; claim 5fwM657m... closed it. The program is IMMUTABLE, so
+    that observation cannot go stale."""
+    assert settlement.STATE_LEN == 81
+    assert draft.ESCROW_RENT_LAMPORTS == (128 + 81) * 3480 * 2
+
+
+# ── [16] round 2: any post-submit exception, not just the in-band timeout ─────────────
+
+class _DiesAfterSubmit:
+    """send_transaction succeeds — the transaction is LIVE — and then the RPC 429s. This is not
+    exotic: api.mainnet-beta is this repo's default endpoint and rate-limits routinely."""
+
+    def __init__(self, exc=None):
+        self.exc = exc or RuntimeError("429 Too Many Requests")
+        self.sent = 0
+
+    def get_latest_blockhash(self):
+        return SimpleNamespace(value=SimpleNamespace(blockhash=Hash.default()))
+
+    def get_balance(self, *_a, **_k):
+        return SimpleNamespace(value=0)
+
+    def send_transaction(self, _tx, opts=None):
+        self.sent += 1
+        return SimpleNamespace(value="LiVeSiGnAtUrE111")
+
+    def get_signature_statuses(self, _sigs):
+        raise self.exc
+
+    def is_blockhash_valid(self, _bh, commitment=None):
+        raise self.exc
+
+
+def test_an_rpc_that_dies_after_a_successful_submit_keeps_the_signature(instant):
+    """Fixed at ONE site inside _send, so create, claim and reclaim all inherit it."""
+    client = _DiesAfterSubmit()
+    with pytest.raises(settlement.SettlementSubmitError) as ei:
+        settlement._send(client, [DEPOSITOR], [_deposit_ix()], DEPOSITOR, "deposit",
+                         ticket={"escrow_id": ESCROW_ID.hex(), "salt": SALT.hex()})
+    assert client.sent == 1, "the transaction really was submitted"
+    assert ei.value.outcome == "unconfirmed", "'failed' asserts an outcome we do not know"
+    assert ei.value.signature == "LiVeSiGnAtUrE111"
+    assert ei.value.ticket["salt"] == SALT.hex()
+    assert "MAY WELL HAVE LANDED" in str(ei.value)
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("xete_settle_claim", (ESCROW_ID.hex(), SALT.hex())),
+    ("xete_settle_reclaim", (ESCROW_ID.hex(),)),
+])
+def test_claim_and_reclaim_keep_the_signature_when_the_rpc_429s_after_submit(
+        server_mod, monkeypatch, instant, tool, args):
+    """The reviewer's a8.py: status='failed', signature discarded, for a transaction live on the
+    cluster. The round-1 handlers only covered the in-band timeout; everything else fell through
+    to `except Exception`."""
+    monkeypatch.setattr(server_mod, "load_or_create_identity",
+                        lambda _p: SimpleNamespace(ed_seed=bytes([1] * 32),
+                                                   pubkey_b58=str(DEPOSITOR.pubkey())))
+    monkeypatch.setattr(settlement, "Client", lambda *_a, **_k: _DiesAfterSubmit())
+    out = json.loads(getattr(server_mod, tool)(*args))
+    assert out["status"] == "submitted_unconfirmed", "'failed' for a live transaction"
+    assert out["tx_signature"] == "LiVeSiGnAtUrE111", "the signature is the only way to resolve it"
+    assert "xete_settle_status" in out["next_step"]
+
+
+def test_settle_create_keeps_ticket_and_signature_when_the_rpc_429s_after_submit(
+        server_mod, monkeypatch, instant, spend_ok):
+    """create was 'better but still incomplete' — it kept the ticket via early_ticket but lost
+    the signature, because the exception never became a SettlementSubmitError."""
+    monkeypatch.setattr(server_mod, "load_or_create_identity",
+                        lambda _p: SimpleNamespace(ed_seed=bytes([1] * 32),
+                                                   pubkey_b58=str(DEPOSITOR.pubkey())))
+    monkeypatch.setattr(settlement, "Client", lambda *_a, **_k: _DiesAfterSubmit())
+    out = json.loads(server_mod.xete_settle_create(str(RECIPIENT.pubkey()), 1.0))
+    assert out["status"] == "submitted_unconfirmed"
+    assert out["tx_signature"] == "LiVeSiGnAtUrE111"
+    assert len(bytes.fromhex(out["ticket"]["salt"])) == 16
+    assert "KEEP_THIS_TICKET" in out
+
+
+def test_a_receipt_read_failure_does_not_unclaim_a_confirmed_claim(monkeypatch, instant):
+    """claim() reads the balance AFTER _send returns a confirmed signature, purely to report how
+    much arrived. A 429 on that read used to unwind out of a claim that had already settled."""
+    class _C(_SendClient):
+        def __init__(self, *_a, **_k):
+            super().__init__([_Status(TCS.Confirmed)])
+            self.calls = 0
+
+        def get_balance(self, *_a, **_k):
+            self.calls += 1
+            if self.calls > 1:
+                raise RuntimeError("429 Too Many Requests")
+            return SimpleNamespace(value=0)
+
+    monkeypatch.setattr(settlement, "Client", _C)
+    sig, received = settlement.claim("http://127.0.0.1:1", RECIPIENT, ESCROW_ID.hex(), SALT.hex())
+    assert sig == "SiGnAtUrE", "the claim confirmed; a receipt read must not undo that"
+    assert received is None, "unknown, and reported as unknown rather than as zero"
+
+
+def test_a_genuine_on_chain_failure_is_still_a_failure(instant):
+    """The over-correction guard: 'the RPC stopped answering' must not swallow a real error the
+    chain actually reported."""
+    client = _SendClient([_Status(TCS.Confirmed, err="InsufficientFundsForRent")])
+    with pytest.raises(settlement.SettlementSubmitError) as ei:
+        settlement._send(client, [DEPOSITOR], [_deposit_ix()], DEPOSITOR, "deposit")
+    assert ei.value.outcome == "failed"
+
+
+def test_a_submit_that_never_happened_is_not_reported_as_submitted():
+    """The other over-correction guard: an exception BEFORE send_transaction must stay an
+    ordinary error — claiming a signature that does not exist would be its own disaster."""
+    class _NeverSends:
+        def get_latest_blockhash(self):
+            raise RuntimeError("connection refused")
+
+    with pytest.raises(settlement.SettlementSubmitError):
+        raise settlement.SettlementSubmitError("placeholder")   # sanity: the type exists
+    # the real assertion:
+    with pytest.raises(RuntimeError) as ei:
+        settlement._send(_NeverSends(), [DEPOSITOR], [_deposit_ix()], DEPOSITOR, "deposit")
+    assert not isinstance(ei.value, settlement.SettlementSubmitError)
+
+
+# ── [23] round 2: OverflowError escaped verify_draft ──────────────────────────────────
+
+def _overflowing_seed_tx() -> str:
+    """CreateAccountWithSeed whose bincode String length is 0xFFFFFFFFFFFFFFFF. _system_movement
+    read it as a u64 and used it as an OFFSET into struct.unpack_from."""
+    evil = Instruction(
+        program_id=settlement.SYS,
+        data=struct.pack("<I", 3) + b"\x00" * 32 + struct.pack("<Q", 0xFFFFFFFFFFFFFFFF),
+        accounts=[AccountMeta(DEPOSITOR.pubkey(), True, True)])
+    return _honest(extra=[evil])
+
+
+def test_a_bincode_length_overflow_returns_a_result_instead_of_raising():
+    """OverflowError is not struct.error, IndexError or ValueError, so it sailed out of
+    verify_draft and broke its documented contract."""
+    r = _verify(_overflowing_seed_tx())
+    assert isinstance(r, draft.VerifyResult)
+    assert not r.ok
+    assert "every_instruction_decoded" in r.failures
+
+
+def test_the_overflowing_instruction_is_refused_at_the_mcp_boundary(chain, drafting):
+    v = json.loads(drafting.xete_verify_settlement_tx(
+        _overflowing_seed_tx(), str(RECIPIENT.pubkey()), SALT.hex(), 1.0))
+    assert v["verified"] is False
+    assert "DO NOT SIGN" in v["verdict"]
+
+
+@pytest.mark.parametrize("seed_len", [0xFFFFFFFFFFFFFFFF, 2 ** 63, 2 ** 40, 10 ** 6])
+def test_an_out_of_range_seed_length_is_bounded_before_it_becomes_an_offset(seed_len):
+    m = draft._system_movement(
+        struct.pack("<I", 3) + b"\x00" * 32 + struct.pack("<Q", seed_len), [])
+    assert m["decoded"] is False, "an unbounded attacker u64 must never reach unpack_from"
+
+
+def test_verify_draft_always_returns_a_result_even_if_it_errors_internally(monkeypatch):
+    """The structural guarantee. Patching each novel exception type as it is discovered leaves
+    the contract resting on the completeness of a list; an escape must be a FAILED result."""
+    def boom(*_a, **_k):
+        raise OverflowError("a parser bug nobody has found yet")
+
+    monkeypatch.setattr(draft, "_lamport_movements", boom)
+    r = _verify(_honest())
+    assert isinstance(r, draft.VerifyResult)
+    assert r.ok is False
+    assert "verifier_internal_error" in r.failures
+    assert "DO NOT SIGN" in json.dumps(r.checks)
+
+
+# ── [20] round 2: the escrow-id expectation defaults to absent, and said nothing ──────
+
+def test_omitting_the_escrow_id_expectation_is_flagged_not_silent(chain, drafting):
+    """The tool default certified a draft that funds a different escrow than the claim ticket
+    names, in silence. xete_settle_status warns when handed half a claim ticket; this is the
+    same class of omission on the argument whose absence WAS finding [20]."""
+    other = bytes(Keypair.from_seed(bytes([11] * 32)).pubkey())
+    tx = _tx_b64([settlement._cb_limit(60_000), settlement._cb_price(1_000),
+                  _deposit_ix(escrow_id=other)])
+    v = json.loads(drafting.xete_verify_settlement_tx(tx, str(RECIPIENT.pubkey()), SALT.hex(), 1.0))
+    assert v["verified"] is True, "the draft itself is well-formed; only the id is unchecked"
+    assert "WARNING_ESCROW_ID_NOT_CHECKED" in v
+    assert other.hex() in v["WARNING_ESCROW_ID_NOT_CHECKED"]
+    assert "NOT checked" in v["verdict"], "the verdict line is what a human actually reads"
+
+
+def test_supplying_the_escrow_id_removes_the_warning(chain, drafting):
+    v = json.loads(drafting.xete_verify_settlement_tx(
+        _honest(), str(RECIPIENT.pubkey()), SALT.hex(), 1.0, expect_escrow_id=ESCROW_ID.hex()))
+    assert v["verified"] is True, v["failed_checks"]
+    assert "WARNING_ESCROW_ID_NOT_CHECKED" not in v
+    assert v["verdict"] == "SAFE TO REVIEW AND SIGN"
