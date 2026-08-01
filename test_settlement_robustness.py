@@ -277,7 +277,14 @@ def _state(depositor, amount, commitment_bytes):
             + struct.pack("<q", 0) + bytes([255]))
 
 
-def _account_client(data: bytes | None, lamports: int = 2_000_000):
+def _account_client(data: bytes | None, lamports: int = 2_000_000, owner=None):
+    """A fake RPC returning one account.
+
+    `owner` defaults to the settlement program because that is what a REAL escrow account looks
+    like — the previous fake omitted the field entirely, which is why an unchecked
+    `info.owner` went unnoticed. Pass `owner=` explicitly to model a hostile RPC serving bytes
+    from an account the settlement program does not own.
+    """
     class _C:
         def __init__(self, *_a, **_k):
             pass
@@ -285,7 +292,9 @@ def _account_client(data: bytes | None, lamports: int = 2_000_000):
         def get_account_info(self, _pda, commitment=None):
             if data is None:
                 return SimpleNamespace(value=None)
-            return SimpleNamespace(value=SimpleNamespace(data=data, lamports=lamports))
+            return SimpleNamespace(value=SimpleNamespace(
+                data=data, lamports=lamports,
+                owner=settlement.program_id() if owner is None else owner))
     return _C
 
 
@@ -389,9 +398,37 @@ class _SendClient:
         return SimpleNamespace(value=self.blockhash_valid)
 
 
+class _Clock:
+    """A virtual clock swapped in for settlement's `time` module.
+
+    Replaces the old `monkeypatch.setattr(settlement.time, "sleep", ...)`, which reached into the
+    real `time` module and made every test blind to how long _send actually waits. Sleeping
+    advances the clock, so the confirmation budget is now measured rather than assumed, and
+    `latency` lets a test charge the same clock for the RPC round trip — which is the thing the
+    old poll-count loop was not counting.
+    """
+
+    def __init__(self, start: float = 1_000.0):
+        self.t = start
+        self.slept = 0.0
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def sleep(self, s: float) -> None:
+        s = max(0.0, s)
+        self.t += s
+        self.slept += s
+
+    def advance(self, s: float) -> None:
+        self.t += s
+
+
 @pytest.fixture()
 def instant(monkeypatch):
-    monkeypatch.setattr(settlement.time, "sleep", lambda _s: None)
+    clock = _Clock()
+    monkeypatch.setattr(settlement, "time", clock)
+    return clock
 
 
 def _send(client):
@@ -511,3 +548,551 @@ def test_settle_create_returns_the_ticket_even_on_an_unexpected_error(server_mod
     monkeypatch.setattr(settlement, "deposit", fake_deposit)
     out = json.loads(server_mod.xete_settle_create(str(RECIPIENT.pubkey()), 1.0))
     assert out["ticket"]["salt"] == SALT.hex()
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# SECOND ADVERSARIAL PASS — findings [15]-[25]
+#
+# Everything below was reproduced against the code as it stood before the accompanying
+# fix, and each test fails without it. Still offline: no network, no mainnet, no wallet.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+from solders.address_lookup_table_account import AddressLookupTableAccount   # noqa: E402
+from solders.instruction import CompiledInstruction                          # noqa: E402
+from solders.message import MessageV0                                        # noqa: E402
+from solders.transaction import VersionedTransaction                         # noqa: E402
+
+from xete_mcp import alias_chain                                             # noqa: E402
+
+SYSTEM_PROGRAM = settlement.SYS
+
+
+@pytest.fixture()
+def chain(monkeypatch):
+    """Control what the on-chain %alias registry says, and fail the test if anything reaches
+    the permit server over HTTP — asking a server who owns a name is the bug."""
+    from xete_mcp import server as server_mod
+
+    state: dict = {"bob": None}
+
+    def fake_resolve(name, rpc=None):
+        owner = state.get(alias_chain.normalize_name(name))
+        if isinstance(owner, Exception):
+            raise owner
+        return owner
+
+    def no_http(*_a, **_k):
+        # A distinctive marker rather than a bare AssertionError: the settlement tools wrap
+        # themselves in `except Exception`, so an assertion raised in here is swallowed into a
+        # generic "failed" that looks identical to a correct chain-side refusal. Tests assert on
+        # the marker's ABSENCE to prove the permit server was genuinely never consulted.
+        raise RuntimeError("PERMIT_SERVER_WAS_ASKED — a %alias must be resolved on chain")
+
+    monkeypatch.setattr(alias_chain, "resolve_owner", fake_resolve)
+    monkeypatch.setattr(server_mod, "requests", SimpleNamespace(get=no_http, post=no_http))
+    return state
+
+
+@pytest.fixture()
+def drafting(monkeypatch, server_mod):
+    """A configured depositor wallet and an RPC that only ever hands out a blockhash."""
+    class _C:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def get_latest_blockhash(self):
+            return SimpleNamespace(value=SimpleNamespace(blockhash=Hash.default()))
+
+    monkeypatch.setattr(server_mod, "DEPOSITOR_WALLET", str(DEPOSITOR.pubkey()))
+    monkeypatch.setattr(server_mod, "NONCE_ACCOUNT", "")
+    monkeypatch.setattr(server_mod, "NONCE_AUTHORITY", "")
+    monkeypatch.setattr(draft, "Client", _C)
+    return server_mod
+
+
+# ── [15] a hostile permit server chose the recipient, and the verifier agreed ─────────
+
+def test_a_lying_permit_server_can_no_longer_choose_who_gets_paid(chain, drafting):
+    """THE finding, end to end. A permit server returning an attacker pubkey used to make
+    xete_draft_settlement_tx build a 1 SOL deposit naming the attacker, and
+    xete_verify_settlement_tx then returned verified=true / 'SAFE TO REVIEW AND SIGN' with zero
+    failed checks — because the 'independent' recipient it compared against came from the same
+    server. The registry is on chain; the server is not asked at all any more."""
+    chain["bob"] = str(RECIPIENT.pubkey())        # the truth, on chain
+    out = json.loads(drafting.xete_draft_settlement_tx("%bob", 1.0))
+    assert out["status"] == "drafted", out
+    assert out["recipient_wallet"] == str(RECIPIENT.pubkey())
+    assert str(ATTACKER.pubkey()) not in json.dumps(out)
+
+
+def test_the_draft_does_not_prefill_the_verifier_with_its_own_answer(chain, drafting):
+    """`verify_with.expect_recipient` used to be d.recipient — the draft's own resolution copied
+    forward, so the verifier re-derived the commitment from the wallet that built it and agreed
+    with itself. The commitment check was tautological."""
+    chain["bob"] = str(RECIPIENT.pubkey())
+    out = json.loads(drafting.xete_draft_settlement_tx("%bob", 1.0))
+    prefilled = out["verify_with"]["expect_recipient"]
+    assert prefilled != out["recipient_wallet"], "the verifier is being fed the draft's own answer"
+    assert prefilled != str(RECIPIENT.pubkey())
+    assert "SUPPLY THIS YOURSELF" in prefilled
+
+
+def test_verification_uses_the_chain_not_the_draft(chain, drafting):
+    """An attacker-built draft paying ATTACKER, verified against %bob, must fail — the chain says
+    %bob is RECIPIENT and the commitment cannot match."""
+    chain["bob"] = str(RECIPIENT.pubkey())
+    evil = _tx_b64([settlement._cb_limit(60_000), settlement._cb_price(1_000),
+                    _deposit_ix(recipient=ATTACKER.pubkey())])
+    v = json.loads(drafting.xete_verify_settlement_tx(evil, "%bob", SALT.hex(), 1.0))
+    assert v["verified"] is False
+    assert "recipient_commitment" in v["failed_checks"]
+    assert v["recipient_checked"] == str(RECIPIENT.pubkey())
+    assert "SAFE TO REVIEW AND SIGN" not in json.dumps(v)
+
+
+def test_an_unreadable_chain_fails_closed_instead_of_falling_back_to_a_server(chain, drafting):
+    """A chain read that fails must refuse, not quietly ask the permit server instead — that
+    fallback is how a hostile server gets to answer whenever it can also cause a timeout."""
+    chain["bob"] = alias_chain.AliasChainError("RPC timed out")
+    out = json.loads(drafting.xete_draft_settlement_tx("%bob", 1.0))
+    assert out["status"] == "failed"
+    assert "PERMIT_SERVER_WAS_ASKED" not in out["error"]
+    assert "RPC timed out" in out["error"]
+    v = json.loads(drafting.xete_verify_settlement_tx(_honest(), "%bob", SALT.hex(), 1.0))
+    assert v["verified"] is False
+    assert "PERMIT_SERVER_WAS_ASKED" not in json.dumps(v)
+
+
+def test_an_unregistered_name_is_refused_not_guessed(chain, drafting):
+    chain["bob"] = None
+    out = json.loads(drafting.xete_draft_settlement_tx("%bob", 1.0))
+    assert out["status"] == "failed"
+    assert "no registration" in out["error"] or "not registered" in out["error"]
+
+
+def test_a_raw_wallet_recipient_never_touches_the_registry(chain, drafting):
+    """Non-regression guard, not a finding: a base58 wallet must keep short-circuiting both the
+    registry and the permit server. Passes before and after the fix, by design — it exists so
+    routing %alias resolution through the chain cannot quietly start a lookup for raw wallets."""
+    out = json.loads(drafting.xete_draft_settlement_tx(str(RECIPIENT.pubkey()), 1.0))
+    assert out["status"] == "drafted"
+    assert out["recipient_wallet"] == str(RECIPIENT.pubkey())
+
+
+# ── [16] claim and reclaim assert failure on a transaction that may well land ─────────
+
+def _identity(monkeypatch, server_mod):
+    monkeypatch.setattr(server_mod, "load_or_create_identity",
+                        lambda _p: SimpleNamespace(ed_seed=bytes([1] * 32),
+                                                   pubkey_b58=str(DEPOSITOR.pubkey())))
+
+
+@pytest.mark.parametrize("tool,fn", [("xete_settle_claim", "claim"),
+                                     ("xete_settle_reclaim", "reclaim")])
+def test_claim_and_reclaim_do_not_report_failure_on_a_submission_that_may_land(
+        server_mod, monkeypatch, tool, fn):
+    """D4's whole premise applied to the other two tools. Reporting 'failed' here tells the agent
+    it was not paid (claim) or that its funds are still locked (reclaim) for a transaction the
+    cluster may still confirm — and throws away the signature needed to find out."""
+    _identity(monkeypatch, server_mod)
+
+    def timeout(*_a, **_k):
+        raise settlement.SettlementSubmitError(
+            f"{fn} not confirmed within 90s — it MAY STILL LAND", signature="SiGnAtUrE",
+            outcome="unconfirmed")
+
+    monkeypatch.setattr(settlement, fn, timeout)
+    args = (ESCROW_ID.hex(), SALT.hex()) if fn == "claim" else (ESCROW_ID.hex(),)
+    out = json.loads(getattr(server_mod, tool)(*args))
+
+    assert out["status"] == "submitted_unconfirmed", "'failed' asserts an outcome we do not know"
+    assert out["submit_outcome"] == "unconfirmed"
+    assert out["tx_signature"] == "SiGnAtUrE", "the signature is how the agent resolves this"
+    assert "xete_settle_status" in out["next_step"]
+
+
+@pytest.mark.parametrize("tool,fn", [("xete_settle_claim", "claim"),
+                                     ("xete_settle_reclaim", "reclaim")])
+def test_a_definitely_dropped_claim_is_still_reported_as_failed_with_its_signature(
+        server_mod, monkeypatch, tool, fn):
+    """'dropped' and 'failed' ARE knowable failures — those must keep saying failed, or the fix
+    would just move the lie to the other side."""
+    _identity(monkeypatch, server_mod)
+
+    def dropped(*_a, **_k):
+        raise settlement.SettlementSubmitError("blockhash expired", signature="SiG",
+                                               outcome="dropped")
+
+    monkeypatch.setattr(settlement, fn, dropped)
+    args = (ESCROW_ID.hex(), SALT.hex()) if fn == "claim" else (ESCROW_ID.hex(),)
+    out = json.loads(getattr(server_mod, tool)(*args))
+    assert out["status"] == "failed"
+    assert out["submit_outcome"] == "dropped"
+    assert out["tx_signature"] == "SiG"
+
+
+# ── [17] a non-escrow account reported open:true in the field agents branch on ────────
+
+@pytest.mark.parametrize("n", [0, 12, 41, 80, 82, 200])
+def test_an_account_that_is_not_an_escrow_is_not_reported_as_open(monkeypatch, n):
+    """`open` is the machine-readable answer, and xete_settle_create's own timeout guidance
+    names it as the 'did my deposit land' signal. Anyone can pay the rent minimum to create a
+    0-data account at a known PDA; before this it read back as {open: true}."""
+    monkeypatch.setattr(settlement, "Client", _account_client(b"\x00" * n))
+    out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex())
+    assert out["open"] is False, f"a {n}-byte account is not an open escrow"
+    assert out["is_escrow"] is False
+    assert out["commitment"] is None
+    assert out["beneficiary_verified"] is None
+
+
+def test_a_real_escrow_is_still_reported_open(monkeypatch):
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    monkeypatch.setattr(settlement, "Client",
+                        _account_client(_state(DEPOSITOR.pubkey(), AMOUNT, mine)))
+    out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex())
+    assert out["open"] is True and out["is_escrow"] is True
+    assert out["amount_lamports"] == AMOUNT
+
+
+# ── [18] the commitment was compared against unauthenticated, unowned bytes ───────────
+
+def test_a_hostile_rpc_cannot_forge_a_verified_escrow(monkeypatch):
+    """Perfectly-formed 81 bytes whose commitment matches — served from an account the settlement
+    program does not own. This used to return beneficiary_verified=True and 'VERIFIED — the
+    hidden beneficiary of this escrow is the wallet you named'."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    forged = _state(ATTACKER.pubkey(), 5_000_000_000, mine)
+    monkeypatch.setattr(settlement, "Client",
+                        _account_client(forged, owner=SYSTEM_PROGRAM))
+    out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex(),
+                            expect_commitment_hex=mine.hex())
+    assert out["beneficiary_verified"] is not True
+    assert out["open"] is False and out["is_escrow"] is False
+    assert "VERIFIED" not in out["verdict"].replace("NOT AN ESCROW", "")
+    assert "depositor" not in out, "no field may be read out of an account this program does not own"
+
+
+def test_an_rpc_that_omits_the_owner_fails_closed(monkeypatch):
+    """No owner field at all is not a pass. Fail closed."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+
+    class _C:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def get_account_info(self, _pda, commitment=None):
+            return SimpleNamespace(value=SimpleNamespace(
+                data=_state(DEPOSITOR.pubkey(), AMOUNT, mine), lamports=1))
+
+    monkeypatch.setattr(settlement, "Client", _C)
+    out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex(),
+                            expect_commitment_hex=mine.hex())
+    assert out["open"] is False
+    assert out["beneficiary_verified"] is not True
+
+
+def test_the_owner_is_surfaced_so_a_human_can_see_what_answered(monkeypatch):
+    monkeypatch.setattr(settlement, "Client",
+                        _account_client(b"\x00" * 81, owner=SYSTEM_PROGRAM))
+    out = settlement.status("http://127.0.0.1:1", ESCROW_ID.hex())
+    assert out["account_owner"] == str(SYSTEM_PROGRAM)
+
+
+# ── [25b] the raw, unnormalised escrow_id was echoed back ─────────────────────────────
+
+def test_status_echoes_the_canonical_escrow_id_not_the_raw_input(monkeypatch):
+    monkeypatch.setattr(settlement, "Client", _account_client(None))
+    out = settlement.status("http://127.0.0.1:1", "  " + ESCROW_ID.hex().upper() + "  ")
+    assert out["escrow_id"] == ESCROW_ID.hex(), \
+        "a caller string-comparing this against their ticket gets a spurious mismatch"
+
+
+# ── [19] the confirmation budget was a poll count and the RPC picked the multiplier ───
+
+class _LatentClient(_SendClient):
+    """An RPC whose round trip costs real time on the same clock _send is watching."""
+
+    def __init__(self, latency, clock, statuses=(None,)):
+        super().__init__(list(statuses))
+        self.latency = latency
+        self.clock = clock
+
+    def get_signature_statuses(self, sigs):
+        self.clock.advance(self.latency)
+        return super().get_signature_statuses(sigs)
+
+
+def test_the_confirmation_budget_is_a_wall_clock_not_a_poll_count(instant, monkeypatch):
+    """`for i in range(int(budget / 0.3))` sleeps for `budget` seconds AND pays one RPC round
+    trip per iteration, so the untrusted RPC sets the real duration. At the 90s default a 0.5s
+    RPC blocked the agent's stdio session for 240s. The budget must bound the total."""
+    monkeypatch.setenv(settlement.ENV_CONFIRM_SECONDS, "90")
+    client = _LatentClient(0.5, instant)
+    start = instant.monotonic()
+    with pytest.raises(settlement.SettlementSubmitError):
+        _send(client)
+    elapsed = instant.monotonic() - start
+    assert elapsed <= 90 * 1.05 + 0.5, f"90s budget took {elapsed:.0f}s of wall clock"
+    assert client.polls > 5, "it must still actually poll"
+
+
+def test_a_slow_rpc_costs_polls_not_extra_seconds(instant, monkeypatch):
+    monkeypatch.setenv(settlement.ENV_CONFIRM_SECONDS, "10")
+    fast, slow = _LatentClient(0.0, _Clock()), _LatentClient(2.0, _Clock())
+    for c in (fast, slow):
+        monkeypatch.setattr(settlement, "time", c.clock)
+        t0 = c.clock.monotonic()
+        with pytest.raises(settlement.SettlementSubmitError):
+            _send(c)
+        c.elapsed = c.clock.monotonic() - t0
+    assert fast.elapsed <= 10.5 and slow.elapsed <= 10.5 + 2.0
+    assert slow.polls < fast.polls, "a slow RPC must buy fewer polls, not more seconds"
+
+
+# ── [20] a verified draft could fund a different escrow than the ticket names ─────────
+
+def test_the_escrow_id_actually_funded_is_reported():
+    r = _verify(_honest())
+    assert r.ok, r.failures
+    assert r.escrow_id_hex == ESCROW_ID.hex()
+    named = [c for c in r.checks if c["name"] == "escrow_id"]
+    assert named and ESCROW_ID.hex() in named[0]["actual"], \
+        "the id the transaction funds must be visible to whoever holds the claim ticket"
+
+
+def test_a_draft_that_funds_a_different_escrow_than_the_ticket_is_caught():
+    """Not theft — the commitment still pins the beneficiary — but the recipient can never claim
+    it, and the tool used to certify it SAFE."""
+    other = bytes(Keypair.from_seed(bytes([11] * 32)).pubkey())
+    r = _verify(_tx_b64([settlement._cb_limit(60_000), settlement._cb_price(1_000),
+                         _deposit_ix(escrow_id=other)]),
+                expect_escrow_id_hex=ESCROW_ID.hex())
+    assert not r.ok
+    assert "escrow_id" in r.failures
+
+
+def test_the_matching_escrow_id_passes():
+    r = _verify(_honest(), expect_escrow_id_hex=ESCROW_ID.hex().upper() + " ")
+    assert r.ok, r.failures
+
+
+def test_the_verify_tool_reports_and_checks_the_escrow_id(chain, drafting):
+    other = bytes(Keypair.from_seed(bytes([11] * 32)).pubkey())
+    tx = _tx_b64([settlement._cb_limit(60_000), settlement._cb_price(1_000),
+                  _deposit_ix(escrow_id=other)])
+    v = json.loads(drafting.xete_verify_settlement_tx(
+        tx, str(RECIPIENT.pubkey()), SALT.hex(), 1.0, expect_escrow_id=ESCROW_ID.hex()))
+    assert v["verified"] is False
+    assert "escrow_id" in v["failed_checks"]
+    assert v["escrow_id_funded"] == other.hex()
+
+
+# ── [21] a v0 transaction is accepted by the legacy parser; only luck stopped it ──────
+
+def _v0_tx_b64(with_alt=True):
+    alt = AddressLookupTableAccount(key=Keypair.from_seed(bytes([5] * 32)).pubkey(),
+                                    addresses=[ATTACKER.pubkey()])
+    m = MessageV0.try_compile(DEPOSITOR.pubkey(), [_deposit_ix()],
+                              [alt] if with_alt else [], Hash.default())
+    return base64.b64encode(bytes(VersionedTransaction.populate(m, []))).decode()
+
+
+def test_the_legacy_parser_really_does_accept_a_v0_transaction():
+    """Documents the reviewed claim that was WRONG: from_bytes does not reject v0. It misreads
+    the 0x80 version byte as num_required_signatures=128, which is the only reason the old code
+    refused it — via the unrelated single_signer check."""
+    raw = base64.b64decode(_v0_tx_b64())
+    tx = Transaction.from_bytes(raw)
+    assert tx.message.header.num_required_signatures == 128
+
+
+def test_a_versioned_transaction_is_refused_on_its_own_terms():
+    r = _verify(_v0_tx_b64())
+    assert not r.ok
+    assert "legacy_transaction" in r.failures
+
+
+def test_the_versioned_refusal_does_not_lean_on_the_single_signer_check():
+    """The load-bearing property: the refusal must come BEFORE, and independently of,
+    single_signer — so relaxing single_signer (multisig depositor, separate fee payer) cannot
+    silently reopen an address-lookup-table bypass of every program-id check in this module."""
+    r = _verify(_v0_tx_b64())
+    assert [c["name"] for c in r.checks] == ["legacy_transaction"]
+    assert "single_signer" not in r.failures, \
+        "the v0 refusal must not be a side effect of the signature-count check"
+
+
+def test_message_version_reads_legacy_and_v0_correctly():
+    assert draft._message_version(base64.b64decode(_honest())) is None
+    assert draft._message_version(base64.b64decode(_v0_tx_b64())) == 0
+
+
+def test_an_honest_legacy_draft_records_the_check_as_passing():
+    r = _verify(_honest())
+    assert r.ok
+    assert any(c["name"] == "legacy_transaction" and c["ok"] for c in r.checks)
+
+
+def test_a_v0_transaction_without_a_lookup_table_is_refused_too():
+    """The refusal is on the version, not on whether an ALT happens to be attached."""
+    r = _verify(_v0_tx_b64(with_alt=False))
+    assert not r.ok
+    assert "legacy_transaction" in r.failures
+
+
+def test_a_signed_legacy_transaction_is_still_classified_legacy():
+    """_message_version has to skip a populated signature array to find the message. If it
+    misread a real signature's first byte as the version prefix, every signed transaction would
+    be refused as 'versioned' — and the `unsigned` check would never get to fire."""
+    msg = Message.new_with_blockhash(
+        [settlement._cb_limit(60_000), settlement._cb_price(1_000), _deposit_ix()],
+        DEPOSITOR.pubkey(), Hash.default())
+    signed = bytes(Transaction([DEPOSITOR], msg, Hash.default()))
+    assert draft._message_version(signed) is None
+    r = _verify(base64.b64encode(signed).decode())
+    assert not r.ok
+    assert "unsigned" in r.failures, "a signed draft must fail as SIGNED, not as versioned"
+
+
+def test_a_non_canonical_length_prefix_cannot_smuggle_a_message_past_the_version_check():
+    """Parser-differential probe: `0x80 0x00` encodes a zero signature count in two bytes rather
+    than one. If this module and solders disagreed about where the message starts, one of them
+    could be reading the version byte from the wrong offset. solders refuses the non-strict
+    encoding outright, so the pair fails closed."""
+    raw = bytearray(base64.b64decode(_honest()))
+    non_canonical = b"\x80\x00" + bytes(raw[1:])
+    r = _verify(base64.b64encode(non_canonical).decode())
+    assert not r.ok
+    assert "deserialize" in r.failures
+
+
+@pytest.mark.parametrize("blob", [b"", b"\x01", b"\x02", b"\x80"])
+def test_truncated_input_returns_a_result_instead_of_raising(blob):
+    """_message_version is hand-rolled byte parsing on attacker-supplied input; it must not be a
+    new way to throw out of verify_draft."""
+    r = _verify(base64.b64encode(blob).decode())
+    assert isinstance(r, draft.VerifyResult)
+    assert not r.ok
+    assert "deserialize" in r.failures
+
+
+# ── [22] the fee ceiling was a per-signature yield, not a theoretical bound ───────────
+
+def test_the_tuned_fee_bomb_that_used_to_report_safe_is_refused():
+    """1_400_000 CU x 710_714 micro-lamports/CU = exactly 1_000_000 lamports, which cleared the
+    old 0.001 SOL cap and returned 'SAFE TO REVIEW AND SIGN'. 198x the honest 5_060, extractable
+    on every draft a human signs."""
+    r = _verify(_honest(limit=1_400_000, price=710_714))
+    assert r.fee_lamports == 1_000_000
+    assert not r.ok
+    assert "max_transaction_fee" in r.failures
+
+
+def test_the_ceiling_is_within_an_order_of_magnitude_of_the_honest_cost():
+    assert draft.HONEST_TX_FEE_LAMPORTS == 5_060
+    assert draft.MAX_TX_FEE_LAMPORTS <= draft.HONEST_TX_FEE_LAMPORTS * 10
+
+
+def test_a_congested_but_honest_priority_fee_still_passes():
+    """200_000 CU at 50_000 micro-lamports/CU = 10_000 priority + 5_000 base. Real congestion
+    must not be refused by the tightened cap. Passes before and after by design — it is the
+    over-tightening guard that stops the [22] fix from being "set the ceiling to zero"."""
+    r = _verify(_honest(limit=200_000, price=50_000))
+    assert r.ok, r.failures
+    assert r.fee_lamports == 15_000
+
+
+# ── [23] IndexError escaped verify_draft ──────────────────────────────────────────────
+
+def _out_of_range_index_tx() -> str:
+    tx = Transaction.from_bytes(base64.b64decode(_honest()))
+    keys = list(tx.message.account_keys)
+    cixs = []
+    for c in tx.message.instructions:
+        if keys[c.program_id_index] == settlement.program_id():
+            cixs.append(CompiledInstruction(program_id_index=c.program_id_index,
+                                            data=bytes(c.data), accounts=bytes([200, 1, 2])))
+        else:
+            cixs.append(c)
+    h = tx.message.header
+    m = Message.new_with_compiled_instructions(
+        num_required_signatures=h.num_required_signatures,
+        num_readonly_signed_accounts=h.num_readonly_signed_accounts,
+        num_readonly_unsigned_accounts=h.num_readonly_unsigned_accounts,
+        account_keys=keys, recent_blockhash=Hash.default(), instructions=cixs)
+    return base64.b64encode(bytes(Transaction.new_unsigned(m))).decode()
+
+
+def test_from_bytes_does_not_sanitise_account_indices():
+    """The premise of the bug, pinned so a solders upgrade that changes it is noticed."""
+    tx = Transaction.from_bytes(base64.b64decode(_out_of_range_index_tx()))
+    assert any(200 in list(c.accounts) for c in tx.message.instructions)
+
+
+def test_an_out_of_range_account_index_returns_a_result_instead_of_raising():
+    """verify_draft's contract is that it always returns a VerifyResult. An unguarded
+    keys[i] broke that for any caller not wrapped in a bare except."""
+    r = _verify(_out_of_range_index_tx())
+    assert isinstance(r, draft.VerifyResult)
+    assert not r.ok
+
+
+def test_the_out_of_range_index_is_surfaced_not_silently_dropped():
+    """Filtering the bad index out would SHIFT every account after it, so `from`/`to` in the
+    movement list would name the wrong wallets to the human reading it. Refuse and say why."""
+    r = _verify(_out_of_range_index_tx())
+    blob = _blob(r)
+    assert "200" in blob and "malformed" in blob
+    assert "deposit_instruction_present" in r.failures
+
+
+def test_an_out_of_range_index_on_a_non_deposit_instruction_is_also_refused():
+    """The same unguarded shape exists in _lamport_movements, on every OTHER instruction. There
+    the old code filtered silently, which is the shift-the-accounts failure above."""
+    tx = Transaction.from_bytes(base64.b64decode(_honest()))
+    keys = list(tx.message.account_keys)
+    cixs = list(tx.message.instructions)
+    cixs.append(CompiledInstruction(
+        program_id_index=[i for i, k in enumerate(keys) if k == settlement.SYS][0],
+        data=struct.pack("<I", 2) + struct.pack("<Q", DRAIN), accounts=bytes([0, 201])))
+    h = tx.message.header
+    m = Message.new_with_compiled_instructions(
+        num_required_signatures=h.num_required_signatures,
+        num_readonly_signed_accounts=h.num_readonly_signed_accounts,
+        num_readonly_unsigned_accounts=h.num_readonly_unsigned_accounts,
+        account_keys=keys, recent_blockhash=Hash.default(), instructions=cixs)
+    r = _verify(base64.b64encode(bytes(Transaction.new_unsigned(m))).decode())
+    assert isinstance(r, draft.VerifyResult)
+    assert not r.ok
+    assert "every_instruction_decoded" in r.failures
+    assert "out of range" in _blob(r)
+
+
+# ── [24] the report told a signer the deposit was the whole debit ─────────────────────
+
+def test_the_report_says_rent_and_fees_are_charged_on_top():
+    r = _verify(_honest())
+    assert r.ok
+    total = [c for c in r.checks if c["name"] == "total_lamport_movement"][0]
+    assert "NOT the whole debit" in total["expected"]
+    extra = [c for c in r.checks if c["name"] == "additional_charges_at_execution"]
+    assert extra, "rent and fees must be stated where the signer reads, not only in a review"
+    assert str(draft.ESCROW_RENT_LAMPORTS) in extra[0]["actual"]
+    assert draft.ESCROW_RENT_LAMPORTS == 1_454_640
+
+
+# ── [25a] half a claim ticket verified nothing, silently ──────────────────────────────
+
+@pytest.mark.parametrize("kwargs", [
+    {"expect_recipient": str(RECIPIENT.pubkey())},
+    {"salt": SALT.hex()},
+])
+def test_half_a_claim_ticket_says_plainly_that_nothing_was_verified(server_mod, monkeypatch,
+                                                                    kwargs):
+    c = settlement.commitment(ATTACKER.pubkey(), SALT)
+    monkeypatch.setattr(settlement, "Client", _account_client(_state(ATTACKER.pubkey(), AMOUNT, c)))
+    out = json.loads(server_mod.xete_settle_status(ESCROW_ID.hex(), **kwargs))
+    assert out["beneficiary_verified"] is None
+    assert "WARNING_NOTHING_WAS_VERIFIED" in out, \
+        "a caller who passed their own wallet reads a clean response as confirmation"
