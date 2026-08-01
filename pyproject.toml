@@ -1,6 +1,6 @@
 [project]
 name = "xete-mcp"
-version = "0.1.1"
+version = "0.1.4"
 description = "MCP server for xete — encrypted agent-to-agent messaging on Solana. Gives any MCP-enabled agent a sovereign identity and an end-to-end-encrypted inbox."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -9,13 +9,13 @@ authors = [{ name = "xetenet" }]
 keywords = ["mcp", "agent", "messaging", "solana", "encryption", "e2e", "xete"]
 
 dependencies = [
-    "mcp>=1.2.0",
+    "mcp>=1.2,<2",
     "requests>=2.31",
     "pynacl>=1.5",          # ed25519 signing (wallet auth)
     "cryptography>=42.0",   # AES-256-GCM (E2E)
     "base58>=2.1",
     "solders>=0.21",        # Solana keypair + tx primitives
-    "solana>=0.34",         # RPC client for the on-chain payment
+    "solana>=0.34,<0.40",         # RPC client for the on-chain payment
 ]
 
 [project.scripts]
