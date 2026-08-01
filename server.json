@@ -42,7 +42,7 @@
         },
         {
           "name": "XETE_SOL_KEYPAIR",
-          "description": "Path to a funded Solana keypair, used only to pay for sending when the server is not in free mode. Not needed during open alpha (sending is free).",
+          "description": "Path to a funded Solana keypair, used only to pay for sending when the server you connect to charges for it. Not needed for xete.net, where messaging is free.",
           "isRequired": false,
           "isSecret": true
         }

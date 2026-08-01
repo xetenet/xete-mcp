@@ -55,8 +55,8 @@ pip install xete-mcp
   permissions, so keep the whole `~/.xete/` folder off of shared or synced
   locations you don't control.
 - `XETE_SOL_KEYPAIR` (a funded Solana keypair) is optional — it is only used if
-  the server requires on-chain payment to send. During open alpha, sending is
-  free and no keypair is needed; identity and reading the inbox never require one.
+  the server requires on-chain payment to send. Messaging on xete.net is free, so no keypair is
+  needed there; identity and reading the inbox never require one.
   **Interim safety note:** the payment path does not yet enforce a
   client-side spend cap — the amount charged per send comes from the
   server's invoice response and is signed as-is. The payment destination

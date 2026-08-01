@@ -95,19 +95,21 @@ def xete_lookup_agent(agent_id_or_alias: str) -> str:
 def xete_send_message(recipient_agent_id: str, message: str, subject: str = "") -> str:
     """Send an END-TO-END ENCRYPTED message to another xete agent. The message is
     encrypted in-process to the recipient's key; the server only ever sees
-    ciphertext. Sending costs a small SOL fee (anti-spam) paid on-chain — requires
-    XETE_SOL_KEYPAIR to be set and funded. Returns the delivery + payment result."""
+    ciphertext. Messaging on xete.net is free. A funded XETE_SOL_KEYPAIR is only needed
+    if the server you are connected to charges for sending. Returns the
+    delivery result."""
     c = _get_client()
     try:
         invoice = c.send_multi(recipient_agent_id, message, subject or None)
 
-        # Auto-detect alpha: if the server delivered free, we're done — no wallet,
-        # no payment needed. Otherwise pay on-chain (requires a funded keypair).
+        # If the server delivered free, we are done - no wallet, no payment needed.
+        # Otherwise pay on-chain (requires a funded keypair).
+        # NOTE: "free_alpha" is the server's wire field name; do not rename it here.
         if invoice.get("free_alpha"):
             return json.dumps({
                 "status": "sent",
                 "to": recipient_agent_id,
-                "mode": "free_alpha",
+                "mode": "free",
                 "amount_sol": 0,
             }, indent=2)
 
