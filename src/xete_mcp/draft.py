@@ -68,6 +68,172 @@ class VerifyResult:
     ok: bool
     checks: list[dict] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    movements: list[dict] = field(default_factory=list)
+    total_lamports_out: int = 0
+    fee_lamports: int = 0
+
+
+# ── what a transaction DOES, not merely which programs it touches ────────────────────────
+# Checking the program id of every instruction is not verification. A plain system-program
+# transfer is "only the system program"; a compute-budget price is "only compute budget". Both
+# move real SOL out of the signer's wallet, and neither is visible unless the instruction DATA is
+# decoded. Everything below decodes it, and fails closed on anything it cannot decode.
+
+# 5000 lamports per signature; the deposit draft has exactly one signer.
+LAMPORTS_PER_SIGNATURE = 5_000
+# Runtime defaults for compute units when the transaction does not set a limit.
+DEFAULT_CU_PER_IX = 200_000
+MAX_CU_LIMIT = 1_400_000
+# What an honest deposit draft costs: 60_000 CU at 1_000 micro-lamports/CU = 60 lamports of
+# priority fee, plus 5_000 base. A cap of 0.001 SOL is ~16x that and still refuses a fee bomb by
+# four orders of magnitude.
+MAX_TX_FEE_LAMPORTS = 1_000_000
+
+_SYS_CREATE_ACCOUNT = 0
+_SYS_TRANSFER = 2
+_SYS_CREATE_ACCOUNT_WITH_SEED = 3
+_SYS_ADVANCE_NONCE = 4
+_SYS_WITHDRAW_NONCE = 5
+_SYS_TRANSFER_WITH_SEED = 11
+
+
+def _u32(b: bytes, off: int) -> int:
+    return struct.unpack_from("<I", b, off)[0]
+
+
+def _u64(b: bytes, off: int) -> int:
+    return struct.unpack_from("<Q", b, off)[0]
+
+
+def _system_movement(data: bytes, accts: list) -> dict:
+    """Decode one system-program instruction into a lamport movement.
+
+    Fail-closed: anything not decoded in full comes back with decoded=False, which the caller
+    treats as a failure. Only AdvanceNonceAccount is a legitimate part of a settlement draft —
+    every other system instruction here either moves lamports or does something we did not ask
+    for, and both deserve a refusal rather than a shrug.
+    """
+    def acct(i: int) -> str:
+        return str(accts[i]) if len(accts) > i else "<missing>"
+
+    if len(data) < 4:
+        return {"program": "system", "kind": "system:truncated", "lamports": None,
+                "from": None, "to": None, "decoded": False}
+    tag = _u32(data, 0)
+    try:
+        if tag == _SYS_ADVANCE_NONCE:
+            return {"program": "system", "kind": "system:advance_nonce_account", "lamports": 0,
+                    "from": None, "to": acct(0), "decoded": True, "expected": True}
+        if tag == _SYS_TRANSFER:
+            return {"program": "system", "kind": "system:transfer", "lamports": _u64(data, 4),
+                    "from": acct(0), "to": acct(1), "decoded": True}
+        if tag == _SYS_CREATE_ACCOUNT:
+            return {"program": "system", "kind": "system:create_account", "lamports": _u64(data, 4),
+                    "from": acct(0), "to": acct(1), "decoded": True}
+        if tag == _SYS_WITHDRAW_NONCE:
+            return {"program": "system", "kind": "system:withdraw_nonce_account",
+                    "lamports": _u64(data, 4), "from": acct(0), "to": acct(1), "decoded": True}
+        if tag == _SYS_TRANSFER_WITH_SEED:
+            return {"program": "system", "kind": "system:transfer_with_seed",
+                    "lamports": _u64(data, 4), "from": acct(0), "to": acct(2), "decoded": True}
+        if tag == _SYS_CREATE_ACCOUNT_WITH_SEED:
+            seed_len = _u64(data, 36)                       # bincode String: u64 length + bytes
+            return {"program": "system", "kind": "system:create_account_with_seed",
+                    "lamports": _u64(data, 44 + seed_len), "from": acct(0), "to": acct(1),
+                    "decoded": True}
+    except (struct.error, IndexError, ValueError):
+        return {"program": "system", "kind": f"system:tag{tag}:truncated", "lamports": None,
+                "from": None, "to": None, "decoded": False}
+    return {"program": "system", "kind": f"system:tag{tag}:unrecognised", "lamports": None,
+            "from": None, "to": None, "decoded": False}
+
+
+def _transaction_fee(msg, keys) -> tuple[int, dict, list[str]]:
+    """(total fee in lamports, itemisation, undecodable compute-budget instructions).
+
+    The compute-budget program moves no lamports of its own, which is exactly why it gets waved
+    through — but priority fee = compute_unit_limit x price_per_unit / 1e6, and both are attacker
+    chosen u32/u64 values. 1_400_000 CU at 700_000_000 micro-lamports/CU is 0.98 SOL, debited
+    from the signer with nothing in the instruction list that looks like a payment.
+    """
+    limit: int | None = None
+    price = 0
+    extra = 0
+    unknown: list[str] = []
+    n_ix = len(msg.instructions)
+    for cix in msg.instructions:
+        if cix.program_id_index >= len(keys) or keys[cix.program_id_index] != settlement.CB:
+            continue
+        d = bytes(cix.data)
+        if not d:
+            unknown.append("compute_budget:empty")
+            continue
+        tag = d[0]
+        try:
+            # max(), not last-wins: if a transaction somehow carries two of these, price the
+            # worse one. Under-quoting the fee is the only direction that can hurt.
+            if tag == 2 and len(d) >= 5:            # SetComputeUnitLimit(u32)
+                limit = max(limit or 0, _u32(d, 1))
+            elif tag == 3 and len(d) >= 9:          # SetComputeUnitPrice(u64 micro-lamports/CU)
+                price = max(price, _u64(d, 1))
+            elif tag == 0 and len(d) >= 9:          # deprecated RequestUnits(u32, additional_fee u32)
+                limit = max(limit or 0, _u32(d, 1))
+                extra += _u32(d, 5)                 # additional_fee is plain lamports
+            elif tag in (1, 4) and len(d) >= 5:     # RequestHeapFrame / SetLoadedAccountsDataSize
+                pass
+            else:
+                unknown.append(f"compute_budget:tag{tag}")
+        except struct.error:
+            unknown.append(f"compute_budget:tag{tag}:truncated")
+    effective_cu = min(limit, MAX_CU_LIMIT) if limit is not None else min(DEFAULT_CU_PER_IX * n_ix,
+                                                                          MAX_CU_LIMIT)
+    priority = -(-(effective_cu * price) // 1_000_000)      # the runtime rounds up
+    base = LAMPORTS_PER_SIGNATURE * msg.header.num_required_signatures
+    detail = {"base_lamports": base, "priority_lamports": priority,
+              "compute_unit_limit": effective_cu, "limit_was_explicit": limit is not None,
+              "micro_lamports_per_cu": price, "additional_fee_lamports": extra}
+    return base + priority + extra, detail, unknown
+
+
+def _lamport_movements(msg, keys, program, expected_pda) -> tuple[list[dict], list[str]]:
+    """Every lamport movement in the transaction, plus the instructions we could not decode."""
+    movements: list[dict] = []
+    undecodable: list[str] = []
+    for n, cix in enumerate(msg.instructions):
+        if cix.program_id_index >= len(keys):
+            undecodable.append(f"ix{n}: program index {cix.program_id_index} out of range")
+            continue
+        prog_key = keys[cix.program_id_index]
+        accts = [keys[i] for i in cix.accounts if i < len(keys)]
+        data = bytes(cix.data)
+        if prog_key == settlement.CB:
+            continue                                     # priced separately, in _transaction_fee
+        if prog_key == settlement.SYS:
+            m = _system_movement(data, accts)
+            m["ix"] = n
+            movements.append(m)
+            if not m["decoded"]:
+                undecodable.append(f"ix{n}: {m['kind']}")
+            continue
+        if prog_key == program:
+            tag = data[0] if data else None
+            if tag == 0 and len(data) == _DEPOSIT_DATA_LEN:
+                pda = settlement.escrow_pda(program, data[1:33])
+                movements.append({"program": "settlement", "kind": "settlement:deposit", "ix": n,
+                                  "lamports": struct.unpack("<Q", data[33:41])[0],
+                                  "from": str(keys[0]) if keys else None, "to": str(pda),
+                                  "decoded": True,
+                                  "expected": str(pda) == str(expected_pda)})
+            else:
+                undecodable.append(f"ix{n}: settlement program instruction tag={tag} "
+                                   f"len={len(data)} — not the deposit this draft claims to be")
+                movements.append({"program": "settlement", "kind": f"settlement:tag{tag}", "ix": n,
+                                  "lamports": None, "from": None, "to": None, "decoded": False})
+            continue
+        undecodable.append(f"ix{n}: unexpected program {prog_key}")
+        movements.append({"program": str(prog_key), "kind": "unknown_program", "ix": n,
+                          "lamports": None, "from": None, "to": None, "decoded": False})
+    return movements, undecodable
 
 
 def _read_nonce(client: Client, nonce_account: Pubkey) -> tuple[Hash, Pubkey]:
@@ -150,7 +316,7 @@ def _find_deposit_ix(tx: Transaction, program: Pubkey) -> tuple[bytes, list[Pubk
     msg = tx.message
     keys = list(msg.account_keys)
     for cix in msg.instructions:
-        if keys[cix.program_id_index] != program:
+        if cix.program_id_index >= len(keys) or keys[cix.program_id_index] != program:
             continue
         data = bytes(cix.data)
         if data[:1] == b"\x00" and len(data) == _DEPOSIT_DATA_LEN:
@@ -160,12 +326,19 @@ def _find_deposit_ix(tx: Transaction, program: Pubkey) -> tuple[bytes, list[Pubk
 
 def verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt_hex: str,
                  expect_amount_lamports: int, expect_depositor: Pubkey,
-                 expect_program: Pubkey | None = None) -> VerifyResult:
+                 expect_program: Pubkey | None = None,
+                 max_fee_lamports: int = MAX_TX_FEE_LAMPORTS) -> VerifyResult:
     """Independently check that a drafted transaction does what its summary claims.
 
     Every expectation is supplied by the CALLER, not read out of the draft — that is the whole
     point. Re-deriving sha256(recipient || salt) is what catches a redirected beneficiary, since
     the recipient never appears in the transaction in the clear.
+
+    The other half of the job is arithmetic, not identity: this decodes the DATA of every
+    instruction, sums every lamport that leaves the signer, prices the compute-budget fee, and
+    refuses unless the total and the destinations are exactly the deposit that was asked for. A
+    green result from a whitelist of program ids means nothing — a system transfer and a
+    compute-budget price both drain the signer while touching only "expected" programs.
     """
     checks: list[dict] = []
     failures: list[str] = []
@@ -235,8 +408,48 @@ def verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt_
 
     # Anything else touching the program, or any extra instruction that moves value, is suspect.
     other = [keys[c.program_id_index] for c in msg.instructions
-             if keys[c.program_id_index] not in (program, settlement.CB, settlement.SYS)]
+             if c.program_id_index < len(keys)
+             and keys[c.program_id_index] not in (program, settlement.CB, settlement.SYS)]
     record("no_unexpected_programs", not other,
            "only settlement + compute-budget + system", other or "none")
 
-    return VerifyResult(ok=not failures, checks=checks, failures=failures)
+    # ── the arithmetic: WHAT each instruction does ───────────────────────────────────────
+    movements, undecodable = _lamport_movements(msg, keys, program, expected_pda)
+    fee_lamports, fee_detail, fee_unknown = _transaction_fee(msg, keys)
+    undecodable = undecodable + fee_unknown
+
+    record("every_instruction_decoded", not undecodable,
+           "every instruction decoded and understood", undecodable or "all decoded")
+
+    deposits = [m for m in movements if m["kind"] == "settlement:deposit"]
+    record("exactly_one_deposit", len(deposits) == 1, 1, len(deposits))
+
+    # Surface every movement whether or not anything failed — a human signing this needs to see
+    # the list, not just a verdict.
+    record("lamport_movements", True, "itemised below",
+           "; ".join(f"ix{m['ix']} {m['kind']} "
+                     f"{'?' if m['lamports'] is None else m['lamports']} lamports -> {m['to']}"
+                     for m in movements) or "none")
+
+    total_out = sum(m["lamports"] or 0 for m in movements)
+    record("total_lamport_movement", total_out == expect_amount_lamports and not undecodable,
+           f"{expect_amount_lamports} lamports (the deposit and nothing else)",
+           f"{total_out} lamports" + (" + undecodable instructions" if undecodable else ""))
+
+    dests = {m["to"] for m in movements if (m["lamports"] or 0) > 0}
+    record("destinations", dests == {str(expected_pda)},
+           f"only the escrow {expected_pda}", sorted(dests) or "none")
+
+    how = (f"{fee_detail['compute_unit_limit']} CU x "
+           f"{fee_detail['micro_lamports_per_cu']} micro-lamports/CU"
+           + ("" if fee_detail["limit_was_explicit"] else " (limit unset — runtime default)")
+           + f" = {fee_detail['priority_lamports']} priority"
+           + f" + {fee_detail['base_lamports']} base"
+           + (f" + {fee_detail['additional_fee_lamports']} additional"
+              if fee_detail["additional_fee_lamports"] else ""))
+    record("max_transaction_fee", fee_lamports <= max_fee_lamports,
+           f"<= {max_fee_lamports} lamports", f"{fee_lamports} lamports [{how}]")
+
+    return VerifyResult(ok=not failures, checks=checks, failures=failures,
+                        movements=movements, total_lamports_out=total_out,
+                        fee_lamports=fee_lamports)

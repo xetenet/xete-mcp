@@ -25,6 +25,10 @@ never no limit. Full reasoning in src/xete_mcp/spendguard.py.
   XETE_SPEND_FLOOR_LAMPORTS   minimum charged per on-chain action, covering the rent
                               and fees a quote excludes         (default 2000000)
   XETE_SPEND_LEDGER           ledger path      (default ~/.xete/spend-ledger.json)
+
+Settlement confirmation (env):
+  XETE_CONFIRM_SECONDS        how long to keep asking the cluster about a submitted settlement
+                              before reporting it as UNKNOWN (never as failed) (default 90)
 """
 from __future__ import annotations
 
@@ -384,6 +388,33 @@ def xete_resolve(identifier: str) -> str:
 # Non-custodial: only the depositor (reclaim) or beneficiary (claim) keys move funds. THIS agent's
 # identity wallet is the depositor/claimant + fee payer, so it must hold SOL.
 
+def _escrow_id_error(escrow_id: str) -> str | None:
+    """None if `escrow_id` is well formed, otherwise the error JSON the tool should return.
+
+    Called as the FIRST statement of every tool that takes an escrow_id — before the identity
+    keystore is opened, before the RPC client exists, before anything reaches solders. An
+    over-length id makes solders raise a Rust PanicException, which derives from BaseException
+    and so is NOT caught by the `except Exception` these tools wrap themselves in: it unwinds
+    out of the tool, out of the MCP dispatch loop, and kills the stdio session. The agent then
+    has no xete tools at all — including xete_settle_reclaim for its own open escrows. And
+    escrow_ids come from claim tickets, which come from the inbox, which is anyone.
+    """
+    try:
+        settlement.parse_escrow_id(escrow_id)
+    except ValueError as e:
+        return json.dumps({"status": "failed", "error": f"invalid escrow_id: {e}"}, indent=2)
+    return None
+
+
+def _salt_error(salt: str) -> str | None:
+    """Same boundary, same reason, for the other half of a claim ticket."""
+    try:
+        settlement.parse_salt(salt)
+    except ValueError as e:
+        return json.dumps({"status": "failed", "error": f"invalid salt: {e}"}, indent=2)
+    return None
+
+
 def _resolve_recipient_wallet(recipient: str):
     """(wallet Pubkey, messageable_handle | None). Accepts a base58 wallet pubkey directly, or a
     %alias / name resolved via the permit server to its on-chain owner wallet."""
@@ -413,8 +444,14 @@ def xete_settle_create(recipient: str, amount_sol: float, notify: bool = True) -
     (must hold amount_sol + a little for rent/gas). If notify is true and the recipient is messageable,
     the claim ticket (escrow_id + salt) is sent to them END-TO-END ENCRYPTED over xete. ALWAYS returns
     the ticket so you can deliver it yourself too — the recipient needs escrow_id + salt to claim. You
-    can xete_settle_reclaim it any time before they claim."""
+    can xete_settle_reclaim it any time before they claim.
+
+    If confirmation times out the ticket still comes back, under `ticket`, with status
+    `submitted_unconfirmed` — the deposit may well have landed, so KEEP IT."""
     ident = load_or_create_identity(IDENTITY_PATH)
+    # Filled in by settlement.deposit BEFORE it submits. The salt lives nowhere else — only its
+    # hash goes on chain — so this is the copy that survives a confirmation timeout.
+    early_ticket: dict = {}
     try:
         from solders.keypair import Keypair
 
@@ -423,7 +460,8 @@ def xete_settle_create(recipient: str, amount_sol: float, notify: bool = True) -
         lamports = int(round(amount_sol * 1_000_000_000))
         if lamports <= 0:
             return json.dumps({"status": "failed", "error": "amount_sol must be > 0"})
-        eid_hex, salt_hex, pda, sig = settlement.deposit(RPC_URL, depositor, recipient_wallet, lamports)
+        eid_hex, salt_hex, pda, sig = settlement.deposit(
+            RPC_URL, depositor, recipient_wallet, lamports, on_ticket=early_ticket.update)
         ticket = {"escrow_id": eid_hex, "salt": salt_hex, "amount_sol": amount_sol,
                   "program": str(settlement.program_id()), "claim_with": "xete_settle_claim"}
         notified = None
@@ -443,8 +481,33 @@ def xete_settle_create(recipient: str, amount_sol: float, notify: bool = True) -
             "ticket": ticket, "notified": notified,
             "note": "give the recipient escrow_id + salt to claim; reclaimable until then",
         }, indent=2)
+    except settlement.SettlementSubmitError as e:
+        # The transaction was submitted. Whether it landed is unknown (or, for outcome
+        # "dropped"/"failed", known not to have) — but the ticket is the ONLY copy of the salt,
+        # so it goes back to the caller either way. Losing it makes a deposit that did land
+        # unclaimable forever.
+        return json.dumps({
+            "status": "failed" if e.outcome in ("failed", "dropped") else "submitted_unconfirmed",
+            "submit_outcome": e.outcome,
+            "error": str(e)[:400],
+            "tx_signature": e.signature,
+            "ticket": e.ticket or early_ticket or None,
+            "amount_sol": amount_sol,
+            "KEEP_THIS_TICKET": "The salt is not on chain — only sha256(recipient || salt) is. "
+                                "If you discard it and the deposit did land, nobody can ever "
+                                "claim or identify it.",
+            "next_step": "Call xete_settle_status with this escrow_id. If it is open, the "
+                         "deposit landed: deliver the ticket to the recipient, or "
+                         "xete_settle_reclaim to take the funds back. If it is not open, the "
+                         "deposit did not happen and your funds never left.",
+        }, indent=2)
     except Exception as e:
-        return json.dumps({"status": "failed", "error": str(e)[:300]})
+        out = {"status": "failed", "error": str(e)[:300]}
+        if early_ticket:
+            out["ticket"] = early_ticket
+            out["KEEP_THIS_TICKET"] = ("a deposit may have been submitted; check "
+                                       "xete_settle_status with this escrow_id before discarding")
+        return json.dumps(out, indent=2)
 
 
 @mcp.tool()
@@ -452,6 +515,9 @@ def xete_settle_claim(escrow_id: str, salt: str) -> str:
     """Claim a confidential settlement addressed to you — using the escrow_id + salt from the claim
     ticket (sent to your inbox, or handed to you). Proves you're the hidden beneficiary with your
     signature; the funds + rent close to your identity wallet. Returns the tx and the amount received."""
+    bad = _escrow_id_error(escrow_id) or _salt_error(salt)
+    if bad:
+        return bad
     ident = load_or_create_identity(IDENTITY_PATH)
     try:
         from solders.keypair import Keypair
@@ -468,6 +534,9 @@ def xete_settle_claim(escrow_id: str, salt: str) -> str:
 def xete_settle_reclaim(escrow_id: str) -> str:
     """Cancel a settlement YOU opened and get the funds + rent back, as long as the recipient hasn't
     claimed yet (depositor-only). Returns the tx signature."""
+    bad = _escrow_id_error(escrow_id)
+    if bad:
+        return bad
     ident = load_or_create_identity(IDENTITY_PATH)
     try:
         from solders.keypair import Keypair
@@ -481,11 +550,38 @@ def xete_settle_reclaim(escrow_id: str) -> str:
 
 
 @mcp.tool()
-def xete_settle_status(escrow_id: str) -> str:
-    """Check whether a settlement is still open (unclaimed and unreclaimed). A closed account means it
-    already settled. While open, returns the depositor and locked amount. Read-only."""
+def xete_settle_status(escrow_id: str, expect_recipient: str = "", salt: str = "") -> str:
+    """Check whether a settlement is still open (unclaimed and unreclaimed), and — if you pass the
+    rest of the claim ticket — whether it is actually FOR the wallet you think. A closed account
+    means it already settled. Read-only.
+
+    "Open" on its own proves nothing about who gets paid. The beneficiary is hidden on-chain as
+    sha256(wallet || salt), so an attacker can open a genuine escrow naming themselves, send you
+    its id, and the depositor, amount and pda will all look exactly right. Pass `expect_recipient`
+    (normally your own wallet, from xete_my_identity) and the `salt` from the ticket: this
+    re-derives the commitment and tells you plainly whether it matches. Without them,
+    `beneficiary_verified` comes back null and you have verified nothing."""
+    bad = _escrow_id_error(escrow_id)
+    if bad:
+        return bad
+    if salt:
+        bad = _salt_error(salt)
+        if bad:
+            return bad
     try:
-        return json.dumps(settlement.status(RPC_URL, escrow_id), indent=2)
+        expect_commitment = None
+        checked_against = None
+        if expect_recipient and salt:
+            wallet, _ = _resolve_recipient_wallet(expect_recipient)
+            expect_commitment = settlement.commitment(wallet, settlement.parse_salt(salt)).hex()
+            checked_against = str(wallet)
+        out = settlement.status(RPC_URL, escrow_id, expect_commitment_hex=expect_commitment)
+        if checked_against:
+            out["checked_against_wallet"] = checked_against
+        elif out.get("open"):
+            out["how_to_verify"] = ("call again with expect_recipient=<your wallet> and "
+                                    "salt=<the salt from the claim ticket>")
+        return json.dumps(out, indent=2)
     except Exception as e:
         return json.dumps({"status": "failed", "error": str(e)[:300]})
 
@@ -547,10 +643,13 @@ def xete_draft_settlement_tx(recipient: str, amount_sol: float) -> str:
 def xete_verify_settlement_tx(unsigned_tx_b64: str, expect_recipient: str, salt: str,
                               amount_sol: float) -> str:
     """Independently check that an unsigned settlement transaction really pays who you think it
-    pays, before a human signs it. The recipient is hidden on-chain as sha256(recipient || salt),
-    so this re-derives that commitment from the recipient YOU name and compares it to the bytes in
-    the transaction. Returns a per-check pass/fail table. A `verified: false` result means DO NOT
-    SIGN — the transaction does not match the stated intent."""
+    pays — and ONLY that — before a human signs it. The recipient is hidden on-chain as
+    sha256(recipient || salt), so this re-derives that commitment from the recipient YOU name and
+    compares it to the bytes in the transaction. It also decodes the data of every instruction,
+    itemises every lamport that would leave the signer (`lamport_movements`), totals them, and
+    prices the compute-budget priority fee — so a bolted-on system transfer or an inflated fee
+    cannot hide behind a familiar program id. Returns a per-check pass/fail table. A
+    `verified: false` result means DO NOT SIGN — the transaction does not match the stated intent."""
     try:
         from solders.pubkey import Pubkey
 
@@ -569,6 +668,10 @@ def xete_verify_settlement_tx(unsigned_tx_b64: str, expect_recipient: str, salt:
             "verified": r.ok,
             "verdict": "SAFE TO REVIEW AND SIGN" if r.ok else "DO NOT SIGN — verification failed",
             "failed_checks": r.failures,
+            "lamport_movements": r.movements,
+            "total_lamports_out": r.total_lamports_out,
+            "total_sol_out": r.total_lamports_out / 1e9,
+            "max_fee_lamports": r.fee_lamports,
             "checks": r.checks,
             "recipient_checked": str(recipient_wallet),
         }, indent=2)
