@@ -145,7 +145,7 @@ verbatim, but the `server.py` hunks are a hand-merge onto committed base. Re-app
 
 ---
 
-## Verdict: BLOCK
+## Verdict: BLOCK  *(superseded — see the appended fresh-context review)*
 
 `self-review-only`. CLAUDE.md rule 5 is explicit: reviewing one's own reasoning inside the
 same context does not count as the adversarial pass, and for a protected path that downgrades
@@ -162,3 +162,50 @@ this diff, the claim, and the assumption table above, and produces at least one 
 attempt per claim — with particular attention to A5 (the 81-byte layout, which is inherited and
 load-bearing for `open`) and to residual risk 2 (the RPC fallback in track 1's file, which is on
 the money path and is not fixed by this branch).
+
+
+---
+
+## FRESH-CONTEXT REVIEW — appended 2026-08-01, verdict moved BLOCK -> SHIP
+
+**The unblock condition this file set for itself** was: *a fresh-context reviewer is given this
+diff, the claim and the assumption table, and produces at least one concrete attack attempt per
+claim — with particular attention to A5 and to residual risk 2.* That happened. A lens was pointed
+at exactly those two points (62 automated attacks plus 6 read-only mainnet probes, worktree left
+clean), and two further independent lenses attacked the same code. Every finding they produced is
+closed with a red-before-green regression test.
+
+### Doubts and reconciliations
+
+- **D-i. Claim 4 ("no settlement tool asserts an outcome it does not know") was FALSE as shipped —
+  falsified twice.** `received / 1e9` threw `TypeError` into the tool's bare `except Exception`,
+  reporting a **confirmed, landed** claim as a flat failure with no signature and no
+  do-not-assume-you-were-not-paid guidance — triggered by one rate-limited balance read on the
+  repo's own default RPC. Separately, `send_transaction` raising unwound past every handler and
+  discarded a locally-known signature for a live transaction. *Reconciliation:* both fixed in
+  `550a3cf`; the signature is captured before submission and the live-boundary comment moved above
+  the send. Claim 4 now holds on the exception paths too.
+- **D-ii. A5 (the inherited 81-byte escrow layout) — discharged.** The fresh lens attacked
+  `status()` with 80/82/attacker-chosen bytes and could not get a field read out of an account
+  failing the owner or length gate. 81 is now load-bearing in a second place via
+  `RENT_EXEMPT_LAMPORTS`, and a read-only mainnet escrow shows `space=81`.
+- **D-iii. Residual risk 2 (degrade-to-weaker-source) was real and WORSE than this file described.**
+  Not merely a fallback: corroboration de-duplicated endpoints **by raw string**, so one host under
+  two spellings — or one provider with two API keys — filled both slots and certified a payment to
+  an attacker while printing "TWO independent endpoints that agree". And the rule was enforced on
+  the *advisory* tool but not the *spending* tools. *Reconciliation:* fixed in `4b6fea1` via
+  `endpoint_identity()` keyed on `(scheme, host, port)`, applied at both sites, with
+  `xete_settle_create` and `xete_draft_settlement_tx` bound to the corroborated resolver.
+- **D-iv. A6 (the rent figure) was right as a number and wrong as a meaning.** The arithmetic was
+  correct; the claim that rent is charged *on top of* the amount was not — it comes *out of* it,
+  making `amount` a floor, and a draft below that floor was certified "SAFE TO REVIEW AND SIGN".
+  *Reconciliation:* fixed in `0c59d4c`, one source of truth plus `validate_deposit_amount()` at
+  both the builder and the top of `deposit()`.
+
+### Residual, carried forward
+`xete_resolve` still answers from a single endpoint and warns rather than refuses, so the
+corroboration rule can be walked around with one extra tool call. The configuration half is fixed
+(`7f7c5eb`); the refuse-vs-warn policy is the owner's decision. See
+`DDR-post-gate-integrator-20260801.md`.
+
+## Verdict: SHIP

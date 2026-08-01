@@ -48,8 +48,44 @@ The recovered work closes the settlement findings the three adversarial lenses c
 - The unverified assumption (each test fails without its fix) is **accepted as open**, not
   dismissed.
 
-## Verdict: BLOCK
+## Verdict: BLOCK  *(superseded — see the appended fresh-context review)*
 
 Not because anything is known to be wrong — the evidence is good — but because this specific
 change set has had **no independent review at all**, and it is on the money path. It needs one
 fresh-context adversarial pass before it can carry SHIP. Do not flip this verdict without one.
+
+
+---
+
+## FRESH-CONTEXT REVIEW — appended 2026-08-01, verdict moved BLOCK -> SHIP
+
+**The stated BLOCK reason was "this change set has had no independent review at all."** That is no
+longer true: four fresh-context lenses attacked the merged tree, then four more attacked the repair
+of their findings. Nothing in this change set survived unexamined.
+
+### The open assumption, resolved honestly
+
+This file listed one assumption as **NOT verified**: *each new test fails without its fix.* Its
+status now, stated precisely rather than conveniently:
+
+- **Discharged at the level that matters.** A dedicated test-integrity lens diffed every test file
+  against `cb1ccb4`, adjudicated each changed or deleted assertion, and mutation-tested the
+  security core. It found **no weakened assertion and no deleted coverage** — the one removed test
+  was a rename whose body is byte-identical, retitled because the old title asserted a thing that
+  was disproved.
+- **What it found instead was three MISSING assertions**, all now closed with mutation-proven
+  tests (`7f7c5eb`): the encryption core had no negative test at all, `_migrate_keystore`'s
+  never-overwrite-the-backup guarantee was unasserted, and two of three match conditions in the
+  spend-rollback were unasserted.
+- **Not discharged:** the 39 recovered tests were *not* individually reverted one at a time. The
+  claim that now holds is "the security core is mutation-proven to catch the defects it should",
+  which is stronger in substance and weaker in literal coverage than the original wording.
+
+### Method lesson worth more than the fix
+
+Closing the backup-guarantee gap took **three attempts**, and the first two tests passed with the
+guard deleted — one started from a keystore with no legacy secret (migration returns at line 1),
+the other migrated the same file twice (an idempotency check returns early). Both looked
+completely reasonable. *A regression test is not a test until you have watched it fail.*
+
+## Verdict: SHIP
