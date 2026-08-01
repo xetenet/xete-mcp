@@ -75,3 +75,96 @@ def test_the_protected_paths_file_is_readable_and_non_empty():
     body = [ln for ln in pp.read_text().splitlines()
             if ln.strip() and not ln.strip().startswith("#")]
     assert body, "protected-paths has no active patterns; the DDR gate guards nothing"
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ARMED IS NOT THE SAME AS EFFECTIVE.
+#
+# Everything above checks the hook is present, executable and has a shebang. None of it
+# checks that the hook STOPS ANYTHING. A hook can be all three and still `exit 0`
+# unconditionally; protected-paths can be non-empty and match nothing real; the gate can
+# be perfectly installed and guard the empty set.
+#
+# That is the identical failure family, one layer up: present-but-unarmed became
+# armed-but-ineffective. Raised by an outside reviewer against the tests above, which is
+# exactly the value of a second context -- I wrote those tests believing they closed the
+# hole, and they closed half of it.
+#
+# These run the REAL hook against a scratch clone. Never the working tree.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+import shutil
+import tempfile
+
+
+def _scratch_repo(tmp: Path) -> Path:
+    """A throwaway git repo wired to the real hooks. Nothing here touches the working tree."""
+    r = tmp / "scratch"
+    r.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=r, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=r, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=r, check=True)
+    subprocess.run(["git", "config", "core.hooksPath", str(_hooks_dir())], cwd=r, check=True)
+    (r / "seed.txt").write_text("seed\n")
+    subprocess.run(["git", "add", "seed.txt"], cwd=r, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed", "--no-verify"], cwd=r, check=True)
+    return r
+
+
+def _try_commit(repo: Path, msg: str):
+    return subprocess.run(["git", "commit", "-q", "-m", msg], cwd=repo,
+                          capture_output=True, text=True)
+
+
+def test_the_precommit_hook_actually_blocks_a_protected_path_without_a_ddr():
+    """THE behavioural test. A protected-path change with no reviews/DDR-*.md must be REFUSED.
+    If this passes while the hook is a no-op, every 'the gate protected us' claim in this
+    repo's history is decoration."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = _scratch_repo(Path(td))
+        f = repo / "src" / "xete_mcp"
+        f.mkdir(parents=True)
+        (f / "server.py").write_text("# protected path, no DDR staged\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        r = _try_commit(repo, "touch a protected path with no review")
+        assert r.returncode != 0, (
+            "THE PRE-COMMIT GATE IS A NO-OP: a change to src/xete_mcp/server.py committed with "
+            "no reviews/DDR-*.md staged. The hook is present and executable and stops nothing.")
+
+
+def test_the_same_change_is_allowed_once_a_ship_ddr_is_staged():
+    """The gate must also be PASSABLE. One that refuses everything gets bypassed with
+    --no-verify within a day, which is worse than no gate because it still reports success."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = _scratch_repo(Path(td))
+        (repo / "src" / "xete_mcp").mkdir(parents=True)
+        (repo / "src" / "xete_mcp" / "server.py").write_text("# protected path\n")
+        rv = repo / "reviews"
+        rv.mkdir()
+        (rv / "DDR-scratch-20260101.md").write_text(
+            "# DDR: scratch\n## Claim\nx\n## Assumptions\nx\n## Doubts raised\nx\n"
+            "## Reconciliation\nx\n## Verdict: SHIP\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        r = _try_commit(repo, "protected path WITH a SHIP ddr")
+        assert r.returncode == 0, (
+            "the gate refuses a properly reviewed change, which is how gates get bypassed:\n"
+            + (r.stdout + r.stderr)[-600:])
+
+
+def test_protected_paths_patterns_match_files_that_actually_exist():
+    """A pattern list can be non-empty and still guard nothing -- a stale path, a typo, a
+    renamed directory. Assert at least one pattern matches a real tracked file."""
+    import re
+    d = _hooks_dir()
+    pp = d / "protected-paths"
+    if not pp.exists():
+        pytest.skip("no protected-paths file")
+    pats = [ln.strip() for ln in pp.read_text().splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+    tracked = subprocess.run(["git", "ls-files"], cwd=REPO,
+                             capture_output=True, text=True).stdout.split()
+    matched = {p: [f for f in tracked if re.search(p, f)] for p in pats}
+    live = {p: v for p, v in matched.items() if v}
+    assert live, (
+        f"NONE of the {len(pats)} protected-path patterns match any tracked file. The DDR gate "
+        f"is installed, armed, and guarding the empty set. Patterns: {pats}")
