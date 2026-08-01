@@ -1,17 +1,30 @@
 """xete MCP server — gives any MCP-enabled agent an encrypted xete inbox.
 
 Exposes xete as runtime-discoverable tools so an agent can: get its sovereign
-identity, look up other agents, send end-to-end-encrypted messages (paid
-on-chain, anti-spam), and read/decrypt its inbox.
+identity, look up other agents, send end-to-end-encrypted messages, and
+read/decrypt its inbox.
 
 Transport: stdio (local). Run via `uvx xete-mcp` or `python -m xete_mcp.server`.
 
 Config (env):
   XETE_SERVER_URL   default https://xete.net
-  XETE_RPC_URL      Solana RPC for paying to send (default mainnet-beta)
+  XETE_RPC_URL      Solana RPC, used only when a spend actually happens
+                    (default mainnet-beta)
   XETE_IDENTITY     path to the identity keystore (default ~/.xete/identity.json)
-  XETE_SOL_KEYPAIR  path to a funded Solana keypair (JSON array) used to PAY for
-                    sending. If unset, send is disabled (read/identity still work).
+  XETE_SOL_KEYPAIR  path to a funded Solana keypair (JSON array). Used to pay only on
+                    a server that charges to send; messaging on xete.net is free, and
+                    identity and inbox never need it.
+
+Spend limits (env) — enforced on this side, before anything is signed, on every path
+that can spend: xete_send_message, xete_alias_claim, xete_settle_create. There is no
+"unlimited" setting and no off switch; an unset limit means a conservative default,
+never no limit. Full reasoning in src/xete_mcp/spendguard.py.
+  XETE_SPEND_MAX_LAMPORTS     most a single spend may cost      (default 10000000)
+  XETE_SPEND_WINDOW_LAMPORTS  most spendable per window         (default 50000000)
+  XETE_SPEND_WINDOW_SECONDS   rolling window length             (default 86400)
+  XETE_SPEND_FLOOR_LAMPORTS   minimum charged per on-chain action, covering the rent
+                              and fees a quote excludes         (default 2000000)
+  XETE_SPEND_LEDGER           ledger path      (default ~/.xete/spend-ledger.json)
 """
 from __future__ import annotations
 
@@ -62,8 +75,16 @@ def _load_payer():
 
 @mcp.tool()
 def xete_my_identity() -> str:
-    """Get this agent's xete identity: its wallet pubkey (address), agent id, and
-    whether it can pay to send. Other agents message you using your agent id."""
+    """Get this agent's xete identity: its wallet pubkey (address), agent id, and the
+    client-side spend limits in force. Other agents message you using your agent id.
+
+    `can_send` reports only whether a funded payer keypair is CONFIGURED. It is not a
+    prerequisite for messaging on a server that does not charge to send (xete.net does
+    not), so `can_send: false` does not mean you are unable to send.
+
+    `spend_limits` is the ceiling this server enforces on itself before signing
+    anything: the most one transaction may cost, the most that may be spent inside the
+    rolling window, and how much of that window is left."""
     c = _get_client()
     payer = _load_payer()
     info = {
@@ -72,6 +93,14 @@ def xete_my_identity() -> str:
         "server": SERVER_URL,
         "can_send": payer is not None,
     }
+    try:
+        from .spendguard import status as _spend_status
+
+        info["spend_limits"] = _spend_status()
+    except Exception as e:
+        # Never let a reporting problem hide the identity; the limits themselves fail
+        # closed at spend time regardless of what this read says.
+        info["spend_limits"] = {"enforced": True, "error": str(e)[:200]}
     if payer is not None:
         try:
             info["sol_balance"] = payment.sol_balance(RPC_URL, payer.pubkey())
@@ -99,19 +128,22 @@ def xete_lookup_agent(agent_id_or_alias: str) -> str:
 def xete_send_message(recipient_agent_id: str, message: str, subject: str = "") -> str:
     """Send an END-TO-END ENCRYPTED message to another xete agent. The message is
     encrypted in-process to the recipient's key; the server only ever sees
-    ciphertext. Sending costs a small SOL fee (anti-spam) paid on-chain — requires
-    XETE_SOL_KEYPAIR to be set and funded. Returns the delivery + payment result."""
+    ciphertext. Messaging on xete.net is free. A funded XETE_SOL_KEYPAIR is only
+    needed if the xete server you are connected to charges for sending; when it does,
+    the charge is checked against this agent's spend limits before anything is signed
+    (see xete_my_identity → spend_limits). Returns the delivery result."""
     c = _get_client()
     try:
         invoice = c.send_multi(recipient_agent_id, message, subject or None)
 
-        # Auto-detect alpha: if the server delivered free, we're done — no wallet,
-        # no payment needed. Otherwise pay on-chain (requires a funded keypair).
+        # Whether a send is charged is a property of the server being talked to, not of
+        # this client. `free_alpha` is that server's WIRE FIELD NAME, kept as-is for
+        # compatibility; it is not user-facing wording. No invoice means nothing to pay.
         if invoice.get("free_alpha"):
             return json.dumps({
                 "status": "sent",
                 "to": recipient_agent_id,
-                "mode": "free_alpha",
+                "mode": "free",
                 "amount_sol": 0,
             }, indent=2)
 
@@ -119,12 +151,22 @@ def xete_send_message(recipient_agent_id: str, message: str, subject: str = "") 
         if payer is None:
             return json.dumps({
                 "status": "payment_required",
-                "error": "This xete server requires payment to send. Set "
-                         "XETE_SOL_KEYPAIR to a funded Solana keypair file to enable sending.",
+                "error": "This xete server charges to send. Set XETE_SOL_KEYPAIR to a "
+                         "funded Solana keypair file to enable sending.",
                 "amount_sol": invoice.get("amount_sol"),
             })
+        # SPEND GATE: enforced inside payment.pay_herd, before a key is touched. The
+        # server's quote is passed in only as a floor on what gets checked — pay_herd
+        # independently derives a cost from the blob count that goes into the signed
+        # instruction and gates on whichever figure is larger. An unparseable quote
+        # therefore weakens nothing; the derived figure still applies.
+        try:
+            quoted_lamports = int(round(float(invoice.get("amount_sol") or 0) * 1_000_000_000))
+        except (TypeError, ValueError):
+            quoted_lamports = 0
         sig = payment.pay_herd(RPC_URL, payer, invoice["payment_nonce"],
-                               int(invoice.get("message_count", 1)))
+                               int(invoice.get("message_count", 1)),
+                               declared_lamports=quoted_lamports)
         confirm = c.confirm_payment(invoice["payment_nonce"], sig)
         return json.dumps({
             "status": "sent",
@@ -239,6 +281,17 @@ def xete_alias_claim(name: str) -> str:
                 {"status": claim.get("status", "denied"), "reason": reason, "hint": hint, "name": name},
                 indent=2,
             )
+        # SPEND GATE — before our signature exists. Be clear about what this can see:
+        # `price_lamports` is DECLARED by the permit server, and the transaction we are
+        # about to sign was BUILT by that same server, so this bounds the price we were
+        # quoted, not the lamports the transaction is able to move. The claim also costs
+        # on-chain rent and gas that the quote excludes, which is what
+        # XETE_SPEND_FLOOR_LAMPORTS covers. See reviews/DDR-spend-caps-20260731.md, D2.
+        from .spendguard import authorize as _authorize_spend
+
+        _authorize_spend(int(claim.get("price_lamports") or 0), "xete_alias_claim",
+                         detail=f"name=%{name}")
+
         # add our claimer signature (we are the fee payer) and submit on-chain
         from solders.keypair import Keypair
         from solders.transaction import Transaction

@@ -1,0 +1,632 @@
+"""Tests for the client-side spend limits (src/xete_mcp/spendguard.py).
+
+Runs offline: nothing here touches the network, a real wallet, or the real ~/.xete/.
+Every test points XETE_SPEND_LEDGER at a temporary directory.
+
+Run with:  python -m pytest test_spendguard.py -v
+"""
+from __future__ import annotations
+
+import ast
+import json
+import os
+import stat
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parent
+SRC = REPO / "src"
+sys.path.insert(0, str(SRC))
+
+from xete_mcp import spendguard  # noqa: E402
+
+SPEND_ENV = [
+    spendguard.ENV_MAX,
+    spendguard.ENV_WINDOW,
+    spendguard.ENV_WINDOW_SECONDS,
+    spendguard.ENV_FLOOR,
+    spendguard.ENV_LEDGER,
+]
+
+
+@pytest.fixture()
+def ledger(tmp_path, monkeypatch):
+    """A clean ledger in a temp dir, with every spend env var under our control."""
+    for name in SPEND_ENV:
+        monkeypatch.delenv(name, raising=False)
+    path = tmp_path / ".xete" / "spend-ledger.json"
+    monkeypatch.setenv(spendguard.ENV_LEDGER, str(path))
+    monkeypatch.setenv(spendguard.ENV_FLOOR, "0")   # off unless a test is about the floor
+    return path
+
+
+def _entries(path: Path) -> list:
+    return json.loads(path.read_text())["entries"]
+
+
+# ── defaults: never unlimited ────────────────────────────────────────────────────────
+
+def test_defaults_are_conservative_and_finite(monkeypatch):
+    for name in SPEND_ENV:
+        monkeypatch.delenv(name, raising=False)
+    assert 0 < spendguard.DEFAULT_MAX_LAMPORTS < spendguard.LAMPORTS_PER_SOL
+    assert 0 < spendguard.DEFAULT_WINDOW_LAMPORTS < spendguard.LAMPORTS_PER_SOL
+    assert spendguard.DEFAULT_WINDOW_SECONDS > 0
+    assert spendguard.DEFAULT_FLOOR_LAMPORTS > 0
+    # A single spend can never exceed the window on the defaults.
+    assert spendguard.DEFAULT_MAX_LAMPORTS <= spendguard.DEFAULT_WINDOW_LAMPORTS
+
+
+def test_unset_limits_still_refuse_a_large_spend(ledger, monkeypatch):
+    monkeypatch.delenv(spendguard.ENV_FLOOR, raising=False)
+    with pytest.raises(spendguard.SpendRefused) as ex:
+        spendguard.authorize(5 * spendguard.LAMPORTS_PER_SOL, "xete_settle_create")
+    assert "per-transaction cap" in str(ex.value)
+
+
+def test_default_ledger_lives_under_dot_xete(monkeypatch):
+    monkeypatch.delenv(spendguard.ENV_LEDGER, raising=False)
+    path = spendguard.ledger_path()
+    assert path.parent.name == ".xete"
+    assert path.name == "spend-ledger.json"
+    assert path.name != "identity.json"
+
+
+# ── per-transaction cap ──────────────────────────────────────────────────────────────
+
+def test_per_transaction_cap_allows_at_the_boundary(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "1000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "100000000")
+    result = spendguard.authorize(1_000_000, "xete_send_message")
+    assert result["charged_lamports"] == 1_000_000
+
+
+def test_per_transaction_cap_refuses_one_lamport_over(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "1000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "100000000")
+    with pytest.raises(spendguard.SpendRefused) as ex:
+        spendguard.authorize(1_000_001, "xete_settle_create")
+    msg = str(ex.value)
+    assert "per-transaction cap" in msg
+    assert "1000001" in msg and "1000000" in msg          # attempted and the limit
+    assert "waiting will not help" in msg                  # tells the agent not to retry
+    assert "Nothing was signed" in msg
+    assert not ledger.exists() or _entries(ledger) == []   # a refusal records nothing
+
+
+# ── windowed cap ─────────────────────────────────────────────────────────────────────
+
+def test_window_accumulates_and_then_refuses(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "3000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW_SECONDS, "3600")
+    spendguard.authorize(1_000_000, "xete_send_message")
+    spendguard.authorize(1_000_000, "xete_send_message")
+    spendguard.authorize(1_000_000, "xete_send_message")
+    with pytest.raises(spendguard.SpendRefused) as ex:
+        spendguard.authorize(1_000_000, "xete_send_message")
+    msg = str(ex.value)
+    assert "windowed cap" in msg
+    assert "3000000" in msg                       # the limit
+    assert "1000000" in msg                       # what was attempted
+    assert "frees up at" in msg                   # when budget returns
+    assert "in 1h 0m" in msg or "in 59m" in msg   # ...expressed as a wait, too
+    assert len(_entries(ledger)) == 3             # the refused one was not recorded
+
+
+def test_window_refusal_names_a_reachable_time(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "2000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW_SECONDS, "600")
+    spendguard.authorize(2_000_000, "xete_send_message")
+    with pytest.raises(spendguard.SpendRefused) as ex:
+        spendguard.authorize(1_000_000, "xete_send_message")
+    assert "frees up at" in str(ex.value)
+    assert "never inside" not in str(ex.value)
+
+
+def test_spend_larger_than_the_whole_window_says_never(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "3000000")
+    with pytest.raises(spendguard.SpendRefused) as ex:
+        spendguard.authorize(4_000_000, "xete_settle_create")
+    assert "never inside" in str(ex.value)
+
+
+def test_entries_outside_the_window_stop_counting(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "1000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW_SECONDS, "3600")
+    spendguard.authorize(1_000_000, "xete_send_message")
+    with pytest.raises(spendguard.SpendRefused):
+        spendguard.authorize(1_000_000, "xete_send_message")
+
+    # Age the recorded spend past the window.
+    data = json.loads(ledger.read_text())
+    data["entries"][0]["ts"] -= 3601
+    ledger.write_text(json.dumps(data))
+
+    assert spendguard.authorize(1_000_000, "xete_send_message")["approved"] is True
+
+
+# ── persistence: a restart is not a fresh budget ─────────────────────────────────────
+
+def test_budget_survives_a_process_restart(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "2000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW_SECONDS, "3600")
+    monkeypatch.setenv(spendguard.ENV_FLOOR, "0")
+
+    env = dict(os.environ)
+    prog = (
+        f"import sys; sys.path.insert(0, {str(SRC)!r})\n"
+        "from xete_mcp import spendguard\n"
+        "try:\n"
+        "    spendguard.authorize(2_000_000, 'xete_send_message'); print('OK')\n"
+        "except spendguard.SpendRefused:\n"
+        "    print('REFUSED')\n"
+    )
+    first = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True, env=env)
+    second = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True, env=env)
+    assert first.stdout.strip() == "OK", first.stderr
+    # A brand new process must NOT get a fresh window.
+    assert second.stdout.strip() == "REFUSED", second.stderr
+
+
+# ── concurrency ──────────────────────────────────────────────────────────────────────
+
+def test_racing_processes_cannot_both_pass_a_check_only_one_should(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "1000000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "10000000")     # room for exactly 10
+    monkeypatch.setenv(spendguard.ENV_WINDOW_SECONDS, "3600")
+    monkeypatch.setenv(spendguard.ENV_FLOOR, "0")
+
+    env = dict(os.environ)
+    prog = (
+        f"import sys; sys.path.insert(0, {str(SRC)!r})\n"
+        "from xete_mcp import spendguard\n"
+        "try:\n"
+        "    spendguard.authorize(1_000_000, 'race'); print('OK')\n"
+        "except spendguard.SpendRefused:\n"
+        "    print('REFUSED')\n"
+    )
+
+    def run(_):
+        return subprocess.run([sys.executable, "-c", prog],
+                              capture_output=True, text=True, env=env).stdout.strip()
+
+    with ThreadPoolExecutor(max_workers=30) as pool:
+        results = list(pool.map(run, range(30)))
+
+    assert results.count("OK") == 10, results
+    assert results.count("REFUSED") == 20, results
+    total = sum(e["lamports"] for e in _entries(ledger))
+    assert total == 10_000_000       # never over the cap, not even by one lamport
+
+
+# ── ledger integrity: corruption must not reset the budget ───────────────────────────
+
+@pytest.mark.parametrize("blob", [
+    "",                                             # truncated to nothing
+    "not json at all",
+    "[]",                                           # right JSON, wrong shape
+    '{"version": 1, "entries": "lots"}',
+    '{"version": 1, "entries": [{"ts": "soon", "lamports": 5}]}',
+    '{"version": 1, "entries": [{"ts": 1.0, "lamports": -5000}]}',
+    '{"version": 1, "entries": [{"ts": 1.0, "lamports": "5000"}]}',
+    '{"version": 1, "entries": [], "last_ts": "yesterday"}',
+])
+def test_a_damaged_ledger_refuses_rather_than_resetting(ledger, monkeypatch, blob):
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(blob)
+    with pytest.raises(spendguard.SpendGuardUnavailable) as ex:
+        spendguard.authorize(1_000, "xete_send_message")
+    assert "NOT being reset" in str(ex.value)
+    assert ledger.read_text() == blob      # and it did not overwrite the evidence
+
+
+def test_an_unknown_ledger_version_refuses(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(json.dumps({"version": 999, "last_ts": 0, "entries": []}))
+    with pytest.raises(spendguard.SpendGuardUnavailable) as ex:
+        spendguard.authorize(1_000, "xete_send_message")
+    assert "version" in str(ex.value)
+
+
+def test_rolling_the_ledger_back_does_not_grant_more_than_the_window(ledger, monkeypatch):
+    """A snapshot-and-restore of the ledger is a rollback. It cannot exceed the cap,
+    because the restored file is itself subject to the same window arithmetic."""
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "2000000")
+    spendguard.authorize(1_000_000, "xete_send_message")
+    snapshot = ledger.read_text()
+    spendguard.authorize(1_000_000, "xete_send_message")
+    with pytest.raises(spendguard.SpendRefused):
+        spendguard.authorize(1_000_000, "xete_send_message")
+
+    ledger.write_text(snapshot)            # roll back one spend
+    spendguard.authorize(1_000_000, "xete_send_message")   # the rolled-back one is re-spendable
+    with pytest.raises(spendguard.SpendRefused):
+        spendguard.authorize(1_000_000, "xete_send_message")
+    # i.e. rollback replays budget but never lifts the ceiling above the window.
+
+
+def test_no_temp_files_are_left_behind(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    for _ in range(5):
+        spendguard.authorize(1_000, "xete_send_message")
+    leftovers = [p.name for p in ledger.parent.iterdir() if ".tmp" in p.name]
+    assert leftovers == []
+
+
+# ── configuration errors fail closed ─────────────────────────────────────────────────
+
+@pytest.mark.parametrize("value", ["abc", "1.5", "0x10", " ten ", "1,000", "1e6"])
+def test_malformed_limit_refuses_every_spend(ledger, monkeypatch, value):
+    monkeypatch.setenv(spendguard.ENV_MAX, value)
+    with pytest.raises(spendguard.SpendGuardUnavailable) as ex:
+        spendguard.authorize(1, "xete_send_message")
+    assert spendguard.ENV_MAX in str(ex.value)
+    assert "not a whole number" in str(ex.value)
+
+
+def test_negative_limit_refuses_every_spend(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "-1")
+    with pytest.raises(spendguard.SpendGuardUnavailable):
+        spendguard.authorize(1, "xete_send_message")
+
+
+def test_zero_cap_disables_spending_with_a_clear_reason(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "0")
+    with pytest.raises(spendguard.SpendRefused) as ex:
+        spendguard.authorize(1, "xete_send_message")
+    assert "disabled by" in str(ex.value)
+
+
+def test_floor_above_cap_is_reported_as_contradictory(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "1000")
+    monkeypatch.setenv(spendguard.ENV_FLOOR, "2000")
+    with pytest.raises(spendguard.SpendGuardUnavailable) as ex:
+        spendguard.authorize(1, "xete_send_message")
+    assert "contradictory configuration" in str(ex.value)
+
+
+def test_zero_window_seconds_is_refused(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_WINDOW_SECONDS, "0")
+    with pytest.raises(spendguard.SpendGuardUnavailable):
+        spendguard.authorize(1, "xete_send_message")
+
+
+# ── the on-chain floor ───────────────────────────────────────────────────────────────
+
+def test_a_zero_quote_still_costs_budget(ledger, monkeypatch):
+    """A free 6+ letter %name quotes 0 but still burns rent and gas. Charging the floor
+    is what stops an unbounded loop of 'free' claims from draining the wallet."""
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "5000000")
+    monkeypatch.setenv(spendguard.ENV_FLOOR, "2000000")
+    for _ in range(2):
+        assert spendguard.authorize(0, "xete_alias_claim")["charged_lamports"] == 2_000_000
+    with pytest.raises(spendguard.SpendRefused) as ex:
+        spendguard.authorize(0, "xete_alias_claim")
+    assert "windowed cap" in str(ex.value)
+    assert "quoted 0 SOL" in str(ex.value)      # honest about quote vs charge
+
+
+def test_the_floor_never_lowers_a_real_quote(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    monkeypatch.setenv(spendguard.ENV_FLOOR, "2000000")
+    assert spendguard.authorize(9_000_000, "xete_alias_claim")["charged_lamports"] == 9_000_000
+
+
+# ── the clock ────────────────────────────────────────────────────────────────────────
+
+def test_a_backwards_clock_does_not_age_spending_out_early(ledger, monkeypatch):
+    """A clock correction must not stamp new spends into the past, where a later
+    correction forwards would expire them prematurely."""
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "10000000")
+    future = time.time() + 100_000
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(json.dumps({"version": 1, "last_ts": future, "entries": []}))
+
+    spendguard.authorize(1_000, "xete_send_message")
+
+    data = json.loads(ledger.read_text())
+    assert data["entries"][0]["ts"] == pytest.approx(future, abs=1.0)
+    assert data["last_ts"] >= future
+
+
+def test_a_normal_clock_stamps_now(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    before = time.time()
+    spendguard.authorize(1_000, "xete_send_message")
+    assert _entries(ledger)[0]["ts"] == pytest.approx(before, abs=5.0)
+
+
+# ── the filesystem ───────────────────────────────────────────────────────────────────
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root ignores directory permissions")
+def test_an_unwritable_directory_refuses_the_spend(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(ledger.parent, 0o500)
+    try:
+        with pytest.raises(spendguard.SpendGuardUnavailable) as ex:
+            spendguard.authorize(1_000, "xete_send_message")
+        assert "cannot be limited" in str(ex.value)
+    finally:
+        os.chmod(ledger.parent, 0o700)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+def test_identity_json_is_never_touched(ledger, monkeypatch):
+    """~/.xete/ holds the identity keystore. The ledger shares the directory and must
+    leave the keystore, and the directory's own mode, exactly as it found them."""
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    xete_dir = ledger.parent
+    xete_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(xete_dir, 0o755)                     # deliberately NOT 0o700
+    identity = xete_dir / "identity.json"
+    identity.write_text('{"secret": "do not touch"}')
+    os.chmod(identity, 0o600)
+
+    before_dir_mode = stat.S_IMODE(xete_dir.stat().st_mode)
+    before_id = (identity.read_bytes(), stat.S_IMODE(identity.stat().st_mode),
+                 identity.stat().st_mtime_ns)
+
+    for _ in range(3):
+        spendguard.authorize(1_000, "xete_send_message")
+
+    assert stat.S_IMODE(xete_dir.stat().st_mode) == before_dir_mode
+    assert (identity.read_bytes(), stat.S_IMODE(identity.stat().st_mode),
+            identity.stat().st_mtime_ns) == before_id
+
+
+def test_the_ledger_refuses_to_be_aimed_at_the_keystore(tmp_path, monkeypatch):
+    for name in SPEND_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(spendguard.ENV_LEDGER, str(tmp_path / ".xete" / "identity.json"))
+    with pytest.raises(spendguard.SpendGuardUnavailable) as ex:
+        spendguard.authorize(1, "xete_send_message")
+    assert "identity keystore" in str(ex.value)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_a_ledger_symlinked_onto_the_keystore_cannot_destroy_it(ledger, monkeypatch):
+    """If the ledger path is a symlink pointing at the keystore, reading it must fail
+    closed and the keystore must survive untouched."""
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    identity = ledger.parent / "identity.json"
+    identity.write_text('{"secret": "do not touch"}')
+    ledger.symlink_to(identity)
+
+    with pytest.raises(spendguard.SpendGuardUnavailable):
+        spendguard.authorize(1_000, "xete_send_message")
+
+    assert identity.read_text() == '{"secret": "do not touch"}'
+    assert identity.is_file() and not identity.is_symlink()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+def test_a_directory_we_create_is_private(tmp_path, monkeypatch):
+    for name in SPEND_ENV:
+        monkeypatch.delenv(name, raising=False)
+    path = tmp_path / "fresh" / ".xete" / "spend-ledger.json"
+    monkeypatch.setenv(spendguard.ENV_LEDGER, str(path))
+    spendguard.authorize(1_000, "xete_send_message")
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+# ── housekeeping ─────────────────────────────────────────────────────────────────────
+
+def test_compaction_preserves_the_total(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "1000000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW_SECONDS, "86400")
+    now = time.time()
+    entries = [{"ts": now - i, "lamports": 100, "path": "x", "detail": ""}
+               for i in range(spendguard.MAX_ENTRIES + 500)]
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(json.dumps({"version": 1, "last_ts": now, "entries": entries}))
+
+    spendguard.authorize(50, "xete_send_message")
+
+    after = _entries(ledger)
+    assert len(after) <= spendguard.MAX_ENTRIES
+    assert sum(e["lamports"] for e in after) == 100 * len(entries) + 50
+
+
+def test_status_reports_the_limits_and_the_remaining_budget(ledger, monkeypatch):
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "5000000")
+    spendguard.authorize(1_000_000, "xete_send_message")
+    s = spendguard.status()
+    assert s["enforced"] is True
+    assert s["per_transaction_max_lamports"] == 10_000_000
+    assert s["window_spent_lamports"] == 1_000_000
+    assert s["window_remaining_lamports"] == 4_000_000
+    assert s["transactions_in_window"] == 1
+    assert "error" not in s
+
+
+def test_status_surfaces_a_broken_ledger_instead_of_lying(ledger, monkeypatch):
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text("garbage")
+    s = spendguard.status()
+    assert "error" in s and s["enforced"] is True
+
+
+# ── the anti-bypass tripwire ─────────────────────────────────────────────────────────
+#
+# A gate that one path routes around is worthless. This walks the AST of every module in
+# src/xete_mcp and finds every function that submits a transaction, adds a signature, or
+# loads a signing key. The result must match the table below EXACTLY: a new spending path
+# fails this test until somebody either gates it or writes down why it needs no gate.
+
+SUBMIT_OR_SIGN = {"send_transaction", "send_raw_transaction", "partial_sign"}
+KEY_LOADERS = {("Keypair", "from_seed"), ("Keypair", "from_bytes")}
+
+EXPECTED_TOUCHPOINTS = {
+    ("payment.py", "pay_herd"):
+        "GATED — calls spendguard.authorize before building or signing anything",
+    ("settlement.py", "_send"):
+        "EXEMPT — shared submitter. Its only spending caller, deposit(), gates before "
+        "calling it; claim() and reclaim() are income, see below",
+    ("server.py", "_load_payer"):
+        "EXEMPT — reads the payer keypair but spends nothing itself; every consumer is gated",
+    ("server.py", "xete_alias_claim"):
+        "GATED — calls spendguard.authorize before tx.partial_sign",
+    ("server.py", "xete_settle_create"):
+        "GATED indirectly — the spend happens inside settlement.deposit, which gates",
+    ("server.py", "xete_settle_claim"):
+        "EXEMPT — income. Claiming funds addressed to this agent; a cap here would block a "
+        "user from collecting money owed to them",
+    ("server.py", "xete_settle_reclaim"):
+        "EXEMPT — income. Recovering this agent's own deposit; net positive",
+}
+
+GATED_DIRECTLY = [
+    ("payment.py", "pay_herd"),
+    ("settlement.py", "deposit"),
+    ("server.py", "xete_alias_claim"),
+]
+
+
+def _touchpoints():
+    found = {}
+    for pyfile in sorted((SRC / "xete_mcp").glob("*.py")):
+        tree = ast.parse(pyfile.read_text(encoding="utf-8"), filename=str(pyfile))
+        for func in [n for n in ast.walk(tree)
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            for node in ast.walk(func):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                    continue
+                attr = node.func.attr
+                hit = attr in SUBMIT_OR_SIGN or (
+                    isinstance(node.func.value, ast.Name)
+                    and (node.func.value.id, attr) in KEY_LOADERS
+                )
+                if hit:
+                    found.setdefault((pyfile.name, func.name), []).append((attr, node.lineno))
+    return found
+
+
+def test_every_signing_site_is_gated_or_explicitly_exempt():
+    found = set(_touchpoints())
+    expected = set(EXPECTED_TOUCHPOINTS)
+    unclassified = found - expected
+    assert not unclassified, (
+        "New code submits a transaction, signs, or loads a signing key in a function that "
+        "the spend gate does not know about:\n  "
+        + "\n  ".join(f"{f}:{fn}" for f, fn in sorted(unclassified))
+        + "\n\nEither call spendguard.authorize() before it spends, or add it to "
+          "EXPECTED_TOUCHPOINTS with the reason it needs no gate."
+    )
+    assert not (expected - found), (
+        "A known signing site disappeared; update EXPECTED_TOUCHPOINTS: "
+        f"{sorted(expected - found)}"
+    )
+
+
+def test_the_gated_paths_really_call_the_gate_before_they_sign():
+    for filename, funcname in GATED_DIRECTLY:
+        tree = ast.parse((SRC / "xete_mcp" / filename).read_text(encoding="utf-8"))
+        func = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == funcname)
+
+        gate_lines, sign_lines = [], []
+        for node in ast.walk(func):
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+                if name in ("authorize", "_authorize_spend"):
+                    gate_lines.append(node.lineno)
+                if getattr(node.func, "attr", None) in SUBMIT_OR_SIGN:
+                    sign_lines.append(node.lineno)
+
+        assert gate_lines, f"{filename}:{funcname} never calls the spend gate"
+        if sign_lines:
+            assert min(gate_lines) < min(sign_lines), (
+                f"{filename}:{funcname} signs at line {min(sign_lines)} before gating at "
+                f"line {min(gate_lines)} — the gate must run first"
+            )
+
+
+# ── the gate is really wired, not merely present in the source ───────────────────────
+
+@pytest.fixture()
+def no_network():
+    class Bomb:
+        def __init__(self, *_a, **_k):
+            raise AssertionError("execution reached the RPC client — the gate did not stop it")
+    return Bomb
+
+
+def test_pay_herd_refuses_before_touching_the_network(ledger, monkeypatch, no_network):
+    from xete_mcp import payment
+
+    monkeypatch.setattr(payment, "Client", no_network)
+    monkeypatch.setenv(spendguard.ENV_MAX, "1000000")
+    with pytest.raises(spendguard.SpendRefused):
+        payment.pay_herd("http://127.0.0.1:1", object(), "nonce-1", 50)
+
+
+def test_pay_herd_uses_the_derived_cost_when_the_server_understates_the_quote(
+        ledger, monkeypatch, no_network):
+    """A server that quotes 1 lamport for 50 blobs must not shrink what the gate checks."""
+    from xete_mcp import payment
+
+    monkeypatch.setattr(payment, "Client", no_network)
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    with pytest.raises(spendguard.SpendRefused) as ex:
+        payment.pay_herd("http://127.0.0.1:1", object(), "n", 50, declared_lamports=1)
+    assert "50000000" in str(ex.value)      # 50 blobs derived on this side, not the quoted 1
+
+
+def test_settlement_deposit_refuses_before_touching_the_network(ledger, monkeypatch, no_network):
+    from xete_mcp import settlement
+
+    monkeypatch.setattr(settlement, "Client", no_network)
+    monkeypatch.setenv(spendguard.ENV_MAX, "1000000")
+    with pytest.raises(spendguard.SpendRefused):
+        settlement.deposit("http://127.0.0.1:1", object(), object(), 2_000_000)
+
+
+def test_an_allowed_spend_passes_the_gate_and_is_recorded(ledger, monkeypatch):
+    """The other direction: within limits, execution continues and the ledger records it."""
+    from xete_mcp import settlement
+
+    reached = []
+
+    class Marker:
+        def __init__(self, *_a, **_k):
+            reached.append(True)
+            raise RuntimeError("stop here — no network wanted in a unit test")
+
+    monkeypatch.setattr(settlement, "Client", Marker)
+    monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
+    with pytest.raises(RuntimeError, match="stop here"):
+        settlement.deposit("http://127.0.0.1:1", object(), object(), 1_000_000)
+
+    assert reached, "the gate refused a spend that was within limits"
+    assert _entries(ledger)[0]["lamports"] == 1_000_000
+    assert _entries(ledger)[0]["path"] == "xete_settle_create"
+
+
+def test_there_is_no_way_to_switch_the_gate_off():
+    """No env var, argument or constant may mean 'unlimited'."""
+    source = (SRC / "xete_mcp" / "spendguard.py").read_text(encoding="utf-8")
+    for forbidden in ("XETE_SPEND_DISABLE", "XETE_SPEND_ENABLED", "XETE_NO_SPEND_LIMIT",
+                      "float('inf')", 'float("inf")', "math.inf", "sys.maxsize"):
+        assert forbidden not in source, f"spendguard.py contains an escape hatch: {forbidden}"

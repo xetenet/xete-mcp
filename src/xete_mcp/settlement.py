@@ -74,7 +74,16 @@ def _send(client: Client, signers, ixs, payer: Keypair, label: str) -> str:
 
 def deposit(rpc_url: str, depositor: Keypair, recipient: Pubkey, amount_lamports: int):
     """Open a settlement: lock `amount_lamports` for `recipient` (hidden as a commitment). Returns
-    (escrow_id_hex, salt_hex, pda_str, sig). The recipient needs escrow_id + salt to claim."""
+    (escrow_id_hex, salt_hex, pda_str, sig). The recipient needs escrow_id + salt to claim.
+
+    SPEND GATE. The client-side limits are checked HERE, before the depositor key is used,
+    so every caller is covered — not only the MCP tool. `amount_lamports` is the whole value
+    being locked away, and once it is locked only the depositor (reclaim) or the hidden
+    beneficiary (claim) can move it again."""
+    from .spendguard import authorize
+
+    authorize(int(amount_lamports), "xete_settle_create", detail=f"recipient={recipient}")
+
     client = Client(rpc_url)
     prog = program_id()
     eid = bytes(Keypair().pubkey())        # random 32-byte escrow id (never derived from the recipient)
