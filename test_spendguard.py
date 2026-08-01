@@ -8,9 +8,13 @@ Run with:  python -m pytest test_spendguard.py -v
 from __future__ import annotations
 
 import ast
+import base64
+import hashlib
+import importlib
 import json
 import os
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -471,12 +475,50 @@ def test_status_surfaces_a_broken_ledger_instead_of_lying(ledger, monkeypatch):
 # ── the anti-bypass tripwire ─────────────────────────────────────────────────────────
 #
 # A gate that one path routes around is worthless. This walks the AST of every module in
-# src/xete_mcp and finds every function that submits a transaction, adds a signature, or
+# src/xete_mcp and finds every place that submits a transaction, adds a signature, or
 # loads a signing key. The result must match the table below EXACTLY: a new spending path
 # fails this test until somebody either gates it or writes down why it needs no gate.
+#
+# FINDING [F2]. The first version of this scan was name-based and evadable two ways, both
+# demonstrated by the reviewer against this very package:
+#
+#   (a) it globbed `(SRC/"xete_mcp").glob("*.py")` — NON-recursive — so any module added
+#       in a subpackage was invisible to it. `rglob` now.
+#   (b) its name lists were short of real spellings that already work here:
+#       `Keypair.from_base58_string`, `tx.sign(...)`, `send_and_confirm_transaction`, an
+#       aliased import (`from solders.keypair import Keypair as KP` defeated a scan that
+#       compared the LOCAL name), and a raw JSON-RPC `sendTransaction` posted through
+#       httpx or requests, which names no solana symbol at all.
+#   (c) it only walked FunctionDef/AsyncFunctionDef, so module-level code — which runs at
+#       import, before any caller can gate anything — was never scanned.
+#
+# All three are closed below, and `test_the_tripwire_sees_past_every_way_around_its_name_list`
+# builds a scratch subpackage that uses every one of those spellings and asserts each is
+# caught. A name list can never be complete; what it can be is wide enough that going
+# around it is a deliberate act rather than an ordinary import.
 
-SUBMIT_OR_SIGN = {"send_transaction", "send_raw_transaction", "partial_sign"}
-KEY_LOADERS = {("Keypair", "from_seed"), ("Keypair", "from_bytes")}
+# Adding a signature to a transaction, or putting one on the wire. Used BOTH by the census
+# below and by the gate-ordering rule in `_assert_gate_discipline`.
+SUBMIT_OR_SIGN = {"send_transaction", "send_raw_transaction",
+                  "send_and_confirm_transaction", "partial_sign"}
+
+# The census is wider than the ordering rule: a bare `.sign(...)` is any use of a private
+# key, transaction or not. It is deliberately NOT in SUBMIT_OR_SIGN, because
+# `xete_alias_claim` legitimately signs the permit server's AUTH CHALLENGE before the spend
+# gate runs — that signature moves no money — and an ordering rule that counted it would
+# have to be weakened to something that no longer says "gate before you spend".
+KEY_USE_CALLS = SUBMIT_OR_SIGN | {"sign"}
+
+# Loading an EXISTING private key. `Keypair()` (fresh, random) is not a loader.
+KEY_LOADER_METHODS = {"from_seed", "from_bytes", "from_base58_string"}
+# Matched against the IMPORTED path, so `from solders.keypair import Keypair as KP` is
+# still Keypair. The bare spelling stays as a fallback for a name this scan cannot resolve
+# to an import — over-flagging is the safe direction for a tripwire.
+KEY_CLASSES = {"solders.keypair.Keypair", "Keypair"}
+
+# A transaction submitted as raw JSON-RPC names no library symbol at all: the only thing
+# that identifies it is the method string in the request body.
+RPC_SUBMIT_METHOD = "sendTransaction"
 
 EXPECTED_TOUCHPOINTS = {
     ("payment.py", "pay_herd"):
@@ -487,7 +529,9 @@ EXPECTED_TOUCHPOINTS = {
     ("server.py", "_load_payer"):
         "EXEMPT — reads the payer keypair but spends nothing itself; every consumer is gated",
     ("server.py", "xete_alias_claim"):
-        "GATED — calls spendguard.authorize before txguard.approve_and_sign",
+        "GATED — calls spendguard.authorize before txguard.approve_and_sign. Its earlier "
+        "`.sign()` is the permit server's auth challenge, which signguard validates and "
+        "which moves nothing",
     ("txguard.py", "approve_and_sign"):
         "EXEMPT — the signing chokepoint itself. It signs nothing it was not handed a "
         "matching ClaimInspection for, and its only caller in this package is "
@@ -523,6 +567,25 @@ EXPECTED_TOUCHPOINTS = {
     ("server.py", "xete_my_identity"):
         "EXEMPT — reports identity and spend limits. It touches _load_payer to say whether "
         "a payer is configured and never builds, signs or submits anything",
+    # The three below are new to the table only because the census now sees `.sign(...)`.
+    # None of them spends; all three are places the identity key is used, which is exactly
+    # what a census of key use is for.
+    ("client.py", "derive_x25519_secret"):
+        "EXEMPT — signs the ONE reserved derivation constant with nacl to produce the "
+        "messaging secret. Spends nothing; the signature never leaves the process (only "
+        "SHA256 of it does), and signguard refuses this constant everywhere else",
+    ("client.py", "login"):
+        "EXEMPT — signs the relay's auth challenge, after validate_relay_auth_challenge "
+        "has proved it is the template bound to our nonce. An authentication signature "
+        "over printable ASCII moves no lamports",
+    ("signguard.py", "sign"):
+        "EXEMPT — GuardedSigningKey.sign IS the guard: it runs assert_signable and only "
+        "then delegates to nacl. Refusing binary is its whole job",
+    ("client.py", "__post_init__"):
+        "EXEMPT — Identity.__post_init__ derives the messaging key at construction by "
+        "calling derive_x25519_secret, which is itself exempt above. Visible only through "
+        "the transitive pass; its whole body is bytes/len/append plus that one call, and it "
+        "builds, signs and submits nothing",
 }
 
 GATED_DIRECTLY = [
@@ -532,66 +595,199 @@ GATED_DIRECTLY = [
 ]
 
 
-def _direct_hit(node) -> str | None:
-    """The submit/sign/key-load call name, if this node is one. Attribute calls only."""
-    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-        return None
-    attr = node.func.attr
-    if attr in SUBMIT_OR_SIGN:
-        return attr
-    if isinstance(node.func.value, ast.Name) and (node.func.value.id, attr) in KEY_LOADERS:
-        return attr
-    return None
+def _with_local_helpers(found: dict, root: Path) -> dict:
+    """Extend `found` through module-local helper calls, to a fixed point.
 
+    THE HOLE: every money function in settlement.py submits through `_send(...)`, a
+    module-local ast.NAME call. A scanner that only classifies attribute calls cannot see
+    the idiom this package actually uses, so the control meant to catch an ungated spending
+    path was blind to the spelling that path would be written in. Reproduced: a
+    `sweep_everything()` calling `_send(...)` left every meta-test green.
 
-def _touchpoints():
-    """Every function that submits or signs -- DIRECTLY, or through a module-local helper.
-
-    THE HOLE THIS CLOSES: the scan used to `continue` on anything that was not an
-    ast.Attribute call, and every money function in settlement.py submits through the
-    module-local helper `_send(...)`, which is an ast.NAME call. So the control that exists
-    to catch an ungated spending path could not see the idiom this codebase actually uses.
-    Reproduced by an outside reviewer: appending a plausible `sweep_everything()` calling
-    `_send(...)` to a copy of settlement.py left every meta-test GREEN, while the same
-    function calling `client.send_transaction` directly went RED.
-
-    A name-based scan that misses the local convention is worse than no scan, because it
-    reports success. So: find helpers that themselves submit, then treat a call to one of
-    them as a submission too, to a FIXED POINT -- a helper calling a helper calling a
-    submitter is still a spending path.
+    A helper calling a helper calling a submitter is still a spending path, so this runs to
+    a fixed point rather than one level deep.
     """
-    parsed = {}
-    for pyfile in sorted((SRC / "xete_mcp").rglob("*.py")):   # rglob: a subpackage was invisible
-        parsed[pyfile.name] = ast.parse(pyfile.read_text(encoding="utf-8"), filename=str(pyfile))
-
-    # Pass 1 -- direct submitters, per file.
-    direct = {}
-    for name, tree in parsed.items():
-        for func in [n for n in ast.walk(tree)
-                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
-            for node in ast.walk(func):
-                hit = _direct_hit(node)
-                if hit:
-                    direct.setdefault((name, func.name), []).append((hit, node.lineno))
-
-    # Pass 2 -- transitive closure over module-local Name calls, within each file.
-    found = dict(direct)
     changed = True
     while changed:
         changed = False
-        for name, tree in parsed.items():
-            submitters = {fn for (f, fn) in found if f == name}
-            for func in [n for n in ast.walk(tree)
-                         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
-                if (name, func.name) in found:
+        for pyfile in sorted(root.rglob("*.py")):
+            name = pyfile.relative_to(root).as_posix()
+            tree = ast.parse(pyfile.read_text(encoding="utf-8"), filename=str(pyfile))
+            known = {scope for (f, scope) in found if f == name}
+            for scope, stmts in _scopes(tree):
+                if (name, scope) in found:
                     continue
-                for node in ast.walk(func):
-                    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                            and node.func.id in submitters):
-                        found[(name, func.name)] = [(f"-> {node.func.id}()", node.lineno)]
+                for call in _calls_in(stmts):
+                    if isinstance(call.func, ast.Name) and call.func.id in known:
+                        found[(name, scope)] = [(f"-> {call.func.id}()", call.lineno)]
                         changed = True
                         break
     return found
+
+
+def _import_aliases(tree) -> dict:
+    """local name -> the dotted path it was imported from.
+
+    Every Import/ImportFrom in the module, not just the top-level ones: this package
+    imports solders INSIDE functions on several paths, and a scan that only read
+    module-level imports would resolve those names to nothing.
+    """
+    out = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                out[alias.asname or alias.name.split(".")[0]] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for alias in node.names:
+                out[alias.asname or alias.name] = f"{module}.{alias.name}" if module else alias.name
+    return out
+
+
+def _scopes(tree):
+    """(name, statements) for every function AND for the module's own body.
+
+    Module-level code runs at import — before any caller exists to gate it — so it is
+    scanned as a synthetic function called `<module>`. Class bodies are module-level code
+    too and are folded in; a `def` inside a class is a function and gets its own scope.
+    """
+    def module_level(body):
+        keep = []
+        for stmt in body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if isinstance(stmt, ast.ClassDef):
+                keep.extend(module_level(stmt.body))
+                continue
+            keep.append(stmt)
+        return keep
+
+    scopes = [("<module>", module_level(tree.body))]
+    scopes += [(n.name, n.body) for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    return scopes
+
+
+def _calls_in(stmts):
+    """Every Call reachable from `stmts` without descending into a nested `def`.
+
+    Nested functions are visited as their own scope, so descending would report the same
+    call twice under two different names.
+    """
+    out = []
+
+    def rec(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return
+        if isinstance(node, ast.Call):
+            out.append(node)
+        for child in ast.iter_child_nodes(node):
+            rec(child)
+
+    for stmt in stmts:
+        rec(stmt)
+    return out
+
+
+def _why_flagged(call, aliases):
+    """Why this call uses a key, or None. The reason string is for the failure message."""
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        if func.attr in KEY_USE_CALLS:
+            return func.attr
+        if func.attr in KEY_LOADER_METHODS and isinstance(func.value, ast.Name):
+            base = func.value.id
+            if aliases.get(base, base) in KEY_CLASSES:
+                return f"{base}.{func.attr}"
+    # Raw JSON-RPC: the method name is a string somewhere in the arguments, typically
+    # `json={"method": "sendTransaction", ...}`. Walk the whole call so it does not matter
+    # whether it arrived positionally, as a keyword, or nested in a dict.
+    for node in ast.walk(call):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                and RPC_SUBMIT_METHOD in node.value:
+            return f"json-rpc {RPC_SUBMIT_METHOD}"
+    return None
+
+
+def _touchpoints(root: Path | None = None) -> dict:
+    """{(module path, scope): [(why, line)]} for every key-using site under `root`.
+
+    `root` is a parameter so the evasion test below can point it at a scratch package
+    instead of at src/. rglob, not glob: a module one directory down was invisible.
+    """
+    root = root if root is not None else (SRC / "xete_mcp")
+    found = {}
+    for pyfile in sorted(root.rglob("*.py")):
+        tree = ast.parse(pyfile.read_text(encoding="utf-8"), filename=str(pyfile))
+        aliases = _import_aliases(tree)
+        name = pyfile.relative_to(root).as_posix()
+        for scope, stmts in _scopes(tree):
+            for call in _calls_in(stmts):
+                why = _why_flagged(call, aliases)
+                if why:
+                    found.setdefault((name, scope), []).append((why, call.lineno))
+    return _with_local_helpers(found, root)
+    return found
+
+
+# A module that spends without gating, written five ways the ORIGINAL name-based scan
+# could not see. It lives in a subpackage because the original glob was not recursive.
+_EVASIVE_SPENDER = '''
+"""Ungated spending, spelled so that a name list has to work for its living."""
+import httpx
+from solders.keypair import Keypair as KP
+
+# Runs at import. The original scan only walked function bodies, so this was invisible
+# no matter what it was spelled as.
+_HOT_KEY = KP.from_base58_string("4wBqpZM9...")
+
+
+def aliased_import(seed):
+    return KP.from_seed(seed)
+
+
+def transaction_sign(tx, keypair):
+    tx.sign([keypair], tx.message.recent_blockhash)
+
+
+def confirm_and_send(client, tx):
+    return client.send_and_confirm_transaction(tx)
+
+
+def raw_json_rpc(url, raw):
+    return httpx.post(url, json={"jsonrpc": "2.0", "id": 1,
+                                 "method": "sendTransaction", "params": [raw]})
+'''
+
+
+def test_the_tripwire_sees_past_every_way_around_its_name_list(tmp_path):
+    """Finding [F2]: each of these was demonstrated against the previous scan, and each
+    one is a spelling that works today with the libraries this package already depends on.
+
+    Written as a permanent test rather than a one-off scratch file, because the reason the
+    holes existed is that nothing was checking. The scratch package is built in tmp_path
+    and thrown away with it.
+    """
+    pkg = tmp_path / "xete_mcp"
+    (pkg / "deeper").mkdir(parents=True)
+    (pkg / "deeper" / "spender.py").write_text(_EVASIVE_SPENDER, encoding="utf-8")
+
+    found = _touchpoints(pkg)
+    reasons = {scope: [why for why, _line in hits] for (_f, scope), hits in found.items()}
+
+    assert all(f == "deeper/spender.py" for f, _s in found), (
+        f"a module one directory down was not scanned at all: {sorted(found)}")
+    assert "from_base58_string" in " ".join(reasons.get("<module>", [])), (
+        "a key loaded at MODULE level, which runs at import, was not seen: "
+        f"{reasons}")
+    assert reasons.get("aliased_import") == ["KP.from_seed"], (
+        f"an aliased `Keypair as KP` import defeated the loader check: {reasons}")
+    assert reasons.get("transaction_sign") == ["sign"], f"tx.sign() was missed: {reasons}"
+    assert reasons.get("confirm_and_send") == ["send_and_confirm_transaction"], (
+        f"send_and_confirm_transaction was missed: {reasons}")
+    assert reasons.get("raw_json_rpc") == [f"json-rpc {RPC_SUBMIT_METHOD}"], (
+        f"a raw JSON-RPC submission through httpx names no solana symbol and was "
+        f"missed: {reasons}")
 
 
 def test_every_signing_site_is_gated_or_explicitly_exempt():
@@ -876,3 +1072,476 @@ def test_there_is_no_way_to_switch_the_gate_off():
     for forbidden in ("XETE_SPEND_DISABLE", "XETE_SPEND_ENABLED", "XETE_NO_SPEND_LIMIT",
                       "float('inf')", 'float("inf")', "math.inf", "sys.maxsize"):
         assert forbidden not in source, f"spendguard.py contains an escape hatch: {forbidden}"
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════
+# FINDING [F1] — eight guards that were STATED and not held in place
+#
+# Each of the eight was deleted, one at a time, in a scratch copy of the source and the
+# whole 677-test suite stayed green. A guard nothing asserts is a comment. Everything
+# below drives the published `xete_alias_claim` tool end to end against a hostile permit
+# server, so what is asserted is what the TOOL does — refuses, signs nothing, submits
+# nothing — not that a particular line still exists.
+#
+# The last of the eight is the worst: replacing
+#     from .spendguard import authorize as _authorize_spend
+# on the claim path with a no-op left 677 tests passing, because every signing test in the
+# repo RAISES XETE_SPEND_MAX_LAMPORTS out of the way (test_signing_regression._accepting
+# sets it to 100,000,000) so that the transaction guards can be exercised. Nothing ever
+# lowered it and watched the tool refuse. `test_the_claim_tool_refuses_when_the_spend_cap_binds`
+# is that missing test.
+# ═════════════════════════════════════════════════════════════════════════════════════
+
+_CLAIM_SEED = bytes([23] * 32)
+_CLAIM_AGENT_ID = "agent-1"
+_CLAIM_NAME = "mcptestname"
+_ALIAS_PROGRAM = "AXTREGuYbpgcWFbZy124jcWDN2nd7mtmrCDsUojktZrd"
+_SYSTEM_PROGRAM = "11111111111111111111111111111111"
+_COMPUTE_BUDGET = "ComputeBudget111111111111111111111111111111"
+# config.names_wallet as the live registry carries it. Pinned here through the documented
+# XETE_ALIAS_TREASURY override so these tests need no network.
+_CLAIM_TREASURY = "9zHPVcHhBeZBCLcw8NMWvAQqLWmMNBrcuiYVwyUcwFds"
+# What an HONEST claim costs beyond its price: alias PDA rent + a two-signature fee.
+_RENT_AND_FEE = 1_628_640 + 10_000
+
+
+class _PermitResponse:
+    """Enough of a requests.Response for safehttp's streaming reader."""
+
+    def __init__(self, payload):
+        self._payload = payload
+        self.status_code = 200
+        self.text = json.dumps(payload)
+        self.headers = {}
+        self.reason = "OK"
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        return None
+
+    def iter_content(self, chunk_size=1):
+        yield self.text.encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def close(self):
+        pass
+
+
+def _solders():
+    from solders.hash import Hash
+    from solders.instruction import AccountMeta, CompiledInstruction, Instruction
+    from solders.keypair import Keypair
+    from solders.message import Message
+    from solders.pubkey import Pubkey
+    from solders.signature import Signature
+    from solders.transaction import Transaction
+    return (Hash, AccountMeta, CompiledInstruction, Instruction, Keypair, Message,
+            Pubkey, Signature, Transaction)
+
+
+def _claim_data(name=_CLAIM_NAME, price=0, trailing=0) -> bytes:
+    """02 | u8 name_len | name | 32-byte record key | u64 price — the mainnet layout."""
+    raw = name.encode()
+    record = hashlib.sha256(_CLAIM_AGENT_ID.encode()).digest()
+    return bytes([2, len(raw)]) + raw + record + struct.pack("<Q", price) + b"\x00" * trailing
+
+
+def _claim_message(pubkey, *, price=0, system=None, data=None, extra_ixs=()):
+    """The message the permit server serves today, with one knob per guard under test."""
+    Hash, AccountMeta, _, Instruction, _, Message, Pubkey, _, _ = _solders()
+    program = Pubkey.from_string(_ALIAS_PROGRAM)
+    me = Pubkey.from_string(pubkey)
+    accounts = [
+        AccountMeta(me, True, True),                                    # payer
+        AccountMeta(me, True, True),                                    # claim authority
+        AccountMeta(Pubkey.find_program_address(
+            [b"alias", _CLAIM_NAME.encode()], program)[0], False, True),
+        AccountMeta(Pubkey.find_program_address([b"config"], program)[0], False, False),
+        AccountMeta(Pubkey.from_string(_CLAIM_TREASURY), False, True),
+        AccountMeta(Pubkey.from_string(system or _SYSTEM_PROGRAM), False, False),
+    ]
+    claim = Instruction(program_id=program,
+                        data=_claim_data(price=price) if data is None else data,
+                        accounts=accounts)
+    return Message.new_with_blockhash([claim, *extra_ixs], me, Hash.default())
+
+
+def _b64(tx) -> str:
+    return base64.b64encode(bytes(tx)).decode()
+
+
+def _honest_claim(pubkey, **kw) -> str:
+    _, _, _, _, _, _, _, _, Transaction = _solders()
+    return _b64(Transaction.new_unsigned(_claim_message(pubkey, **kw)))
+
+
+def _with_extra_keys(message, extras):
+    """The same message with `extras` appended to the account list, unreferenced.
+
+    `num_readonly_unsigned_accounts` grows by the same amount, so the WRITABILITY of every
+    account the claim instruction names is byte-for-byte what it was. Without that the
+    added keys would silently flip the System-program slot writable and the test would be
+    passing for a reason that has nothing to do with the account-count bound.
+    """
+    Hash, _, _, _, _, Message, _, _, _ = _solders()
+    header = message.header
+    return Message.new_with_compiled_instructions(
+        header.num_required_signatures,
+        header.num_readonly_signed_accounts,
+        header.num_readonly_unsigned_accounts + len(extras),
+        list(message.account_keys) + list(extras),
+        Hash.default(),
+        list(message.instructions),
+    )
+
+
+class _ClaimHarness:
+    """Drives `xete_alias_claim` against a permit server that serves whatever we hand it.
+
+    Records what was SIGNED and what was SUBMITTED separately, because "the tool returned
+    an error" and "the tool refused before using the key" are different claims and only
+    the second one is a security property.
+    """
+
+    def __init__(self, server, pubkey, signed, submitted, ledger):
+        self.server = server
+        self.pubkey = pubkey
+        self.signed = signed
+        self.submitted = submitted
+        self.ledger = ledger
+        self.sim_debit = _RENT_AND_FEE
+
+    # max_price defaults to None -- "no opinion" -- NOT 0. Since 3a9177c those are
+    # different: 0 means "this claim MUST BE FREE" and is a real ceiling, which would
+    # refuse every priced claim in this file. This harness predates that fix.
+    def run(self, tx_b64, *, price=0, name=_CLAIM_NAME, max_price=None) -> dict:
+        self.serve(tx_b64, price=price)
+        return json.loads(self.server.xete_alias_claim(name, max_price_lamports=max_price))
+
+    def serve(self, tx_b64, *, price=0):
+        self._tx_b64, self._price = tx_b64, price
+
+    def _post(self, url, json=None, timeout=None, **_kw):
+        if url.endswith("/alias/claim/challenge"):
+            nonce = "48aSgGfAhcHvDJwwFNG3jh"
+            return _PermitResponse({
+                "nonce": nonce, "expires_in": 300,
+                "message": (f"xete alias claim\npubkey:{self.pubkey}\nnonce:{nonce}"
+                            f"\nts:{int(time.time())}"),
+            })
+        if url.endswith("/alias/claim"):
+            return _PermitResponse({"status": "approved", "price_lamports": self._price,
+                                    "free_grace": True, "transaction": self._tx_b64})
+        if url.endswith("/alias/claim/confirm"):
+            return _PermitResponse({"status": "confirmed"})
+        raise AssertionError(f"unexpected permit call {url}")
+
+
+@pytest.fixture()
+def claim(tmp_path, monkeypatch):
+    """An isolated identity, ledger and permit server, with the RPC faked into agreeing.
+
+    Deliberately permissive by default: the spend cap is set high and simulation is made
+    to answer, so that a transaction reaching this fixture is refused ONLY by the guard
+    the test is about. When a test wants the cap to bind it lowers it itself.
+    """
+    for name in SPEND_ENV:
+        monkeypatch.delenv(name, raising=False)
+    ledger_path = tmp_path / "ledger.json"
+    monkeypatch.setenv("XETE_IDENTITY", str(tmp_path / "identity.json"))
+    monkeypatch.setenv(spendguard.ENV_LEDGER, str(ledger_path))
+    monkeypatch.setenv(spendguard.ENV_MAX, "100000000")
+    monkeypatch.setenv(spendguard.ENV_WINDOW, "100000000")
+    monkeypatch.setenv("XETE_PERMIT_URL", "https://permit.invalid")
+    monkeypatch.setenv("XETE_SERVER_URL", "https://relay.invalid")
+    monkeypatch.setenv("XETE_RPC_URL", "https://rpc.invalid")
+    monkeypatch.setenv("XETE_ALIAS_TREASURY", _CLAIM_TREASURY)
+    (tmp_path / "identity.json").write_text(json.dumps({
+        "ed_seed": base64.b64encode(_CLAIM_SEED).decode(), "agent_id": _CLAIM_AGENT_ID}))
+
+    import xete_mcp.server as server
+    server = importlib.reload(server)
+    from xete_mcp.client import load_or_create_identity
+
+    pubkey = load_or_create_identity(server.IDENTITY_PATH).pubkey_b58
+    signed, submitted = [], []
+
+    class _Rpc:
+        """Accepts and confirms. A refusing mock cannot tell 'the guard stopped it' from
+        'the fake RPC stopped it', and every guard here is supposed to fire first."""
+
+        def __init__(self, *_a, **_k):
+            pass
+
+        def send_raw_transaction(self, raw, *_a, **_kw):
+            submitted.append(bytes(raw))
+
+            class _R:
+                value = "5ig"
+            return _R()
+
+        def get_signature_statuses(self, *_a, **_kw):
+            class _S:
+                confirmation_status = "confirmed"
+                err = None
+
+            class _R:
+                value = [_S()]
+            return _R()
+
+    import solana.rpc.api
+
+    monkeypatch.setattr(solana.rpc.api, "Client", _Rpc)
+
+    harness = _ClaimHarness(server, pubkey, signed, submitted, ledger_path)
+
+    real_sign = server.txguard_mod.approve_and_sign
+
+    def _spy_sign(tx, inspection, keypair):
+        signed.append(inspection.message_sha256)
+        return real_sign(tx, inspection, keypair)
+
+    monkeypatch.setattr(server.txguard_mod, "approve_and_sign", _spy_sign)
+    monkeypatch.setattr(server.txguard_mod, "simulated_debit",
+                        lambda *_a, **_k: harness.sim_debit)
+    monkeypatch.setattr(server.requests, "post", harness._post)
+    # safehttp dispatches through requests.request, not requests.post.
+    monkeypatch.setattr(server.requests, "request",
+                        lambda method, url, **kw: harness._post(url, **kw))
+    return harness
+
+
+def _refused(harness, result):
+    """Assert the tool refused AND that no key was used and nothing left the machine."""
+    assert result.get("status") == "refused", result
+    assert result.get("signed") is False and result.get("submitted") is False, result
+    assert not harness.signed, "the transaction was SIGNED before it was refused"
+    assert not harness.submitted, "the transaction was SUBMITTED on-chain"
+    return result["reason"]
+
+
+def test_the_harness_lets_an_honest_claim_through(claim):
+    """The over-refusal guard for everything below. If this fixture refused every claim,
+    the eight tests that follow would pass while asserting nothing at all — which is the
+    exact failure mode that let the eight guards rot in the first place."""
+    result = claim.run(_honest_claim(claim.pubkey))
+
+    assert result["status"] == "claimed", result
+    assert claim.signed and claim.submitted, result
+    assert result["verified_before_signing"]["claim_name"] == _CLAIM_NAME
+
+
+def test_the_transaction_shape_bounds_are_pinned_to_what_a_claim_needs():
+    """Finding [F1]: MAX_INSTRUCTIONS 8 -> 64 and MAX_ACCOUNT_KEYS 32 -> 256 both left the
+    whole suite green, because nothing anywhere asserted the numbers.
+
+    The numbers are not arbitrary and are not a matter of taste, which is why they can be
+    pinned rather than merely bounded. A claim the registry accepts is ONE registry
+    instruction plus at most the four distinct compute-budget operations that exist
+    (SetComputeUnitLimit, SetComputeUnitPrice, RequestHeapFrame,
+    SetLoadedAccountsDataSizeLimit) — txguard refuses a repeated one — so five
+    instructions is the true ceiling and 8 is already slack. It names seven accounts. Its
+    instruction data is `02 | name_len | name | 32-byte key | u64 price`, at most 74 bytes
+    for the longest name the registry can hold.
+
+    Raising any of these buys no compatibility and widens what a hostile permit server can
+    hide in a transaction we sign, so a change here should have to argue for itself.
+    """
+    from xete_mcp import txguard
+
+    assert txguard.MAX_INSTRUCTIONS == 8
+    assert txguard.MAX_ACCOUNT_KEYS == 32
+    assert txguard.MAX_IX_DATA_BYTES == 512
+    # And the bounds stay above what a real claim needs, or the guard becomes an outage.
+    assert txguard.MAX_IX_DATA_BYTES > txguard._CLAIM_FIXED_BYTES + txguard.MAX_ALIAS_NAME_BYTES
+    assert txguard.MAX_ACCOUNT_KEYS > txguard.CLAIM_ACCOUNT_COUNT
+
+
+def test_a_claim_carrying_more_instructions_than_a_claim_needs_is_refused(claim):
+    """Guard 1 of 8: MAX_INSTRUCTIONS.
+
+    Nine instructions, refused on the count alone — before a single one of them is
+    decoded, which is the point of a bound. With the cap raised to 64 this same
+    transaction is refused for an unrelated reason (a repeated compute-budget operation),
+    so the assertion is on the refusal the COUNT produces, not merely on being refused.
+    """
+    _, _, _, Instruction, _, _, Pubkey, _, _ = _solders()
+    filler = [Instruction(program_id=Pubkey.from_string(_COMPUTE_BUDGET),
+                          data=bytes([2]) + struct.pack("<I", 200_000), accounts=[])
+              for _ in range(8)]
+
+    result = claim.run(_honest_claim(claim.pubkey, extra_ixs=filler))
+
+    assert "9 instructions, over the 8 an alias claim can need" in _refused(claim, result)
+
+
+def test_a_claim_naming_more_accounts_than_a_claim_needs_is_refused(claim):
+    """Guard 2 of 8: MAX_ACCOUNT_KEYS.
+
+    Thirty-four spare account keys, referenced by nothing. With the cap raised to 256 this
+    transaction is ACCEPTED, signed and submitted — every other check passes, because
+    every other check looks at the accounts the claim instruction NAMES and this attack
+    does not touch those. An unbounded account list is how a transaction is padded until
+    the thing a human or an agent is asked to look at no longer fits on a screen.
+    """
+    _, _, _, _, Keypair, _, _, _, Transaction = _solders()
+    message = _claim_message(claim.pubkey)
+    padded = _with_extra_keys(message, [Keypair().pubkey() for _ in range(34)])
+
+    result = claim.run(_b64(Transaction.new_unsigned(padded)))
+
+    assert "40 accounts, over the 32 an alias claim can need" in _refused(claim, result)
+
+
+def test_this_agents_wallet_may_appear_only_once_in_the_account_list(claim):
+    """Guard 3 of 8: `keys.count(expect_fee_payer) != 1`.
+
+    Delete it and this transaction is accepted, signed and submitted. Every positional
+    check in `_check_claim_accounts` compares a slot against a PUBKEY, so a second copy of
+    our wallet sitting at another index is a second handle on the same signature: the
+    fee-payer identity the guard establishes at index 0 stops being the only place we
+    appear, and any later instruction added to the transaction can name the copy while the
+    checks keep agreeing with themselves about index 0.
+    """
+    _, _, _, _, _, _, Pubkey, _, Transaction = _solders()
+    message = _claim_message(claim.pubkey)
+    duplicated = _with_extra_keys(message, [Pubkey.from_string(claim.pubkey)])
+
+    result = claim.run(_b64(Transaction.new_unsigned(duplicated)))
+
+    assert "appears 2 times in the account list" in _refused(claim, result)
+
+
+def test_a_transaction_needing_a_third_signature_is_refused(claim):
+    """Guard 4 of 8: `not 1 <= nsig <= 2`.
+
+    A claim needs this agent, or this agent plus the permit co-signer. This fixture
+    requires THREE signatures and arrives with the other two already filled, so with the
+    bound deleted every remaining check passes and the tool signs and submits.
+
+    A third required signer is a third party whose transaction we are completing. Our
+    signature over a message we did not choose the rest of is the whole reason this module
+    exists.
+    """
+    Hash, _, CompiledInstruction, _, Keypair, Message, Pubkey, Signature, Transaction = _solders()
+    program = Pubkey.from_string(_ALIAS_PROGRAM)
+    me = Pubkey.from_string(claim.pubkey)
+    authority, stranger = Keypair().pubkey(), Keypair().pubkey()
+    pda = Pubkey.find_program_address([b"alias", _CLAIM_NAME.encode()], program)[0]
+    config = Pubkey.find_program_address([b"config"], program)[0]
+    # 3 signers (the last read-only), then the writable unsigned accounts, then the
+    # read-only ones — the layout a Solana message header describes.
+    keys = [me, authority, stranger,
+            Pubkey.from_string(_CLAIM_TREASURY), pda,
+            Pubkey.from_string(_SYSTEM_PROGRAM), config, program]
+    compiled = CompiledInstruction(program_id_index=7, data=_claim_data(),
+                                   accounts=bytes([0, 1, 4, 6, 3, 5]))
+    message = Message.new_with_compiled_instructions(3, 1, 3, keys, Hash.default(), [compiled])
+    cosigned = Signature.from_bytes(bytes([7] * 64))
+    tx = Transaction.populate(message, [Signature.default(), cosigned, cosigned])
+
+    result = claim.run(_b64(tx))
+
+    assert "requires 3 signatures" in _refused(claim, result)
+
+
+def test_a_transaction_whose_signature_slot_is_already_filled_is_refused(claim):
+    """Guard 5 of 8: `tx.signatures[0] != empty`.
+
+    Delete it and this is accepted: `partial_sign` simply overwrites the slot, so nothing
+    downstream notices. But a permit server that hands back a transaction already carrying
+    a signature in OUR slot is telling us something is wrong — either it holds a signature
+    of ours over these bytes, or the bytes are not what it says they are. Refusing is the
+    only answer that does not depend on guessing which.
+    """
+    _, _, _, _, _, _, _, Signature, Transaction = _solders()
+    tx = Transaction.populate(_claim_message(claim.pubkey),
+                              [Signature.from_bytes(bytes([7] * 64))])
+
+    result = claim.run(_b64(tx))
+
+    assert "signature slot already carries a signature we did not make" in _refused(claim, result)
+
+
+def test_the_system_program_slot_of_a_claim_is_pinned(claim):
+    """Guard 6 of 8: `accounts[IX_SYSTEM] != SYSTEM_PROGRAM`.
+
+    Delete it and a claim whose sixth account is an address of the server's choosing is
+    accepted, signed and submitted. That slot is what the registry does its inner
+    CreateAccount and its inner transfer through; every other slot in the instruction is
+    checked by position and this one was the hole in the row.
+    """
+    _, _, _, _, Keypair, _, _, _, _ = _solders()
+
+    result = claim.run(_honest_claim(claim.pubkey, system=str(Keypair().pubkey())))
+
+    assert "System-program slot holds" in _refused(claim, result)
+
+
+def test_an_oversized_instruction_data_field_is_refused(claim):
+    """Guard 7 of 8: MAX_IX_DATA_BYTES.
+
+    573 bytes on the registry instruction. Removing the bound does not make this one
+    ACCEPTED — the claim decoder rejects it a few lines later for the wrong length — so
+    the assertion is on the refusal the SIZE bound produces. The bound is what stops
+    unbounded attacker-chosen bytes reaching a decoder at all, and it is the only check
+    here that applies to instructions this client does not otherwise decode.
+    """
+    result = claim.run(_honest_claim(claim.pubkey, data=_claim_data(trailing=520)))
+
+    assert "over the 512-byte limit" in _refused(claim, result)
+
+
+def test_the_claim_tool_refuses_when_the_spend_cap_binds(claim, monkeypatch):
+    """Guard 8 of 8, and the worst one: THE SPEND GATE ITSELF.
+
+    Replacing `from .spendguard import authorize as _authorize_spend` on the claim path
+    with a no-op lambda left all 677 tests passing. There was no behavioural test that
+    `xete_alias_claim` refuses when the cap binds, because every signing test RAISES
+    XETE_SPEND_MAX_LAMPORTS out of its own way in order to exercise txguard — so the one
+    direction the cap exists for was never driven.
+
+    Here the permit server quotes 50,000,000 lamports against a 40,000,000 cap. The
+    transaction is otherwise perfect: it passes every txguard check, simulation agrees
+    with it, and the fixture's RPC would accept it. The gate is the only thing left.
+    """
+    claim.sim_debit = 50_000_000 + _RENT_AND_FEE
+    monkeypatch.setenv(spendguard.ENV_MAX, "40000000")
+    tx_b64 = _honest_claim(claim.pubkey, price=50_000_000)
+
+    result = claim.run(tx_b64, price=50_000_000)
+
+    assert result["status"] == "failed", result
+    assert "SPEND REFUSED (per-transaction cap)" in result["error"], result
+    assert not claim.signed, "the spend gate did not stop the signature"
+    assert not claim.submitted, "a transaction over the spend cap was submitted on-chain"
+    # A refusal records nothing, so the window is not burned by a spend that never happened.
+    assert not claim.ledger.exists() or _entries(claim.ledger) == []
+
+
+def test_the_same_claim_goes_through_once_the_cap_allows_it(claim, monkeypatch):
+    """The other half of guard 8: the cap is a cap, not a brick. Byte-for-byte the same
+    transaction as the test above, with the cap set above the price, completes.
+
+    Without this, `test_the_claim_tool_refuses_when_the_spend_cap_binds` would still pass
+    if the tool had simply stopped working, which is how a "the guard fires" test quietly
+    becomes a test of nothing.
+    """
+    claim.sim_debit = 50_000_000 + _RENT_AND_FEE
+    monkeypatch.setenv(spendguard.ENV_MAX, "60000000")
+    tx_b64 = _honest_claim(claim.pubkey, price=50_000_000)
+
+    result = claim.run(tx_b64, price=50_000_000)
+
+    assert result["status"] == "claimed", result
+    assert claim.signed and claim.submitted, result
+    # The gate charged the largest figure anyone can justify — what simulation measured.
+    assert _entries(claim.ledger)[0]["lamports"] == 50_000_000 + _RENT_AND_FEE
+    assert _entries(claim.ledger)[0]["path"] == "xete_alias_claim"
