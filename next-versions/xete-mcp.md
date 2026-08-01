@@ -42,7 +42,8 @@ from the version string alone, exactly like a bugfix. A version number is a weak
 ## (not xete-mcp, parked here so it is not lost) xete-site: /login and /get-started are undeployed
 
 **Found:** 2026-08-01, chasing hourly GitHub failure mail.
-**Status:** SHELVED by John pending the MCP tooling work. Not fixed.
+**Status:** FIXED and verified 2026-08-01 17:12 UTC. `verify.yml` run 30709817620 green,
+`ok /get-started` / `ok /login`. Kept here as the record of what it was.
 
 `verify-site-integrity` has failed every ~15 min since at least 2026-07-20 on two routes,
 `/get-started` and `/login` (one shared page). The live site is running an OLD build:
@@ -64,3 +65,10 @@ eleven days is an alarm nobody reads. The next real tamper alert lands in a mail
 trained to ignore it.
 
 Fix is a webroot file copy on the production box, no rebuild and no service restart.
+
+**What it actually was, once opened:** not a stale page — a missing file. The vendored
+`nacl.min.js` was on disk with a sha384 matching the page's SRI exactly; the page asked for
+`/js/nacl-1.0.3.min.js`, which was 404. Deploying the repo page alone would have shipped a
+login page whose crypto library did not load at all. Fix was the page plus the versioned
+filename (the unversioned name is kept — `setup.html` and `pwa-install.html` reference it).
+Backup: `/root/webroot-backups/xete-login.html.20260801-171156`.
