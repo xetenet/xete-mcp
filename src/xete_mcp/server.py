@@ -11,7 +11,31 @@ Config (env):
   XETE_RPC_URL      Solana RPC, used only when a spend actually happens
                     (default mainnet-beta). Same https-or-loopback rule as every other
                     endpoint here: it is checked when a tool uses it, not at import.
-  XETE_IDENTITY     path to the identity keystore (default ~/.xete/identity.json)
+                    TWO VALUES THAT WORKED IN 0.1.4 ARE NOW REFUSED, before any request:
+                      * credentials embedded in the URL (https://user:pass@host/...) —
+                        they would be sent to whatever host the URL names, so put them
+                        in a header instead. This is checked first, so it applies even
+                        to a loopback URL.
+                      * plain http:// to anything that is not loopback, including a
+                        private-LAN validator (http://192.168.x.x). This path submits
+                        signed transactions and reads the confirmations that say they
+                        landed; use https://, or an ssh/TLS tunnel to 127.0.0.1.
+                    Both refusals name the offending variable and say nothing was sent.
+  XETE_INVITE_CODE  invite code for registering a NEW xete account. Read on the login
+                    path (client.login) and sent with the first /agent/login. Existing
+                    accounts log in without one, so this is a first-run-only setting; a
+                    relay that requires it answers 403 and the refusal quotes the
+                    relay's own text alongside this hint.
+  XETE_IDENTITY     path to the identity keystore (default ~/.xete/identity.json).
+                    UPGRADING FROM 0.1.4: that keystore holds a RANDOM x25519 messaging
+                    secret; this version derives the messaging key from the wallet seed
+                    instead, so that everything (House Elf, the browser inbox, here)
+                    lands on one key. The old secret is NOT discarded — it is kept in
+                    the keystore under `legacy_x_secrets` and tried per message when the
+                    derived key fails, so the pre-upgrade mailbox stays readable. The
+                    file is rewritten once into that two-field form, after copying the
+                    original to <name>.pre-derived-key.bak. See xete_my_identity ->
+                    messaging_key for which key is live and whether the relay took it.
   XETE_SOL_KEYPAIR  path to a funded Solana keypair (JSON array). Used to pay only on
                     a server that charges to send; messaging on xete.net is free, and
                     identity and inbox never need it.
@@ -126,13 +150,99 @@ def _get_client() -> XeteClient:
     global _client
     if _client is None:
         ident = load_or_create_identity(IDENTITY_PATH)
-        _client = XeteClient(base_url=SERVER_URL, identity=ident)
-        _client.login()
+        client = XeteClient(base_url=SERVER_URL, identity=ident)
+        client.login()
         try:
-            _client.register_encryption_key()
-        except Exception:
-            pass  # non-fatal; lookups by others will just fail until it lands
+            client.register_encryption_key()
+        except Exception as e:
+            # Still non-fatal — a relay hiccup must not brick identity and inbox, both
+            # of which work without a fresh registration. But it is no longer SILENT:
+            # register_encryption_key records what happened on the client, and every
+            # tool that can be affected reports it. A key that never landed is why a
+            # recipient cannot read your mail, and that used to be invisible.
+            if not client.messaging_key_error:
+                client.messaging_key_error = str(e)[:300]
+        _client = client
     return _client
+
+
+def _get_client_or_error(**extra) -> tuple[XeteClient | None, str]:
+    """`_get_client()`, with failures returned as JSON instead of raised.
+
+    Every tool below needs a logged-in client, and the login path can legitimately
+    refuse — most commonly signguard's clock-skew check, whose message says exactly
+    what to do ("check the system time"). Raised out of a tool that diagnostic becomes
+    an MCP transport error the agent cannot read as data; the other tools already
+    wrapped theirs and only xete_my_identity did not. All four go through here now.
+
+    The limit is generous (500 chars) because these messages are written by THIS
+    client, not by a server — the reason is the whole value, and truncating it at 300
+    cut the actionable sentence off the end of the skew diagnostic.
+    """
+    try:
+        return _get_client(), ""
+    except Exception as e:
+        return None, json.dumps({**extra, "error": str(e)[:500]}, indent=2)
+
+
+def _scrub_paths(text: str) -> str:
+    """Take filesystem paths out of a string that is about to be returned to an agent.
+
+    Popping the `ledger` KEY is not enough. Every failure branch of spendguard.status()
+    — a corrupt ledger, an unwritable directory, the refusal when XETE_SPEND_LEDGER is
+    aimed at something called identity.json — embeds the absolute path in its `error`
+    PROSE, and that prose was going straight into xete_my_identity's output. The home
+    directory is in it, so the OS username is in it.
+
+    Longest-first so the full path is replaced before its own parent matches a prefix
+    of it.
+    """
+    if not text:
+        return text
+    out = str(text)
+    configured = os.environ.get("XETE_SPEND_LEDGER", "").strip()
+    candidates = []
+    for raw in (configured, str(Path.home() / ".xete" / "spend-ledger.json")):
+        if not raw:
+            continue
+        try:
+            p = Path(raw).expanduser()
+        except Exception:
+            continue
+        candidates.append((str(p), p.name))
+        candidates.append((str(p.parent), "…"))
+    candidates.append((str(Path.home()), "~"))
+    for needle, replacement in sorted(candidates, key=lambda c: len(c[0]), reverse=True):
+        if needle and needle not in ("/", "~", "…"):
+            out = out.replace(needle, replacement)
+    return out
+
+
+def _redact_ledger_path(limits: dict) -> dict:
+    """Replace the spend ledger's absolute path with its name and a writability flag.
+
+    The absolute path discloses the OS username into every xete_my_identity answer, and
+    that answer routinely gets pasted into issues and chat logs. What a caller actually
+    needs to know is whether the ledger can be written — because a ledger that cannot
+    be written refuses every spend — not where the operator's home directory is.
+    """
+    if not isinstance(limits, dict):
+        return limits
+    out = dict(limits)
+    if "error" in out:
+        out["error"] = _scrub_paths(str(out["error"]))
+    if "ledger" not in out:
+        return out
+    raw = out.pop("ledger", "")
+    try:
+        p = Path(str(raw))
+        out["ledger_file"] = p.name
+        probe = p if p.exists() else p.parent
+        out["ledger_writable"] = bool(probe.exists() and os.access(str(probe), os.W_OK))
+    except Exception:
+        out["ledger_file"] = "(unreadable)"
+        out["ledger_writable"] = False
+    return out
 
 
 def _load_payer():
@@ -154,23 +264,56 @@ def xete_my_identity() -> str:
 
     `spend_limits` is the ceiling this server enforces on itself before signing
     anything: the most one transaction may cost, the most that may be spent inside the
-    rolling window, and how much of that window is left."""
-    c = _get_client()
-    payer = _load_payer()
+    rolling window, and how much of that window is left.
+
+    `messaging_key` reports the x25519 key other agents encrypt to when they message
+    you, whether the relay has accepted it, and whether this keystore still carries
+    pre-upgrade keys that old mail is decrypted with."""
+    c, err = _get_client_or_error()
+    if err:
+        return err
+    # _load_payer() parses a file named by env. A malformed XETE_SOL_KEYPAIR raised
+    # straight out of this tool — the same class of defect as the login refusal above,
+    # and identity has no business failing because the OPTIONAL payer file is broken.
+    payer, payer_error = None, ""
+    try:
+        payer = _load_payer()
+    except Exception as e:
+        payer_error = _scrub_paths(str(e))[:200]
     info = {
         "agent_id": c.identity.agent_id,
         "wallet_pubkey": c.identity.pubkey_b58,
         "server": SERVER_URL,
         "can_send": payer is not None,
     }
+    if payer_error:
+        info["payer_error"] = payer_error
+    # The messaging key is the difference between mail that can be read and mail that
+    # cannot, and until now no tool showed it at all — a key that failed to publish, or
+    # a keystore still carrying an older key, were both invisible.
+    key_info = {
+        "x25519_public_key": c.identity.x_public.hex(),
+        "derived_from_wallet": True,
+        "registered_with_relay": c.messaging_key_registered,
+        "legacy_keys_retained": len(c.identity.legacy_x_secrets),
+    }
+    if c.identity.legacy_x_secrets:
+        key_info["legacy_x25519_public_keys"] = [k.hex() for k in c.identity.legacy_x_publics]
+        key_info["note"] = (
+            "this keystore predates the derived messaging key. Mail encrypted to the "
+            "listed older key(s) is still decrypted; new mail uses the current key.")
+    if c.messaging_key_error:
+        key_info["warning"] = c.messaging_key_error[:400]
+        key_info["sending_blocked"] = c.messaging_key_conflict
+    info["messaging_key"] = key_info
     try:
         from .spendguard import status as _spend_status
 
-        info["spend_limits"] = _spend_status()
+        info["spend_limits"] = _redact_ledger_path(_spend_status())
     except Exception as e:
         # Never let a reporting problem hide the identity; the limits themselves fail
         # closed at spend time regardless of what this read says.
-        info["spend_limits"] = {"enforced": True, "error": str(e)[:200]}
+        info["spend_limits"] = {"enforced": True, "error": _scrub_paths(str(e))[:200]}
     if payer is not None:
         try:
             info["sol_balance"] = payment.sol_balance(_signing_rpc_url(), payer.pubkey())
@@ -184,7 +327,11 @@ def xete_my_identity() -> str:
 def xete_lookup_agent(agent_id_or_alias: str) -> str:
     """Look up another xete agent by agent id or alias to confirm it exists and
     has published an encryption key (i.e. you can message it)."""
-    c = _get_client()
+    # A login failure is not "that agent does not exist", so it does not get reported
+    # as found:false — it gets its own error, as data rather than a raised exception.
+    c, err = _get_client_or_error(agent=agent_id_or_alias, messageable=False)
+    if err:
+        return err
     try:
         key = c.lookup_encryption_key(agent_id_or_alias)
         return json.dumps({"found": True, "agent": agent_id_or_alias,
@@ -202,7 +349,9 @@ def xete_send_message(recipient_agent_id: str, message: str, subject: str = "") 
     needed if the xete server you are connected to charges for sending; when it does,
     the charge is checked against this agent's spend limits before anything is signed
     (see xete_my_identity → spend_limits). Returns the delivery result."""
-    c = _get_client()
+    c, err = _get_client_or_error(status="failed", to=recipient_agent_id)
+    if err:
+        return err
     try:
         invoice = c.send_multi(recipient_agent_id, message, subject or None)
 
@@ -256,7 +405,9 @@ def xete_check_inbox(limit: int = 20) -> str:
     """Read this agent's xete inbox. Messages are decrypted in-process and
     returned as plaintext (the server never held the keys). Returns sender,
     subject, time, and decrypted text for each message."""
-    c = _get_client()
+    c, err = _get_client_or_error()
+    if err:
+        return err
     try:
         msgs = c.inbox(limit=limit)
         return json.dumps({"count": len(msgs), "messages": msgs}, indent=2, default=str)

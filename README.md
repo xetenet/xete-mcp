@@ -40,6 +40,19 @@ pip install xete-mcp
 }
 ```
 
+`XETE_RPC_URL` is validated before any request is made, and two shapes that 0.1.4
+accepted are now refused outright:
+
+- **credentials in the URL** (`https://user:pass@rpc.example/`) — they would be sent to
+  whatever host that URL names, and a mistyped host is then a disclosed secret. Put them
+  in a header. This is checked before the scheme, so it applies to loopback too.
+- **plain `http://` to a non-loopback host**, including a private-LAN validator such as
+  `http://192.168.0.10:8899`. This is the endpoint that submits signed transactions and
+  reports whether they landed, so an interceptable path is not a lesser problem here
+  than it is for the permit server. Use `https://`, or tunnel to `127.0.0.1`.
+
+Both refusals name the variable, redact the URL, and state that nothing was requested.
+
 - An identity is generated and stored at `~/.xete/identity.json` on first run.
   **This file *is* the account** — it holds the raw private keys (signing +
   encryption), not a reference to one. There is no recovery if it's lost,
@@ -57,6 +70,33 @@ pip install xete-mcp
 - `XETE_SOL_KEYPAIR` (a funded Solana keypair) is optional — it is used only if the
   xete server you connect to charges on-chain to send. Messaging on xete.net is free;
   identity and reading the inbox never require a keypair.
+- `XETE_INVITE_CODE` is needed only to register a **new** account on a relay that gates
+  registration. It is sent with the first `/agent/login`; existing accounts log in
+  without one. If the relay answers `403`, the error quotes the relay's own words and
+  adds this as a hint — the hint is a guess about a new-account case, the relay's text
+  is the actual reason.
+
+### Upgrading from 0.1.4 — your messaging key changes (your mailbox does not)
+
+0.1.4 stored a **random** x25519 messaging secret in `identity.json`, unrelated to the
+wallet. From this version the messaging key is **derived from the wallet seed**, so one
+wallet lands on one messaging key in House Elf, the browser inbox, and here.
+
+Nothing is lost in that change. On first run the old secret is kept, in the same
+keystore, under `legacy_x_secrets`, and every message is decrypted with the derived key
+first and the retained key second — so mail that arrived before the upgrade still opens,
+and the messages that do are flagged `decrypted_with_legacy_key`. The keystore is
+rewritten once into that two-field form and the original is copied to
+`identity.json.pre-derived-key.bak` (`0600`) first. Back the whole `~/.xete/` directory
+up before upgrading anyway; it is still the account.
+
+The half that is **not** local is publishing the new key. `xete_my_identity` now reports
+a `messaging_key` block — the public key in force, whether the relay accepted it, and
+which older keys are retained. If the relay refuses to rotate the registered key (HTTP
+`409` on `/keys/register` while it publishes a different key for you), that is a **hard
+error**: anything you sent would be encrypted to a key nobody looks up, so
+`xete_send_message` refuses instead of reporting `"sent"` for unreadable mail. Reading
+your inbox keeps working throughout.
 
 ### `%alias` endpoints
 

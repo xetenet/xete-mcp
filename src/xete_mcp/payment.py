@@ -10,6 +10,7 @@ id and treasury cannot be redirected by a malicious server.
 from __future__ import annotations
 
 import hashlib
+import secrets
 import struct
 
 from solders.keypair import Keypair
@@ -37,38 +38,126 @@ def _encode_payherd(nonce: str, blob_count: int) -> bytes:
     return struct.pack("<I", len(nb)) + nb + struct.pack("<B", blob_count)
 
 
+SEND_PATH_LABEL = "xete_send_message"
+
+
+def _attempt_detail(payment_nonce: str, blob_count: int) -> str:
+    """The ledger `detail` for one attempt, led by a token unique to THIS call.
+
+    The token is what makes a release safe. Without it the detail is
+    `blobs=<n> nonce=<server-supplied>`, which is not unique: the relay chooses
+    `payment_nonce` and can repeat it, and two concurrent sends with the same nonce and
+    blob count produce byte-identical entries. A release then deletes whichever matched
+    — possibly the entry belonging to the OTHER call, the one that already reached
+    `send_transaction` and must never be released.
+
+    It leads the string because spendguard truncates `detail` to 200 characters and the
+    server-chosen nonce is unbounded; a token at the tail could be truncated away.
+    """
+    return f"attempt={secrets.token_hex(8)} blobs={blob_count} nonce={payment_nonce}"
+
+
+def _release_recorded_spend(detail: str, charged: int) -> None:
+    """Give back a spend that was recorded and then provably never happened.
+
+    spendguard records at APPROVAL time and offers no release, deliberately: once a
+    transaction has been submitted, "it failed" and "it landed and the receipt was
+    lost" are the same observation from here, and over-counting is the safe direction
+    for a ceiling. That reasoning is sound — and it does not reach a
+    `get_latest_blockhash` that raised ConnectError. Nothing was built, nothing was
+    signed, nothing was submitted, no lamport can possibly have moved. Charging those
+    meant 25 attempts against an unreachable or 429ing RPC locked the agent out of its
+    24-hour window having spent exactly zero.
+
+    So this removes exactly the ONE entry just written for THIS attempt, identified by
+    the unique token `_attempt_detail` put at the front of the detail string — not by
+    anything the relay chose. Two concurrent sends can no longer match each other's
+    entries, which is what made an earlier version able to release an entry belonging to
+    a call that HAD reached `send_transaction`. It runs under spendguard's own exclusive
+    lock and atomic replace, because a rollback that raced a concurrent write would be a
+    worse bug than the over-count it fixes. Nothing else in the ledger is touched, so a
+    rollback can only ever return budget this same call consumed — it cannot lift the
+    ceiling (test_rolling_the_ledger_back_does_not_grant_more_than_the_window).
+
+    Every failure is swallowed. If the entry cannot be given back the spend simply stays
+    counted, which is the conservative direction and exactly the old behaviour.
+    """
+    try:
+        from .spendguard import (LEDGER_VERSION, _ExclusiveLock, _read_ledger,
+                                 _write_ledger, ledger_path)
+
+        path = ledger_path()
+        if not path.exists():
+            return
+        stored = str(detail)[:200]      # spendguard truncates `detail` on the way in
+        with _ExclusiveLock(path.with_name(f"{path.name}.lock")):
+            data = _read_ledger(path)
+            entries = list(data["entries"])
+            for i in range(len(entries) - 1, -1, -1):
+                e = entries[i]
+                if (e.get("path") == SEND_PATH_LABEL and e.get("detail") == stored
+                        and e.get("lamports") == charged):
+                    del entries[i]
+                    break
+            else:
+                return          # not ours to give back; leave the ledger alone
+            _write_ledger(path, {"version": LEDGER_VERSION,
+                                 "last_ts": data["last_ts"],
+                                 "entries": entries})
+    except Exception:
+        pass
+
+
 def pay_herd(rpc_url: str, payer: Keypair, payment_nonce: str, blob_count: int,
              declared_lamports: int | None = None) -> str:
     """Build, sign, submit, and confirm the PayHerd tx. Returns the signature.
 
     SPEND GATE. The client-side limits are checked HERE, before anything is built or
-    signed, so every caller of this function is covered — not only the MCP tool.
+    signed — before the RPC client is even constructed — so every caller of this
+    function is covered, not only the MCP tool.
 
     `declared_lamports` is the amount the server quoted for this send. It is only ever
     used to RAISE the figure the limits see. The baseline is derived on this side from
     `blob_count`, which is what actually goes into the instruction being signed, so a
     server that understates its own price cannot shrink the number that gets checked.
+
+    WHAT HAPPENS WHEN THE ATTEMPT DIES BEFORE SUBMISSION. Approval is recorded up front,
+    so an attempt that then fails has already consumed window budget. That is right for
+    anything at or past `send_transaction` and wrong for everything before it: a dead
+    RPC is not an ambiguous outcome, it is proof that no transaction exists. So the
+    pre-submission span — connecting, fetching the blockhash, building and signing
+    locally — releases the recorded spend on failure and re-raises. From
+    `send_transaction` onward nothing is released: the transaction may be on the
+    cluster whatever the client saw.
     """
     from .spendguard import authorize
 
     derived = max(int(blob_count), 0) * LAMPORTS_PER_BLOB
-    authorize(max(int(declared_lamports or 0), derived), "xete_send_message",
-              detail=f"blobs={blob_count} nonce={payment_nonce}")
+    detail = _attempt_detail(payment_nonce, blob_count)
+    approval = authorize(max(int(declared_lamports or 0), derived), SEND_PATH_LABEL,
+                         detail=detail)
 
-    client = Client(rpc_url)
-    pda, _ = _derive_pda(payment_nonce)
-    ix = Instruction(
-        program_id=PROGRAM_ID,
-        accounts=[
-            AccountMeta(payer.pubkey(), is_signer=True, is_writable=True),
-            AccountMeta(pda, is_signer=False, is_writable=True),
-            AccountMeta(TREASURY, is_signer=False, is_writable=True),
-            AccountMeta(SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
-        ],
-        data=_encode_payherd(payment_nonce, blob_count),
-    )
-    bh = client.get_latest_blockhash().value.blockhash
-    tx = Transaction([payer], Message.new_with_blockhash([ix], payer.pubkey(), bh), bh)
+    # ── pre-submission: refundable, because nothing can have left ──────────────────
+    try:
+        client = Client(rpc_url)
+        pda, _ = _derive_pda(payment_nonce)
+        ix = Instruction(
+            program_id=PROGRAM_ID,
+            accounts=[
+                AccountMeta(payer.pubkey(), is_signer=True, is_writable=True),
+                AccountMeta(pda, is_signer=False, is_writable=True),
+                AccountMeta(TREASURY, is_signer=False, is_writable=True),
+                AccountMeta(SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
+            ],
+            data=_encode_payherd(payment_nonce, blob_count),
+        )
+        bh = client.get_latest_blockhash().value.blockhash
+        tx = Transaction([payer], Message.new_with_blockhash([ix], payer.pubkey(), bh), bh)
+    except BaseException:
+        _release_recorded_spend(detail, int(approval["charged_lamports"]))
+        raise
+
+    # ── FROM HERE THE TRANSACTION MAY BE LIVE. Nothing below is ever released. ──────
     sig = client.send_transaction(tx, opts=TxOpts(skip_preflight=False, preflight_commitment=Confirmed)).value
     # confirm
     import time

@@ -272,6 +272,18 @@ def validate_relay_auth_challenge(message, nonce, *, client_nonce: str | None = 
 
     bound = False
     if len(lines) == 4:
+        if lines[3] == "":
+            # A trailing newline. Still refused — the signed bytes must be the exact
+            # template — but it is a formatting difference, not a smuggled fourth line,
+            # and saying "a fourth line '' that is not this client's own nonce" sends
+            # whoever debugs it looking for a nonce bug that does not exist.
+            raise RefusedToSign(
+                f"REFUSED TO SIGN ({where}): the challenge is the correct three lines "
+                "followed by a TRAILING NEWLINE, so the bytes are not the exact xete "
+                "authentication template and are refused rather than signed. This is a "
+                "server formatting change, not an attack signature: the relay must emit "
+                "the three lines with no trailing newline. Nothing was signed."
+            )
         if client_nonce and lines[3] == f"Client-Nonce: {client_nonce}":
             bound = True
         else:
