@@ -25,6 +25,15 @@ never no limit. Full reasoning in src/xete_mcp/spendguard.py.
   XETE_SPEND_FLOOR_LAMPORTS   minimum charged per on-chain action, covering the rent
                               and fees a quote excludes         (default 2000000)
   XETE_SPEND_LEDGER           ledger path      (default ~/.xete/spend-ledger.json)
+
+Signing safety (env) — xete_alias_claim decodes the permit server's transaction against an
+allow-list before adding a signature to it, and refuses anything it cannot positively
+identify. Full reasoning in src/xete_mcp/txguard.py and src/xete_mcp/signguard.py.
+  XETE_ALIAS_PROGRAM                the %alias registry program id. For local-validator
+                                    testing only; never point it at an untrusted program.
+  XETE_ALIAS_TX_TOLERANCE_LAMPORTS  how far above the quoted price the claim transaction
+                                    may debit, covering rent + fees a quote excludes
+                                                                     (default 5000000)
 """
 from __future__ import annotations
 
@@ -36,7 +45,8 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from .client import XeteClient, load_or_create_identity
-from . import payment, settlement
+from . import payment, settlement, signguard
+from . import txguard as txguard_mod
 
 SERVER_URL = os.environ.get("XETE_SERVER_URL", "https://xete.net")
 RPC_URL = os.environ.get("XETE_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -252,21 +262,31 @@ def xete_alias_claim(name: str) -> str:
     little SOL — it pays the one-time price (0 for ordinary 6+ letter names, or in grace) plus a
     small network rent + gas. Check the price first with xete_alias_quote. Returns the price
     paid, the tx signature, and the settlement status. You must already have a xete identity
-    registered (claiming binds the name to your agent)."""
+    registered (claiming binds the name to your agent).
+
+    The permit server's transaction is DECODED and allow-listed before your key touches it:
+    every instruction must be the alias registry, the compute budget, or a bounded System
+    transfer, the name's account must be the one you asked for, durable-nonce constructions
+    are refused, and the lamports it can take from you are bounded by the quote plus rent.
+    Anything else is refused unsigned, and the result reports what was verified."""
     # Load the identity directly: claim depends on the permit server + its relay DB, NOT on the
     # messaging relay being reachable — so don't force a messaging-server login here.
     ident = load_or_create_identity(IDENTITY_PATH)
     pubkey = ident.pubkey_b58
     try:
-        import base64 as _b64
         import base58
 
         ch = requests.post(_permit_url("/alias/claim/challenge"), json={"pubkey": pubkey}, timeout=15).json()
         if "message" not in ch or "nonce" not in ch:
             return json.dumps({"status": "failed", "stage": "challenge", "detail": ch})
-        # sign the challenge with the identity ed25519 key. NOTE: the permit server verifies sigs as
-        # BASE58 (bs58::decode in auth.rs) — unlike the messaging relay, which uses base64. Different
-        # services, different convention; send base58 here.
+        # The identity key does not sign whatever the permit server sends. The challenge
+        # must be the exact 4-line template, addressed to THIS wallet, carrying the nonce
+        # the server also returned separately, timestamped now. Raises RefusedToSign
+        # otherwise — before any signature exists.
+        signguard.validate_alias_claim_challenge(ch["message"], ch["nonce"], pubkey)
+        # NOTE: the permit server verifies sigs as BASE58 (bs58::decode in auth.rs) — unlike the
+        # messaging relay, which uses base64. Different services, different convention; send
+        # base58 here.
         sig = base58.b58encode(ident.signing_key.sign(ch["message"].encode("utf-8")).signature).decode()
         claim = requests.post(
             _permit_url("/alias/claim"),
@@ -281,24 +301,56 @@ def xete_alias_claim(name: str) -> str:
                 {"status": claim.get("status", "denied"), "reason": reason, "hint": hint, "name": name},
                 indent=2,
             )
-        # SPEND GATE — before our signature exists. Be clear about what this can see:
-        # `price_lamports` is DECLARED by the permit server, and the transaction we are
-        # about to sign was BUILT by that same server, so this bounds the price we were
-        # quoted, not the lamports the transaction is able to move. The claim also costs
-        # on-chain rent and gas that the quote excludes, which is what
-        # XETE_SPEND_FLOOR_LAMPORTS covers. See reviews/DDR-spend-caps-20260731.md, D2.
-        from .spendguard import authorize as _authorize_spend
 
-        _authorize_spend(int(claim.get("price_lamports") or 0), "xete_alias_claim",
-                         detail=f"name=%{name}")
-
-        # add our claimer signature (we are the fee payer) and submit on-chain
         from solders.keypair import Keypair
-        from solders.transaction import Transaction
+        from solders.pubkey import Pubkey
         from solana.rpc.api import Client
 
         claimer = Keypair.from_seed(ident.ed_seed)
-        tx = Transaction.from_bytes(_b64.b64decode(claim["transaction"]))
+        quoted = int(claim.get("price_lamports") or 0)
+        tx_b64 = claim.get("transaction")
+
+        # ── DECODE BEFORE SIGNING ───────────────────────────────────────────────────
+        # Allow-list every instruction against what an alias claim is allowed to be, and
+        # bound what the transaction can visibly take from us. Raises TransactionRejected
+        # on anything it cannot positively identify — including the bare SystemProgram
+        # drain that used to pass straight through this function.
+        tx, inspection = txguard_mod.inspect_alias_claim(
+            tx_b64,
+            expect_fee_payer=Pubkey.from_string(pubkey),
+            expect_name=name,
+            quoted_lamports=quoted,
+        )
+
+        # ── AND ASK THE NETWORK WHAT IT ACTUALLY MOVES ──────────────────────────────
+        # Static decoding cannot see lamports moved by a cross-program invocation (the
+        # claim funds its own PDA rent exactly that way). Simulation can. A simulated
+        # debit over the ceiling, or a transaction the network says fails, is a hard
+        # refusal; an unreachable RPC is not evidence of an attack, so that degrades to
+        # the static bound and says so in the result.
+        simulated = None
+        simulation_note = None
+        try:
+            simulated = txguard_mod.simulated_debit(RPC_URL, tx_b64, Pubkey.from_string(pubkey))
+            txguard_mod.check_debit_within(simulated, 0, inspection.ceiling_lamports,
+                                       who=f"{pubkey} (alias claim %{name})")
+        except txguard_mod.TransactionRejected:
+            raise
+        except Exception as e:
+            simulation_note = (f"could not simulate before signing ({str(e)[:120]}); the static "
+                               "instruction allow-list and the spend limits still applied")
+
+        # SPEND GATE — still before our signature exists, and now fed the largest figure
+        # anyone can justify rather than only the server's own quote: the declared price,
+        # what the instructions visibly debit, and what simulation says actually leaves
+        # the wallet. See reviews/DDR-spend-caps-20260731.md, D2 — this is the part of D2
+        # that the transaction guard closes.
+        from .spendguard import authorize as _authorize_spend
+
+        charged = max(quoted, inspection.static_debit_lamports, simulated or 0)
+        _authorize_spend(charged, "xete_alias_claim",
+                         detail=f"name=%{name} quoted={quoted} observed={simulated}")
+
         tx.partial_sign([claimer], tx.message.recent_blockhash)
         rpc = Client(RPC_URL)
         onchain = rpc.send_raw_transaction(bytes(tx)).value
@@ -311,7 +363,7 @@ def xete_alias_claim(name: str) -> str:
                 break
         conf = requests.post(_permit_url("/alias/claim/confirm"),
                              json={"pubkey": pubkey, "name": name}, timeout=20).json()
-        return json.dumps({
+        out = {
             "status": "claimed" if conf.get("status") == "confirmed" else conf.get("status", "submitted"),
             "name": name,
             "owner": pubkey,
@@ -319,7 +371,18 @@ def xete_alias_claim(name: str) -> str:
             "free_grace": claim.get("free_grace"),
             "tx_signature": str(onchain),
             "settled": conf.get("status"),
-        }, indent=2)
+            "verified_before_signing": inspection.as_dict(),
+            "simulated_debit_lamports": simulated,
+        }
+        if simulation_note:
+            out["simulation_note"] = simulation_note
+        return json.dumps(out, indent=2)
+    except (signguard.RefusedToSign, txguard_mod.TransactionRejected) as e:
+        # A refusal is the most useful thing this tool can say, so it is NOT truncated
+        # to 300 characters like an ordinary error: the message names exactly what the
+        # server sent and why it was not signed.
+        return json.dumps({"status": "refused", "name": name, "signed": False,
+                           "submitted": False, "reason": str(e)}, indent=2)
     except Exception as e:
         return json.dumps({"status": "failed", "error": str(e)[:300]})
 
