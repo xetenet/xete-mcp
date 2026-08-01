@@ -1255,6 +1255,7 @@ def xete_settle_create(recipient: str, amount_sol: float, notify: bool = True) -
     # Filled in by settlement.deposit BEFORE it submits. The salt lives nowhere else — only its
     # hash goes on chain — so this is the copy that survives a confirmation timeout.
     early_ticket: dict = {}
+    sig = None      # set only once the deposit has CONFIRMED; see the generic handler below
     try:
         from solders.keypair import Keypair
 
@@ -1313,6 +1314,15 @@ def xete_settle_create(recipient: str, amount_sol: float, notify: bool = True) -
             out["ticket"] = early_ticket
             out["KEEP_THIS_TICKET"] = ("a deposit may have been submitted; check "
                                        "xete_settle_status with this escrow_id before discarding")
+        if sig:
+            # settlement.deposit only returns a signature after the deposit CONFIRMED, so a
+            # failure past that point is this tool's own reporting, not the money. Carry the
+            # signature rather than emitting a bare failure for a transaction on the chain.
+            out.update({"status": "submitted_unconfirmed", "submit_outcome": "unconfirmed",
+                        "tx_signature": sig})
+            out["next_step"] = ("Call xete_settle_status with this escrow_id and read "
+                                "`determinate` FIRST — the deposit reached the chain, only the "
+                                "reporting of it failed. KEEP THE TICKET either way.")
         return json.dumps(out, indent=2)
 
 
@@ -1325,13 +1335,26 @@ def xete_settle_claim(escrow_id: str, salt: str) -> str:
     if bad:
         return bad
     ident = load_or_create_identity(IDENTITY_PATH)
+    sig = None      # set only once the claim has CONFIRMED; see the generic handler below
     try:
         from solders.keypair import Keypair
 
         beneficiary = Keypair.from_seed(ident.ed_seed)
         sig, received = settlement.claim(_signing_rpc_url(), beneficiary, escrow_id, salt)
-        return json.dumps({"status": "claimed", "escrow_id": escrow_id, "tx_signature": sig,
-                           "received_sol": received / 1e9, "to": ident.pubkey_b58}, indent=2)
+        # `received` is OPTIONAL BY DESIGN. settlement.claim returns None whenever either balance
+        # read fails, precisely so that a 429 on a receipt cannot become "your claim failed" —
+        # and dividing it by 1e9 here threw TypeError straight into the `except Exception` below,
+        # which reported a CONFIRMED, landed claim as a bare {"status": "failed"} with no
+        # signature. The receipt is a nicety; the claim is the money.
+        out = {"status": "claimed", "escrow_id": escrow_id, "tx_signature": sig,
+               "received_sol": None if received is None else received / 1e9,
+               "to": ident.pubkey_b58}
+        if received is None:
+            out["receipt_note"] = (
+                "THE CLAIM CONFIRMED. received_sol is null only because the balance read that "
+                "measures it did not answer — the amount is unknown, the claim is not. Read your "
+                "balance with xete_my_identity if you need the figure.")
+        return json.dumps(out, indent=2)
     except settlement.SettlementSubmitError as e:
         # "Out of patience" is NOT "failed" — and this tool inherits the same 90s budget as
         # xete_settle_create, so it reaches this path routinely. Reporting `failed` here tells
@@ -1357,7 +1380,26 @@ def xete_settle_claim(escrow_id: str, salt: str) -> str:
                          "against an endpoint you trust.",
         }, indent=2)
     except Exception as e:
-        return json.dumps({"status": "failed", "error": str(e)[:300]})
+        out = {"status": "failed", "escrow_id": escrow_id, "error": str(e)[:300]}
+        if sig:
+            # A signature exists here only because settlement.claim RETURNED — which it does
+            # only after the claim reached a durable confirmation. Whatever raised afterwards
+            # broke this tool's reporting, not the money. A bare "failed" would tell the agent
+            # it was not paid for funds already in its wallet, and throw away the one string
+            # that could settle the question.
+            out.update({
+                "status": "submitted_unconfirmed", "submit_outcome": "unconfirmed",
+                "tx_signature": sig,
+                "DO_NOT_ASSUME_YOU_WERE_NOT_PAID":
+                    "The claim was submitted and this tool holds its signature. Do not re-claim, "
+                    "and do not tell the depositor to reclaim, until you have checked.",
+                "next_step": "Call xete_settle_status with this escrow_id and read `determinate` "
+                             "FIRST. determinate=true and open=false: the escrow closed — your "
+                             "claim landed. determinate=true and open=true: it did not land and "
+                             "you can safely retry. determinate=false (open=null): the status "
+                             "could NOT be authenticated — conclude nothing.",
+            })
+        return json.dumps(out, indent=2)
 
 
 @mcp.tool()
@@ -1368,6 +1410,7 @@ def xete_settle_reclaim(escrow_id: str) -> str:
     if bad:
         return bad
     ident = load_or_create_identity(IDENTITY_PATH)
+    sig = None      # set only once the reclaim has CONFIRMED; see the generic handler below
     try:
         from solders.keypair import Keypair
 
@@ -1397,7 +1440,51 @@ def xete_settle_reclaim(escrow_id: str) -> str:
                          "trust.",
         }, indent=2)
     except Exception as e:
-        return json.dumps({"status": "failed", "error": str(e)[:300]})
+        out = {"status": "failed", "escrow_id": escrow_id, "error": str(e)[:300]}
+        if sig:
+            # settlement.reclaim returns only on a durable confirmation, so the funds are back;
+            # reporting "failed" would send the agent retrying an instruction the chain will now
+            # reject, believing its money is still locked.
+            out.update({
+                "status": "submitted_unconfirmed", "submit_outcome": "unconfirmed",
+                "tx_signature": sig,
+                "DO_NOT_ASSUME_YOUR_FUNDS_ARE_STILL_LOCKED":
+                    "The reclaim was submitted and this tool holds its signature.",
+                "next_step": "Call xete_settle_status with this escrow_id and read `determinate` "
+                             "FIRST. determinate=true and open=false: the reclaim landed and the "
+                             "funds are back in your wallet.",
+            })
+        return json.dumps(out, indent=2)
+
+
+_INDETERMINATE_TAIL = (
+    " Do NOT discard a claim ticket, do NOT conclude a payment landed or failed, and do NOT "
+    "reclaim on the strength of it. Re-check against a Solana endpoint you trust.")
+_INDETERMINATE_WARNING = (
+    "open is null, NOT false. This read could not be authenticated, so nothing is "
+    "known about whether this settlement is open or settled." + _INDETERMINATE_TAIL)
+# The read never happened at all — a refused argument, or an endpoint that did not answer.
+_UNANSWERED_WARNING = (
+    "open is null, NOT false. This call never reached the chain, so nothing is known about "
+    "whether this settlement is open or settled." + _INDETERMINATE_TAIL)
+
+
+def _status_refusal(payload_json: str) -> str:
+    """Re-emit one of the shared argument refusals in the three keys THIS tool's callers are
+    told to read.
+
+    `_escrow_id_error` / `_salt_error` are shared with xete_settle_claim and _reclaim, where
+    {"status","error"} is the whole answer. Coming out of xete_settle_status it is not: every
+    unconfirmed-submit message from create/claim/reclaim says "call xete_settle_status and read
+    `determinate` FIRST", and a missing key is not False — an agent reading it as falsey lands on
+    "the deposit did not happen" or "you were paid". A malformed escrow_id or salt means nothing
+    was learned about the escrow, which is the indeterminate state, so it says so.
+    """
+    out = json.loads(payload_json)
+    out["open"] = None
+    out["determinate"] = False
+    out["WARNING_STATUS_IS_INDETERMINATE"] = _UNANSWERED_WARNING
+    return json.dumps(out, indent=2)
 
 
 @mcp.tool()
@@ -1414,11 +1501,11 @@ def xete_settle_status(escrow_id: str, expect_recipient: str = "", salt: str = "
     `beneficiary_verified` comes back null and you have verified nothing."""
     bad = _escrow_id_error(escrow_id)
     if bad:
-        return bad
+        return _status_refusal(bad)
     if salt:
         bad = _salt_error(salt)
         if bad:
-            return bad
+            return _status_refusal(bad)
     try:
         expect_commitment = None
         checked_against = None
@@ -1433,11 +1520,7 @@ def xete_settle_status(escrow_id: str, expect_recipient: str = "", salt: str = "
             # xete_settle_claim's means "you were paid". Both are unfounded, and the first ends
             # with the only copy of the salt discarded. Say it in a key that cannot be read as
             # a boolean.
-            out["WARNING_STATUS_IS_INDETERMINATE"] = (
-                "open is null, NOT false. This read could not be authenticated, so nothing is "
-                "known about whether this settlement is open or settled. Do NOT discard a claim "
-                "ticket, do NOT conclude a payment landed or failed, and do NOT reclaim on the "
-                "strength of it. Re-check against a Solana endpoint you trust.")
+            out["WARNING_STATUS_IS_INDETERMINATE"] = _INDETERMINATE_WARNING
         if checked_against:
             out["checked_against_wallet"] = checked_against
         elif expect_recipient or salt:
@@ -1456,7 +1539,22 @@ def xete_settle_status(escrow_id: str, expect_recipient: str = "", salt: str = "
                                     "salt=<the salt from the claim ticket>")
         return json.dumps(out, indent=2)
     except Exception as e:
-        return json.dumps({"status": "failed", "error": str(e)[:300]})
+        # THIS SHAPE IS AN ANSWER TO A QUESTION, and the question is always "did my money move?".
+        # Every unconfirmed-submit message from create/claim/reclaim sends the agent here with
+        # "read `determinate` FIRST" — and the RPC outage that produces an unconfirmed submit is
+        # the same outage that produces this branch. Returning {"status","error"} alone left the
+        # named field missing exactly when it was needed: `out.get("determinate")` is then None,
+        # which is not False, and an agent reading the absent key as falsey lands on "the deposit
+        # did not happen / you were paid". A read that did not happen is the indeterminate state,
+        # so it says so in the same three keys every other branch uses.
+        return json.dumps({
+            "status": "failed",
+            "escrow_id": str(escrow_id).strip().lower(),
+            "open": None,
+            "determinate": False,
+            "error": str(e)[:300],
+            "WARNING_STATUS_IS_INDETERMINATE": _UNANSWERED_WARNING,
+        }, indent=2)
 
 
 @mcp.tool()

@@ -29,6 +29,7 @@ from solders.system_program import (                                       # noq
 )
 from solders.transaction import Transaction                                # noqa: E402
 from solders.transaction_status import TransactionConfirmationStatus as TCS  # noqa: E402
+from solana.rpc.core import RPCException                                   # noqa: E402
 
 from xete_mcp import draft, settlement, spendguard                         # noqa: E402
 
@@ -382,20 +383,30 @@ class _Status:
 
 
 class _SendClient:
-    """Fake RPC. `statuses` is consumed one per poll; the last entry repeats forever."""
+    """Fake RPC. `statuses` is consumed one per poll; the last entry repeats forever.
+
+    FIXTURE CALIBRATION (finding [G13]): send_transaction used to answer with the constant
+    "SiGnAtUrE" — a string no real endpoint could return, since the signature is ed25519 over the
+    message the client just signed and is therefore fixed before submission. Echoing the
+    transaction's OWN signature is what a real RPC does, and it is what lets the tests below
+    assert the returned value IS the submitted transaction's signature instead of a made-up
+    constant. `_ForeignSignature` below is the same fake lying about it.
+    """
 
     def __init__(self, statuses, blockhash_valid=True):
         self.statuses = list(statuses)
         self.blockhash_valid = blockhash_valid
         self.sent = 0
         self.polls = 0
+        self.signature = None       # the signature of the transaction actually submitted
 
     def get_latest_blockhash(self):
         return SimpleNamespace(value=SimpleNamespace(blockhash=Hash.default()))
 
     def send_transaction(self, _tx, opts=None):
         self.sent += 1
-        return SimpleNamespace(value="SiGnAtUrE")
+        self.signature = str(_tx.signatures[0])
+        return SimpleNamespace(value=_tx.signatures[0])
 
     def get_signature_statuses(self, _sigs):
         self.polls += 1
@@ -439,14 +450,26 @@ def instant(monkeypatch):
     return clock
 
 
-def _send(client):
-    return settlement._send(client, [DEPOSITOR], [_deposit_ix()], DEPOSITOR, "deposit")
+def _send(client, **kw):
+    return settlement._send(client, [DEPOSITOR], [_deposit_ix()], DEPOSITOR, "deposit", **kw)
+
+
+def _capture(cls, *a, **k):
+    """(factory, made) — a settlement.Client replacement that keeps every instance it builds, so
+    a test can read the signature the fake actually submitted."""
+    made: list = []
+
+    def factory(*_a, **_k):
+        made.append(cls(*a, **k))
+        return made[-1]
+
+    return factory, made
 
 
 def test_send_keeps_watching_through_a_congestion_spike(instant):
     """The old client gave up after 60 polls (18s) while the RPC rebroadcasts for 60-90s."""
     client = _SendClient([None] * 70 + [_Status(TCS.Confirmed)])
-    assert _send(client) == "SiGnAtUrE"
+    assert _send(client) == client.signature
     assert client.polls > 60
 
 
@@ -460,23 +483,34 @@ def test_send_does_not_call_processed_confirmed(instant):
 
 
 def test_send_accepts_finalized(instant):
-    assert _send(_SendClient([_Status(TCS.Finalized)])) == "SiGnAtUrE"
+    client = _SendClient([_Status(TCS.Finalized)])
+    assert _send(client) == client.signature
 
 
 def test_a_timeout_hands_back_the_signature_instead_of_a_bare_failure(instant):
     client = _SendClient([None])
     with pytest.raises(settlement.SettlementSubmitError) as ei:
         _send(client)
-    assert ei.value.signature == "SiGnAtUrE"
+    assert ei.value.signature == client.signature
     assert ei.value.outcome == "unconfirmed"
     assert "MAY STILL LAND" in str(ei.value)
 
 
-def test_a_dead_blockhash_with_no_status_is_reported_as_definitely_dropped(instant):
+def test_a_dead_blockhash_with_no_status_is_reported_as_definitely_dropped(instant, monkeypatch):
+    """FIXTURE CALIBRATION (finding [G15]): the assertion is unchanged — a dead blockhash with no
+    status is still reported as definitely dropped — but it now takes TWO endpoints saying so.
+    `dropped` is the one outcome the tools turn into a flat {"status": "failed"}, and both facts
+    it rests on are chosen by the same endpoint, so a second, independently-configured endpoint
+    has to agree. The single-endpoint case is asserted directly below."""
+    monkeypatch.setenv(settlement.ENV_SECOND_RPC, "https://second.example")
+    monkeypatch.setattr(settlement, "Client",
+                        lambda *_a, **_k: _SendClient([None], blockhash_valid=False))
     client = _SendClient([None], blockhash_valid=False)
     with pytest.raises(settlement.SettlementSubmitError) as ei:
-        _send(client)
+        _send(client, rpc_url="https://primary.example")
     assert ei.value.outcome == "dropped"
+    assert ei.value.signature == client.signature
+    assert "second" in str(ei.value)
 
 
 def test_an_on_chain_error_is_still_a_failure(instant):
@@ -502,7 +536,7 @@ def test_deposit_hands_over_the_claim_ticket_before_submitting(spend_ok, monkeyp
     seen: list[dict] = []
     submitted: list[str] = []
 
-    def fake_send(_client, _signers, _ixs, _payer, label, ticket=None):
+    def fake_send(_client, _signers, _ixs, _payer, label, ticket=None, rpc_url=None):
         submitted.append(label)
         raise settlement.SettlementSubmitError("timed out", signature="SiG",
                                                outcome="unconfirmed", ticket=ticket)
@@ -1554,6 +1588,7 @@ class _DiesAfterSubmit:
     def __init__(self, exc=None):
         self.exc = exc or RuntimeError("429 Too Many Requests")
         self.sent = 0
+        self.signature = None
 
     def get_latest_blockhash(self):
         return SimpleNamespace(value=SimpleNamespace(blockhash=Hash.default()))
@@ -1563,7 +1598,8 @@ class _DiesAfterSubmit:
 
     def send_transaction(self, _tx, opts=None):
         self.sent += 1
-        return SimpleNamespace(value="LiVeSiGnAtUrE111")
+        self.signature = str(_tx.signatures[0])
+        return SimpleNamespace(value=_tx.signatures[0])
 
     def get_signature_statuses(self, _sigs):
         raise self.exc
@@ -1580,7 +1616,7 @@ def test_an_rpc_that_dies_after_a_successful_submit_keeps_the_signature(instant)
                          ticket={"escrow_id": ESCROW_ID.hex(), "salt": SALT.hex()})
     assert client.sent == 1, "the transaction really was submitted"
     assert ei.value.outcome == "unconfirmed", "'failed' asserts an outcome we do not know"
-    assert ei.value.signature == "LiVeSiGnAtUrE111"
+    assert ei.value.signature == client.signature
     assert ei.value.ticket["salt"] == SALT.hex()
     assert "MAY WELL HAVE LANDED" in str(ei.value)
 
@@ -1597,10 +1633,11 @@ def test_claim_and_reclaim_keep_the_signature_when_the_rpc_429s_after_submit(
     monkeypatch.setattr(server_mod, "load_or_create_identity",
                         lambda _p: SimpleNamespace(ed_seed=bytes([1] * 32),
                                                    pubkey_b58=str(DEPOSITOR.pubkey())))
-    monkeypatch.setattr(settlement, "Client", lambda *_a, **_k: _DiesAfterSubmit())
+    factory, made = _capture(_DiesAfterSubmit)
+    monkeypatch.setattr(settlement, "Client", factory)
     out = json.loads(getattr(server_mod, tool)(*args))
     assert out["status"] == "submitted_unconfirmed", "'failed' for a live transaction"
-    assert out["tx_signature"] == "LiVeSiGnAtUrE111", "the signature is the only way to resolve it"
+    assert out["tx_signature"] == made[0].signature, "the signature is the only way to resolve it"
     assert "xete_settle_status" in out["next_step"]
 
 
@@ -1611,10 +1648,11 @@ def test_settle_create_keeps_ticket_and_signature_when_the_rpc_429s_after_submit
     monkeypatch.setattr(server_mod, "load_or_create_identity",
                         lambda _p: SimpleNamespace(ed_seed=bytes([1] * 32),
                                                    pubkey_b58=str(DEPOSITOR.pubkey())))
-    monkeypatch.setattr(settlement, "Client", lambda *_a, **_k: _DiesAfterSubmit())
+    factory, made = _capture(_DiesAfterSubmit)
+    monkeypatch.setattr(settlement, "Client", factory)
     out = json.loads(server_mod.xete_settle_create(str(RECIPIENT.pubkey()), 1.0))
     assert out["status"] == "submitted_unconfirmed"
-    assert out["tx_signature"] == "LiVeSiGnAtUrE111"
+    assert out["tx_signature"] == made[0].signature
     assert len(bytes.fromhex(out["ticket"]["salt"])) == 16
     assert "KEEP_THIS_TICKET" in out
 
@@ -1633,9 +1671,10 @@ def test_a_receipt_read_failure_does_not_unclaim_a_confirmed_claim(monkeypatch, 
                 raise RuntimeError("429 Too Many Requests")
             return SimpleNamespace(value=0)
 
-    monkeypatch.setattr(settlement, "Client", _C)
+    factory, made = _capture(_C)
+    monkeypatch.setattr(settlement, "Client", factory)
     sig, received = settlement.claim("http://127.0.0.1:1", RECIPIENT, ESCROW_ID.hex(), SALT.hex())
-    assert sig == "SiGnAtUrE", "the claim confirmed; a receipt read must not undo that"
+    assert sig == made[0].signature, "the claim confirmed; a receipt read must not undo that"
     assert received is None, "unknown, and reported as unknown rather than as zero"
 
 
@@ -1734,3 +1773,475 @@ def test_supplying_the_escrow_id_removes_the_warning(chain, drafting):
     assert v["verified"] is True, v["failed_checks"]
     assert "WARNING_ESCROW_ID_NOT_CHECKED" not in v
     assert v["verdict"] == "SAFE TO REVIEW AND SIGN"
+
+
+# ══ THE SUBMIT/RECEIPT REPORTING GROUP — [G8] [G9] [G13] [G15] [G19] ═════════════════
+#
+# One bug wearing five hats: a transaction that IS or MAY BE live on the cluster is reported as
+# a clean failure, and the signature — which this client computes locally before it submits
+# anything — is thrown away. The caller is then told they were not paid, and has no string with
+# which to find out otherwise.
+
+
+def _raiser(exc):
+    """A settlement.Client replacement whose construction itself fails — an RPC that is simply
+    not there."""
+    def _factory(*_a, **_k):
+        raise exc
+    return _factory
+
+
+class _ReceiptDies(_SendClient):
+    """The claim CONFIRMS, and the balance read that measures the receipt does not answer.
+
+    `which` picks the trigger: "pre" fails the read taken BEFORE submission, "post" the one
+    after. Either alone makes settlement.claim return received=None — deliberately, so that a
+    429 on a receipt cannot become "your claim failed".
+    """
+
+    def __init__(self, which):
+        super().__init__([_Status(TCS.Confirmed)])
+        self.which = which
+        self.balance_calls = 0
+
+    def get_balance(self, *_a, **_k):
+        self.balance_calls += 1
+        if (self.which == "pre") == (self.balance_calls == 1):
+            raise RuntimeError("429 Too Many Requests")
+        return SimpleNamespace(value=0)
+
+
+@pytest.mark.parametrize("which", ["pre", "post"])
+def test_the_claim_TOOL_does_not_report_a_confirmed_claim_as_failed(
+        server_mod, monkeypatch, instant, which):
+    """[G8] THE ONE THAT WAS ALREADY TESTED ONE LAYER TOO LOW.
+
+    test_a_receipt_read_failure_does_not_unclaim_a_confirmed_claim asserts the exact value that
+    breaks this tool — received is None — but it calls settlement.claim directly and never
+    xete_settle_claim. The tool then did `received / 1e9`, TypeError, straight into its own bare
+    `except Exception`: a CONFIRMED, landed claim reported as {"status": "failed"} with no
+    tx_signature, no DO_NOT_ASSUME_YOU_WERE_NOT_PAID and no next_step. The agent tells the
+    depositor to reclaim, and a settled payment is unwound.
+    """
+    _identity(monkeypatch, server_mod)
+    factory, made = _capture(_ReceiptDies, which)
+    monkeypatch.setattr(settlement, "Client", factory)
+
+    out = json.loads(server_mod.xete_settle_claim(ESCROW_ID.hex(), SALT.hex()))
+
+    assert out["status"] == "claimed", "a confirmed claim reported as a failure"
+    assert out["tx_signature"] == made[0].signature, "the signature must survive a lost receipt"
+    assert out["received_sol"] is None, "unknown, and reported as unknown rather than as zero"
+    assert "receipt_note" in out and "CONFIRMED" in out["receipt_note"]
+
+
+def test_an_unforeseen_error_after_a_confirmed_claim_still_carries_the_signature(
+        server_mod, monkeypatch):
+    """[G8], second half. The division was one instance of a class: anything raising after the
+    claim returns lands in the generic handler, which emitted a bare failure. If the tool holds a
+    signature, the money already moved and 'failed' is never the honest word."""
+    _identity(monkeypatch, server_mod)
+
+    class _Unserialisable:
+        def __truediv__(self, _o):
+            raise TypeError("a shape nobody anticipated")
+
+    monkeypatch.setattr(settlement, "claim",
+                        lambda *_a, **_k: ("CoNfIrMeDsIg", _Unserialisable()))
+    out = json.loads(server_mod.xete_settle_claim(ESCROW_ID.hex(), SALT.hex()))
+
+    assert out["status"] != "failed", "the claim confirmed; only the reporting broke"
+    assert out["tx_signature"] == "CoNfIrMeDsIg"
+    assert "DO_NOT_ASSUME_YOU_WERE_NOT_PAID" in out
+
+
+class _SendRaises(_SendClient):
+    """The endpoint accepts the transaction — the cluster will index it under the signature this
+    client already holds — and then the response never arrives. A read timeout, a proxy 502, a
+    dropped socket. Indistinguishable, from here, from an endpoint that never forwarded it."""
+
+    def __init__(self, exc=None):
+        super().__init__([_Status(TCS.Confirmed)])
+        self.exc = exc or RuntimeError("ReadTimeout: the response never came back")
+
+    def get_balance(self, *_a, **_k):
+        return SimpleNamespace(value=0)
+
+    def send_transaction(self, _tx, opts=None):
+        self.sent += 1
+        self.signature = str(_tx.signatures[0])     # what the cluster will index it under
+        raise self.exc
+
+
+def test_a_send_that_raises_keeps_the_locally_signed_signature(instant):
+    """[G9] The 'FROM HERE ON THE TRANSACTION IS LIVE' comment sat one line BELOW the send call,
+    and nothing guarded the call itself. The signature was never unknown — the transaction is
+    signed locally on the line above — it was simply never captured."""
+    client = _SendRaises()
+    with pytest.raises(settlement.SettlementSubmitError) as ei:
+        _send(client)
+    assert client.sent == 1
+    assert ei.value.outcome == "unconfirmed", "'failed' asserts an outcome we do not know"
+    assert ei.value.signature == client.signature, "the id the cluster would index it under"
+    assert "MAY ALREADY BE LIVE" in str(ei.value)
+
+
+def test_a_send_that_raises_keeps_the_deposit_ticket_too(instant):
+    """[G9] The ticket is the only copy of the salt. A submit-call failure must not lose it."""
+    ticket = {"escrow_id": ESCROW_ID.hex(), "salt": SALT.hex()}
+    with pytest.raises(settlement.SettlementSubmitError) as ei:
+        settlement._send(_SendRaises(), [DEPOSITOR], [_deposit_ix()], DEPOSITOR, "deposit",
+                         ticket=ticket)
+    assert ei.value.ticket == ticket
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("xete_settle_claim", (ESCROW_ID.hex(), SALT.hex())),
+    ("xete_settle_reclaim", (ESCROW_ID.hex(),)),
+])
+def test_the_tools_report_a_send_that_raises_as_live_not_failed(
+        server_mod, monkeypatch, instant, tool, args):
+    """[G9] at the surface the agent actually reads. Both tools returned nothing but an error
+    string for a transaction the cluster may be confirming."""
+    _identity(monkeypatch, server_mod)
+    factory, made = _capture(_SendRaises)
+    monkeypatch.setattr(settlement, "Client", factory)
+
+    out = json.loads(getattr(server_mod, tool)(*args))
+
+    assert out["status"] == "submitted_unconfirmed", "'failed' for a possibly-live transaction"
+    assert out["tx_signature"] == made[0].signature
+    assert "xete_settle_status" in out["next_step"]
+
+
+def test_settle_create_reports_a_send_that_raises_as_live_and_keeps_the_ticket(
+        server_mod, monkeypatch, instant, spend_ok):
+    """[G9] create kept the ticket but lost the signature, because the raise never became a
+    SettlementSubmitError."""
+    _identity(monkeypatch, server_mod)
+    factory, made = _capture(_SendRaises)
+    monkeypatch.setattr(settlement, "Client", factory)
+
+    out = json.loads(server_mod.xete_settle_create(str(RECIPIENT.pubkey()), 1.0))
+
+    assert out["status"] == "submitted_unconfirmed"
+    assert out["tx_signature"] == made[0].signature
+    assert len(bytes.fromhex(out["ticket"]["salt"])) == 16
+    assert "KEEP_THIS_TICKET" in out
+
+
+def test_a_failure_before_the_send_call_is_still_an_ordinary_error(instant):
+    """[G9]'s over-correction guard. The boundary moved UP to the send call, not further: an
+    exception raised before it must not claim a transaction was submitted."""
+    class _NeverSends(_SendClient):
+        def get_latest_blockhash(self):
+            raise RuntimeError("connection refused")
+
+    with pytest.raises(RuntimeError) as ei:
+        _send(_NeverSends([None]))
+    assert not isinstance(ei.value, settlement.SettlementSubmitError)
+
+
+class _ForeignSignature(_SendClient):
+    """An endpoint that answers with a receipt for a DIFFERENT transaction — a hostile endpoint,
+    a buggy one, or a proxy that submitted something else."""
+
+    FOREIGN = "5fwM657mN3n3LXbMeGSttmUG3N147sHcmn775i3kZ92Afrx3iVGStXMnSyVzpD39t6H3L7e3mz8Sb4zP4iTc4MM7"
+
+    def send_transaction(self, _tx, opts=None):
+        self.sent += 1
+        self.signature = str(_tx.signatures[0])
+        return SimpleNamespace(value=self.FOREIGN)
+
+
+def test_an_endpoint_does_not_get_to_name_our_transaction(instant):
+    """[G13] The signature is deterministic and computed locally, so comparing it is free — and
+    it was not done. An endpoint could hand back a receipt pointing at a stranger's transaction,
+    and the whole recovery story ('check signature X on chain') would then confirm that
+    stranger's transaction as ours."""
+    client = _ForeignSignature([_Status(TCS.Confirmed)])
+    with pytest.raises(settlement.SettlementSubmitError) as ei:
+        _send(client, rpc_url="https://liar.example")
+    assert ei.value.outcome == "unconfirmed", "the transaction may still be live"
+    assert ei.value.signature == client.signature, "report OUR signature, never the endpoint's"
+    assert _ForeignSignature.FOREIGN not in ei.value.signature
+    assert "liar.example" in str(ei.value), "name the endpoint that did it"
+
+
+def test_a_foreign_signature_never_reaches_the_caller_as_a_success(server_mod, monkeypatch,
+                                                                   instant):
+    """[G13] at the tool surface: the reviewer's poc7 reported status=reclaimed with a mainnet
+    signature belonging to somebody else."""
+    _identity(monkeypatch, server_mod)
+    factory, made = _capture(_ForeignSignature, [_Status(TCS.Confirmed)])
+    monkeypatch.setattr(settlement, "Client", factory)
+
+    out = json.loads(server_mod.xete_settle_reclaim(ESCROW_ID.hex()))
+
+    assert out["status"] != "reclaimed"
+    assert out["tx_signature"] == made[0].signature
+    assert _ForeignSignature.FOREIGN not in json.dumps(out), \
+        "no field an agent could lift a signature from may carry the endpoint's"
+    # The tools truncate str(e) at 400 characters and the ENDPOINT chooses that text, so a
+    # message that ends with "check signature <ours>" can be cut off while an attacker-supplied
+    # signature-shaped string survives at the front. Our signature has to lead.
+    assert made[0].signature in out["error"], \
+        "the recovery string must survive the tools' 400-character truncation"
+
+
+def test_a_dropped_verdict_is_not_taken_from_one_endpoint(instant, monkeypatch):
+    """[G15] `dropped` is the one outcome the tools turn into a flat {"status": "failed"}, and
+    xete_settle_claim's own guidance reads it as proof the claim did not land. Both facts behind
+    it — 'no status for this signature' and 'the blockhash is dead' — are chosen by the SAME
+    endpoint. This module refuses single-source conclusions everywhere else; this was the one
+    place it did not."""
+    monkeypatch.delenv(settlement.ENV_SECOND_RPC, raising=False)   # and no network from a test
+    client = _SendClient([None], blockhash_valid=False)
+    with pytest.raises(settlement.SettlementSubmitError) as ei:
+        _send(client, rpc_url="https://only.example")
+    assert ei.value.outcome == "unconfirmed", "one endpoint cannot prove a transaction is dead"
+    assert ei.value.signature == client.signature
+    assert settlement.ENV_SECOND_RPC in str(ei.value), "say how to earn the definite answer"
+
+
+def test_a_second_endpoint_that_has_seen_the_transaction_blocks_the_dropped_verdict(
+        instant, monkeypatch):
+    """[G15] The contradiction case. If the corroborator HAS a status for the signature, the
+    primary's 'the cluster never saw it' is contradicted and must not become a verdict."""
+    monkeypatch.setenv(settlement.ENV_SECOND_RPC, "https://second.example")
+    monkeypatch.setattr(settlement, "Client",
+                        lambda *_a, **_k: _SendClient([_Status(TCS.Processed)]))
+    client = _SendClient([None], blockhash_valid=False)
+    with pytest.raises(settlement.SettlementSubmitError) as ei:
+        _send(client, rpc_url="https://primary.example")
+    assert ei.value.outcome == "unconfirmed"
+    assert client.polls > 20, "it must go back to watching, not conclude from the primary"
+
+
+def test_a_silenced_second_endpoint_does_not_upgrade_a_guess_into_a_verdict(instant, monkeypatch):
+    """[G15] The adversary who can lie on endpoint 1 can usually also drop endpoint 2. A
+    corroborator that does not answer corroborates nothing."""
+    monkeypatch.setenv(settlement.ENV_SECOND_RPC, "https://second.example")
+
+    def _refused(*_a, **_k):
+        raise ConnectionRefusedError("silenced")
+
+    monkeypatch.setattr(settlement, "Client", _refused)
+    with pytest.raises(settlement.SettlementSubmitError) as ei:
+        _send(_SendClient([None], blockhash_valid=False), rpc_url="https://primary.example")
+    assert ei.value.outcome == "unconfirmed"
+
+
+def test_settle_status_reports_determinate_false_when_the_read_itself_fails(
+        server_mod, monkeypatch):
+    """[G19] Every unconfirmed-submit message from create/claim/reclaim says 'call
+    xete_settle_status and read `determinate` FIRST' — and the RPC outage that produces an
+    unconfirmed submit is the same outage that produces this branch. The field the guidance names
+    was missing exactly when it was needed, and an absent key reads as falsey: 'the deposit did
+    not happen', 'you were paid'."""
+    def _down(*_a, **_k):
+        raise ConnectionRefusedError("primary down")
+
+    monkeypatch.setattr(settlement, "Client", _down)
+    out = json.loads(server_mod.xete_settle_status(ESCROW_ID.hex()))
+
+    assert out["status"] == "failed", "the READ failed, and that much is true"
+    assert out["determinate"] is False, "the field the recovery guidance tells agents to read"
+    assert out["open"] is None, "not false — nothing was learned about the escrow"
+    assert "WARNING_STATUS_IS_INDETERMINATE" in out
+    assert "Do NOT discard a claim ticket" in out["WARNING_STATUS_IS_INDETERMINATE"]
+    assert "primary down" in out["error"], "the diagnostic must not be swallowed either"
+
+
+def test_every_settle_status_shape_carries_determinate(server_mod, monkeypatch):
+    """[G19] as a property rather than a case: an agent following the recovery guidance branches
+    on `determinate`, so no answer-shaped response from this tool may omit it."""
+    mine = settlement.commitment(RECIPIENT.pubkey(), SALT)
+    shapes = {
+        "open": _account_client(_state(DEPOSITOR.pubkey(), AMOUNT, mine)),
+        "settled": _account_client(None),
+        "unknown-layout": _account_client(_state(DEPOSITOR.pubkey(), AMOUNT, mine) + b"\x00"),
+        "read-failed": _raiser(ConnectionRefusedError("primary down")),
+    }
+    for name, client in shapes.items():
+        monkeypatch.setattr(settlement, "Client", client)
+        out = json.loads(server_mod.xete_settle_status(ESCROW_ID.hex()))
+        assert "determinate" in out, f"the {name} shape omits `determinate`"
+        assert isinstance(out["determinate"], bool)
+
+
+# ══ what the fresh-context adversarial pass on this change broke ═════════════════════
+# See reviews/DDR-settlement-submit-receipt-20260801.md, doubts D1-D6. Every test below
+# corresponds to a claim that pass BROKE, or to a branch it found had no coverage at all.
+
+
+class _PreflightRefusal(_SendClient):
+    """The endpoint SIMULATES the transaction (skip_preflight=False) and refuses to forward it.
+    A wrong salt, an escrow already claimed, not enough lamports. It answered, and its answer is
+    a refusal: nothing was forwarded and nothing executed."""
+
+    def __init__(self, statuses=(None,)):
+        super().__init__(list(statuses))
+
+    def get_balance(self, *_a, **_k):
+        return SimpleNamespace(value=0)
+
+    def send_transaction(self, _tx, opts=None):
+        self.sent += 1
+        self.signature = str(_tx.signatures[0])
+        raise RPCException("Transaction simulation failed: Error processing Instruction 0: "
+                           "custom program error: 0x1")
+
+
+def test_a_preflight_refusal_is_a_failure_not_a_maybe_live_transaction(instant):
+    """[D2] The G9 guard's over-correction. Wrapping the send call turned every DETERMINISTIC
+    rejection into 'MAY ALREADY BE LIVE — do not re-claim', which is the opposite of the advice
+    a wrong salt needs. An endpoint that answered with a JSON-RPC error refused to forward it."""
+    client = _PreflightRefusal()
+    with pytest.raises(settlement.SettlementSubmitError) as ei:
+        _send(client, rpc_url="https://honest.example")
+    assert ei.value.outcome == "failed", "the endpoint answered, and its answer was a refusal"
+    assert ei.value.signature == client.signature, "keep the signature anyway — it costs nothing"
+    assert "REJECTED" in str(ei.value)
+
+
+def test_the_claim_tool_tells_an_agent_to_fix_a_rejected_claim_not_to_wait(
+        server_mod, monkeypatch, instant):
+    """[D2] at the surface: 'submitted_unconfirmed' here would tell the agent its bad-salt claim
+    might still land, and to leave it alone."""
+    _identity(monkeypatch, server_mod)
+    factory, made = _capture(_PreflightRefusal)
+    monkeypatch.setattr(settlement, "Client", factory)
+    out = json.loads(server_mod.xete_settle_claim(ESCROW_ID.hex(), SALT.hex()))
+    assert out["status"] == "failed"
+    assert out["submit_outcome"] == "failed"
+    assert out["tx_signature"] == made[0].signature, "HEAD lost this; a rejection keeps it now"
+
+
+def test_a_transport_failure_is_still_treated_as_possibly_live(instant):
+    """[D2]'s own guard: narrowing to RPCException must not swallow the G9 case it was built
+    for. A transport error is not an answer."""
+    client = _SendRaises()
+    with pytest.raises(settlement.SettlementSubmitError) as ei:
+        _send(client)
+    assert ei.value.outcome == "unconfirmed"
+
+
+def test_an_error_at_processed_is_not_yet_a_definite_failure(instant):
+    """[D1] THE REVIEWER'S HEADLINE. `Processed` is refused as proof of SUCCESS one line below,
+    because it can still be forked away — so it cannot be proof of FAILURE either. This was the
+    cheaper twin of the single-source `dropped` verdict: one poll, one endpoint, and the tools
+    turn outcome='failed' into 'you were not paid' / 'your funds are still locked'."""
+    client = _SendClient([_Status(TCS.Processed, err={"InstructionError": [0, {"Custom": 1}]})])
+    with pytest.raises(settlement.SettlementSubmitError) as ei:
+        _send(client)
+    assert ei.value.outcome != "failed", "one forkable opinion is not a definite failure"
+    assert ei.value.outcome == "unconfirmed"
+    assert ei.value.signature == client.signature
+    assert client.polls > 1, "it must keep watching, not conclude on the first poll"
+
+
+def test_an_error_that_reaches_a_durable_status_is_still_a_definite_failure(instant):
+    """[D1]'s over-correction guard. The chain's own answer, at a commitment that cannot be
+    forked away, must still be reported as the failure it is."""
+    client = _SendClient([_Status(TCS.Processed, err="Custom(1)"),
+                          _Status(TCS.Finalized, err="Custom(1)")])
+    with pytest.raises(settlement.SettlementSubmitError) as ei:
+        _send(client)
+    assert ei.value.outcome == "failed"
+
+
+def test_a_second_endpoint_that_calls_the_blockhash_alive_blocks_the_dropped_verdict(
+        instant, monkeypatch):
+    """[D5] The one _corroborate_dropped branch the first round left untested: the corroborator
+    has no status either, but does NOT agree the blockhash is dead."""
+    monkeypatch.setenv(settlement.ENV_SECOND_RPC, "https://second.example")
+    monkeypatch.setattr(settlement, "Client",
+                        lambda *_a, **_k: _SendClient([None], blockhash_valid=True))
+    with pytest.raises(settlement.SettlementSubmitError) as ei:
+        _send(_SendClient([None], blockhash_valid=False), rpc_url="https://primary.example")
+    assert ei.value.outcome == "unconfirmed"
+    assert "does not agree" in str(ei.value)
+
+
+def test_the_corroboration_is_time_bounded(instant, monkeypatch):
+    """[D4] solana-py's default is 10 SECONDS PER REQUEST and this makes two of them, from
+    inside a loop whose documented contract is that the confirmation budget bounds the total."""
+    seen: list = []
+
+    def _factory(url, *_a, **kw):
+        seen.append(kw.get("timeout"))
+        return _SendClient([None], blockhash_valid=False)
+
+    monkeypatch.setenv(settlement.ENV_SECOND_RPC, "https://second.example")
+    monkeypatch.setenv(settlement.ENV_CONFIRM_SECONDS, "10")   # enough polls to reach the check
+    monkeypatch.setattr(settlement, "Client", _factory)
+    with pytest.raises(settlement.SettlementSubmitError):
+        _send(_SendClient([None], blockhash_valid=False), rpc_url="https://primary.example")
+    assert seen, "the corroborating client was never built"
+    assert all(t is not None for t in seen), "an unbounded corroborator can hang the tool"
+    assert all(t <= settlement._CORROBORATION_TIMEOUT for t in seen)
+
+
+@pytest.mark.parametrize("bad_args,why", [
+    ((OVERLONG_ESCROW_ID,), "a malformed escrow_id"),
+    ((ESCROW_ID.hex(), str(RECIPIENT.pubkey()), "zz"), "a malformed salt"),
+])
+def test_settle_status_argument_refusals_also_carry_determinate(server_mod, bad_args, why):
+    """[D3] The property test in the first round enumerated four dict shapes and missed the two
+    guard early-returns — which are the shapes an attacker-supplied claim ticket reaches. Escrow
+    ids and salts arrive in the inbox."""
+    out = json.loads(server_mod.xete_settle_status(*bad_args))
+    assert out["status"] == "failed"
+    assert out["determinate"] is False, f"{why} must not omit the field agents branch on"
+    assert out["open"] is None
+    assert "WARNING_STATUS_IS_INDETERMINATE" in out
+
+
+@pytest.mark.parametrize("tool,fn,args", [
+    ("xete_settle_create", "deposit", (str(RECIPIENT.pubkey()), 1.0)),
+    ("xete_settle_reclaim", "reclaim", (ESCROW_ID.hex(),)),
+])
+def test_create_and_reclaim_also_carry_a_signature_out_of_the_generic_handler(
+        server_mod, monkeypatch, spend_ok, tool, fn, args):
+    """[D6] The mutation pass found the signature-carry in create's and reclaim's generic
+    handlers had no test at all — working code, zero coverage. Same property as the claim tool:
+    settlement.deposit/reclaim return only on a durable confirmation, so anything raising after
+    that broke the reporting, not the money."""
+    _identity(monkeypatch, server_mod)
+
+    class _Weird:
+        def __str__(self):
+            raise TypeError("not serialisable, and not the chain's problem")
+
+    def _returns_then_breaks(*_a, **_k):
+        # deposit returns a 4-tuple, reclaim a bare signature; both then meet an object that
+        # blows up during response assembly.
+        return ("00" * 32, "11" * 16, _Weird(), "CoNfIrMeDsIg") if fn == "deposit" \
+            else "CoNfIrMeDsIg"
+
+    monkeypatch.setattr(settlement, fn, _returns_then_breaks)
+    if fn == "reclaim":
+        monkeypatch.setattr(server_mod, "json", _BreaksOnce(server_mod.json))
+    out = json.loads(getattr(server_mod, tool)(*args))
+
+    assert out["status"] != "failed", "the transaction confirmed; only the reporting broke"
+    assert out["tx_signature"] == "CoNfIrMeDsIg"
+
+
+class _BreaksOnce:
+    """`json` for the module under test: the FIRST dumps() raises, later ones work. Models an
+    unforeseen serialisation failure on the success path without touching the error path."""
+
+    def __init__(self, real):
+        self._real = real
+        self._armed = True
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def dumps(self, *a, **k):
+        if self._armed:
+            self._armed = False
+            raise TypeError("Object of type _Weird is not JSON serializable")
+        return self._real.dumps(*a, **k)

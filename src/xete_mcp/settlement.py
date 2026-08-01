@@ -34,6 +34,12 @@ from solana.rpc.api import Client
 from solana.rpc.commitment import Confirmed
 from solana.rpc.types import TxOpts
 
+try:                                     # the JSON-RPC error type, as distinct from transport
+    from solana.rpc.core import RPCException
+except Exception:                        # pragma: no cover — layout drift in solana-py
+    class RPCException(Exception):       # never raised by anything; the guard below then falls
+        """Placeholder so the endpoint-answered branch simply never matches."""
+
 SYS = Pubkey.from_string("11111111111111111111111111111111")
 CB = Pubkey.from_string("ComputeBudget111111111111111111111111111111")
 MAINNET_PROGRAM = "GPCsJ6kvrQ61wDG8bpP8315ge7AHfmsUHdxTD7LQ6CoJ"
@@ -74,6 +80,10 @@ DEFAULT_CONFIRM_SECONDS = 90.0
 # XETE_RPC_URL, or it is the same source twice and buys nothing.
 ENV_SECOND_RPC = "XETE_RPC_URL_2"
 _POLL_SECONDS = 0.3
+# Per-request ceiling for the corroborating endpoint. solana-py's default is 10s per request and
+# _corroborate_dropped makes two, from inside a loop that promises the confirmation budget bounds
+# the whole call. It is clamped again against the remaining budget at the call site.
+_CORROBORATION_TIMEOUT = 5.0
 # Only these are durable. `Processed` is one validator's opinion and can still be forked away.
 _DURABLE = (TransactionConfirmationStatus.Confirmed, TransactionConfirmationStatus.Finalized)
 
@@ -90,9 +100,15 @@ class SettlementSubmitError(RuntimeError):
       ticket    — for a deposit, the escrow_id + salt. The salt is NEVER written on chain (only
                   its hash is), so if this object is dropped the beneficiary can never prove the
                   commitment and the funds are unclaimable.
-      outcome   — "unconfirmed": may still land, DO NOT assume it failed.
-                  "dropped":     the blockhash died before the cluster ever saw it; it cannot land.
-                  "failed":      the chain executed it and it errored.
+      outcome   — "unconfirmed": may still land, DO NOT assume it failed. This is the default,
+                  and it is where anything that cannot be established belongs.
+                  "dropped":     the blockhash died before the cluster ever saw it; it cannot
+                  land. Requires TWO endpoints to say so — the tools turn this into a flat
+                  "failed", so one endpoint's word is not enough to earn it.
+                  "failed":      it did not take effect. Either the chain executed it and it
+                  errored (at a DURABLE commitment — a `Processed` error is still forkable and
+                  is not accepted as proof), or the endpoint simulated it at submit and refused
+                  to forward it. The signature is carried in both cases anyway.
     """
 
     def __init__(self, message: str, *, signature: str | None = None,
@@ -187,11 +203,70 @@ def _blockhash_alive(client: Client, bh) -> bool | None:
 
 
 def _send(client: Client, signers, ixs, payer: Keypair, label: str,
-          ticket: dict | None = None) -> str:
+          ticket: dict | None = None, rpc_url: str | None = None) -> str:
     bh = client.get_latest_blockhash().value.blockhash
     tx = Transaction(signers, Message.new_with_blockhash([_cb_limit(60_000), _cb_price(1_000)] + ixs, payer.pubkey(), bh), bh)
-    sig = client.send_transaction(tx, opts=TxOpts(skip_preflight=False, preflight_commitment=Confirmed)).value
-    # ── FROM HERE ON THE TRANSACTION IS LIVE ON THE CLUSTER ────────────────────────────────
+    # THE SIGNATURE IS KNOWN HERE, BEFORE ANYTHING IS SUBMITTED. It is ed25519 over the signed
+    # message, computed locally by Transaction() — it is the id the cluster will index this
+    # transaction under, and it does not depend on any endpoint answering. Every recovery story
+    # on this path ("check signature X on chain") needs it, so it is captured before the one call
+    # that can lose it instead of being read off the RPC's reply afterwards.
+    sig = tx.signatures[0]
+    sig_local = str(sig)
+    # ── FROM HERE ON THE TRANSACTION IS OR MAY BE LIVE ON THE CLUSTER ──────────────────────
+    # The boundary is the send CALL, not its return. An endpoint that read the request and
+    # forwarded it has already made the transaction live; a read timeout, a proxy 502 or a
+    # dropped socket on the RESPONSE leaves it landing while this client raises. An endpoint
+    # that failed before forwarding is INDISTINGUISHABLE from that, from here. Unguarded, the
+    # raise unwound past every SettlementSubmitError handler into the tools' bare
+    # `except Exception`, which reported {"status": "failed"} AND discarded the signature —
+    # telling the caller they were not paid for a transaction the cluster may be confirming.
+    # NOTE ON MESSAGE ORDER, here and in every SettlementSubmitError below: OUR signature is
+    # stated before any endpoint-controlled text. The tools truncate `str(e)` at 400 characters,
+    # and the endpoint chooses the exception text — so a message that ends with "check signature
+    # X" can have X cut off while an attacker-supplied signature-shaped string survives at the
+    # front. The recovery string leads.
+    try:
+        returned = client.send_transaction(
+            tx, opts=TxOpts(skip_preflight=False, preflight_commitment=Confirmed)).value
+    except SettlementSubmitError:
+        raise
+    except RPCException as e:
+        # THE ENDPOINT ANSWERED, and its answer is a refusal. With skip_preflight=False the node
+        # simulates the transaction and declines to forward what fails, so this is the ordinary
+        # deterministic rejection — a wrong salt, an escrow already claimed, not enough lamports
+        # — and calling it "may be live" would tell the agent not to retry the very thing it
+        # should fix. It is reported as the failure it is, but WITH the signature: if this
+        # endpoint is lying about not forwarding, that string is the only way to find out.
+        raise SettlementSubmitError(
+            f"{label} was REJECTED at submit: signature {sig_local}. The endpoint "
+            f"{rpc_url or '(unnamed)'} simulated it and refused to forward it, so it did not "
+            f"execute and nothing moved. Fix the cause and retry. (If you have reason to doubt "
+            f"that endpoint, check the signature on chain — a node that refused a transaction it "
+            f"had already forwarded would look the same.) Endpoint said: "
+            f"{type(e).__name__}: {str(e)[:160]}",
+            signature=sig_local, outcome="failed", ticket=ticket) from e
+    except Exception as e:                      # noqa: BLE001 — deliberate, see above
+        raise SettlementSubmitError(
+            f"{label} MAY ALREADY BE LIVE: check signature {sig_local} on chain before retrying "
+            f"or discarding anything. The transaction is SIGNED and the submit call itself "
+            f"failed without an answer from the endpoint — one that forwarded it and then failed "
+            f"to reply looks exactly like one that never forwarded it. This is NOT a confirmed "
+            f"failure. Transport error: {type(e).__name__}: {str(e)[:160]}",
+            signature=sig_local, outcome="unconfirmed", ticket=ticket) from e
+    # The endpoint does not get to name our transaction. The signature is deterministic and we
+    # computed it above, so an endpoint returning anything else is handing back a receipt for a
+    # DIFFERENT transaction — and the whole recovery story ("look up signature X") would then
+    # confirm a stranger's transaction as ours. Free check, so make it; and poll on the local
+    # signature regardless of what came back.
+    if str(returned) != sig_local:
+        raise SettlementSubmitError(
+            f"{label}: SIGNATURE MISMATCH — this client signed {sig_local}, and that is the only "
+            f"transaction to look for. The endpoint {rpc_url or '(unnamed)'} answered with a "
+            f"different signature, so nothing it says about either transaction can be trusted. "
+            f"The transaction MAY BE LIVE — check ours against a different endpoint before "
+            f"retrying or discarding anything. It returned: {str(returned)[:96]}",
+            signature=sig_local, outcome="unconfirmed", ticket=ticket)
     # Everything below only WATCHES it. No failure of the watching can un-submit it, so no
     # failure of the watching may be reported as a failure of the transaction. This try/except
     # is the whole guarantee: without it, the very first `get_signature_statuses` call raising —
@@ -201,21 +276,64 @@ def _send(client: Client, signers, ixs, payer: Keypair, label: str,
     # signature, leaving the caller with no way to find a transaction that was already landing.
     # Catching it here fixes create, claim and reclaim at one site and keeps the signature.
     try:
-        return _await_confirmation(client, sig, bh, label, ticket)
+        return _await_confirmation(client, sig, bh, label, ticket, rpc_url=rpc_url)
     except SettlementSubmitError:
         raise
     except Exception as e:                      # noqa: BLE001 — deliberate, see above
         raise SettlementSubmitError(
-            f"{label} was SUBMITTED, then the RPC stopped answering ({type(e).__name__}: "
-            f"{str(e)[:160]}). This says nothing about the transaction — it MAY WELL HAVE "
-            f"LANDED. Check signature {sig} on chain before retrying or discarding anything.",
-            signature=str(sig), outcome="unconfirmed", ticket=ticket) from e
+            f"{label} was SUBMITTED and MAY WELL HAVE LANDED: check signature {sig_local} on "
+            f"chain before retrying or discarding anything. The RPC stopped answering after the "
+            f"submit, which says nothing about the transaction. Endpoint error: "
+            f"{type(e).__name__}: {str(e)[:160]}",
+            signature=sig_local, outcome="unconfirmed", ticket=ticket) from e
 
 
-def _await_confirmation(client: Client, sig, bh, label: str, ticket: dict | None) -> str:
+def _corroborate_dropped(sig, bh, primary: str | None,
+                         timeout: float = _CORROBORATION_TIMEOUT) -> tuple[str, str]:
+    """Ask a SECOND, independently-operated endpoint about a suspected drop. Never raises.
+
+    Returns ("dropped" | "seen" | "unknown", detail). "dropped" is the only answer that licenses
+    the definitive verdict, and it needs a second endpoint that has ALSO never seen the signature
+    and ALSO calls the blockhash dead.
+
+    TIME-BOUNDED, and the bound is the caller's business: solana-py's default is 10 SECONDS PER
+    REQUEST, and this makes two of them from inside a loop whose whole contract is that the
+    confirmation budget bounds the total. An unbounded corroboration would let a merely-slow
+    second endpoint add ~20s to a tool call that promised not to.
+
+    Whether the endpoints are genuinely independent is `second_rpc_url`'s judgement, and it is a
+    raw string comparison — two spellings of one host still count as two. That is findings
+    [G10]/[G16], owned elsewhere; this function is no stronger than the answer it gets there.
+    """
+    try:
+        url = second_rpc_url(primary) if primary else None
+    except Exception:
+        url = None
+    if not url:
+        return "unknown", ("no second endpoint is configured, so this rests on one source — set "
+                           + ENV_SECOND_RPC + " to a DIFFERENT provider")
+    try:
+        c = Client(url, timeout=max(1.0, float(timeout)))
+        st = c.get_signature_statuses([sig]).value[0]
+    except Exception as e:
+        return "unknown", f"the second endpoint ({url}) did not answer: {type(e).__name__}"
+    if st is not None:
+        return "seen", f"the second endpoint ({url}) HAS a status for this signature"
+    if _blockhash_alive(c, bh) is not False:
+        return "unknown", f"the second endpoint ({url}) does not agree the blockhash is dead"
+    return "dropped", f"corroborated by a second, independently-configured endpoint ({url})"
+
+
+def _await_confirmation(client: Client, sig, bh, label: str, ticket: dict | None,
+                        rpc_url: str | None = None) -> str:
     """Poll until `sig` reaches a durable status, or raise SettlementSubmitError describing what
     is and is not known. Split out of `_send` so the submit boundary is a syntactic one: every
-    line in here runs with a live transaction on the cluster."""
+    line in here runs with a live transaction on the cluster.
+
+    `budget` bounds the polling. At most ONE corroboration excursion may run on top of it (two
+    requests to a second endpoint, each clamped to what is left of the budget, never more than
+    _CORROBORATION_TIMEOUT) — it happens only on a suspected drop, and it happens exactly once
+    because every branch out of it either raises or stops asking."""
     budget = confirm_seconds()
 
     # A WALL CLOCK, not a poll count. The previous shape was
@@ -232,21 +350,53 @@ def _await_confirmation(client: Client, sig, bh, label: str, ticket: dict | None
     while True:
         st = client.get_signature_statuses([sig]).value[0]
         if st is not None:
-            if st.err:
-                raise SettlementSubmitError(f"{label} failed on-chain: {st.err}",
-                                            signature=str(sig), outcome="failed", ticket=ticket)
             # Compare the enum; do NOT test it for truth. Every variant of
             # TransactionConfirmationStatus is truthy, so `if st.confirmation_status` reports
             # `Processed` — one validator's opinion, still forkable — as settled.
-            if st.confirmation_status in _DURABLE:
+            durable = st.confirmation_status in _DURABLE
+            if st.err and durable:
+                raise SettlementSubmitError(f"{label} failed on-chain: {st.err}",
+                                            signature=str(sig), outcome="failed", ticket=ticket)
+            if durable:
                 return str(sig)
+            # SYMMETRY, and it is the point: `Processed` is refused as proof of success because
+            # it can still be forked away, so it cannot be proof of FAILURE either. Taking an
+            # `err` at that level was the cheaper twin of the single-source `dropped` verdict
+            # below — one poll, one endpoint, and the tools turn it into a flat
+            # {"status": "failed"} their own guidance reads as "you were not paid". Keep
+            # watching: a real error reaches Confirmed within a poll or two and is reported
+            # then; anything that never does times out as `unconfirmed`, with the signature.
             seen = True
         elif not seen and i % 20 == 19 and _blockhash_alive(client, bh) is False:
-            # Never seen by the cluster AND the blockhash is dead: it can no longer land. That is
-            # a definite answer, so give it instead of waiting out the clock.
-            raise SettlementSubmitError(
-                f"{label} was dropped: its blockhash expired before the cluster ever saw it",
-                signature=str(sig), outcome="dropped", ticket=ticket)
+            # Never seen by the cluster AND the blockhash is dead: it can no longer land. That
+            # would be a definite answer — but BOTH halves of it are chosen by the same endpoint,
+            # and `dropped` is the one outcome the tools turn into a flat {"status": "failed"}
+            # whose own guidance reads it as proof the transaction did not land. This module
+            # refuses single-source conclusions everywhere else (see `status()`); it must refuse
+            # this one too. Same bargain: one source buys a caveated answer, two agreeing sources
+            # buy the verdict.
+            verdict, detail = _corroborate_dropped(
+                sig, bh, rpc_url,
+                timeout=min(_CORROBORATION_TIMEOUT, max(1.0, deadline - time.monotonic())))
+            if verdict == "dropped":
+                raise SettlementSubmitError(
+                    f"{label} was dropped: its blockhash expired before the cluster ever saw it "
+                    f"({detail})",
+                    signature=str(sig), outcome="dropped", ticket=ticket)
+            if verdict == "seen":
+                # The endpoints disagree about whether the cluster has this transaction. Stop
+                # asking the drop question and keep watching for a durable status — the one
+                # thing that must not happen is concluding "it cannot land" from the endpoint
+                # that is contradicted.
+                seen = True
+            else:
+                raise SettlementSubmitError(
+                    f"{label} MAY NOT HAVE BEEN DELIVERED: check signature {sig} on chain before "
+                    f"retrying or discarding anything. One endpoint reports no status for it and "
+                    f"says its blockhash has already expired, which would mean it can never "
+                    f"land — but both of those facts came from that same endpoint and could not "
+                    f"be corroborated ({detail}), so this is NOT a confirmed failure.",
+                    signature=str(sig), outcome="unconfirmed", ticket=ticket)
         i += 1
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -314,7 +464,8 @@ def deposit(rpc_url: str, depositor: Keypair, recipient: Pubkey, amount_lamports
     ticket = {"escrow_id": eid.hex(), "salt": salt.hex(), "pda": str(pda), "program": str(prog)}
     if on_ticket is not None:
         on_ticket(dict(ticket))            # before send_transaction, deliberately
-    sig = _send(client, [depositor], [ix], depositor, "deposit", ticket=dict(ticket))
+    sig = _send(client, [depositor], [ix], depositor, "deposit", ticket=dict(ticket),
+                rpc_url=rpc_url)
     return eid.hex(), salt.hex(), str(pda), sig
 
 
@@ -336,7 +487,7 @@ def claim(rpc_url: str, beneficiary: Keypair, escrow_id_hex: str, salt_hex: str)
         b0 = client.get_balance(beneficiary.pubkey(), Confirmed).value
     except Exception:
         b0 = None                    # pre-submit, so a failure here costs only the receipt
-    sig = _send(client, [beneficiary], [ix], beneficiary, "claim")
+    sig = _send(client, [beneficiary], [ix], beneficiary, "claim", rpc_url=rpc_url)
     # The claim is CONFIRMED. This read is a receipt, nothing more, and a 429 on it must not be
     # allowed to become "your claim failed" — the money is already in the wallet. Same rule as
     # _send's post-submit guard: never let a reporting failure be reported as a money failure.
@@ -360,7 +511,7 @@ def reclaim(rpc_url: str, depositor: Keypair, escrow_id_hex: str) -> str:
         data=data,
         accounts=[AccountMeta(depositor.pubkey(), True, True), AccountMeta(pda, False, True)],
     )
-    return _send(client, [depositor], [ix], depositor, "reclaim")
+    return _send(client, [depositor], [ix], depositor, "reclaim", rpc_url=rpc_url)
 
 
 UNVERIFIED_NOTE = (
