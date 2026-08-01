@@ -71,6 +71,10 @@ class VerifyResult:
     movements: list[dict] = field(default_factory=list)
     total_lamports_out: int = 0
     fee_lamports: int = 0
+    # The escrow the transaction actually funds. "" when verification stopped before the deposit
+    # instruction was located — an empty string is not an escrow id, so a caller comparing it to
+    # a ticket gets a mismatch rather than a silent pass.
+    escrow_id_hex: str = ""
 
 
 # ── what a transaction DOES, not merely which programs it touches ────────────────────────
@@ -84,10 +88,26 @@ LAMPORTS_PER_SIGNATURE = 5_000
 # Runtime defaults for compute units when the transaction does not set a limit.
 DEFAULT_CU_PER_IX = 200_000
 MAX_CU_LIMIT = 1_400_000
+
 # What an honest deposit draft costs: 60_000 CU at 1_000 micro-lamports/CU = 60 lamports of
-# priority fee, plus 5_000 base. A cap of 0.001 SOL is ~16x that and still refuses a fee bomb by
-# four orders of magnitude.
-MAX_TX_FEE_LAMPORTS = 1_000_000
+# priority fee, plus 5_000 base = 5_060 lamports.
+HONEST_TX_FEE_LAMPORTS = LAMPORTS_PER_SIGNATURE + 60
+# The ceiling is a YIELD, not a bound on a hypothetical. Whatever slack sits between the honest
+# cost and this number is extractable in full, silently, on every single draft a human signs —
+# a priority fee moves real SOL out of the signer with nothing in the instruction list to show
+# for it. The old 0.001 SOL cap was 198x the honest cost: 1_400_000 CU x 710_714
+# micro-lamports/CU lands on exactly 1_000_000 lamports and verified "SAFE TO REVIEW AND SIGN".
+# 50_000 still leaves ~10x headroom for a genuinely congested slot (200_000 CU at 50_000
+# micro-lamports/CU = 15_000 lamports all-in) while cutting the per-signature take by 95%.
+# Callers who really do need more must say so explicitly via max_fee_lamports and own it.
+MAX_TX_FEE_LAMPORTS = 50_000
+
+# Rent-exempt minimum for the 81-byte escrow account: (128 bytes of account overhead + 81) x
+# 3480 lamports/byte-year x the 2-year exemption threshold. The depositor is charged this at
+# EXECUTION by the system program's account creation inside the settlement program's CPI — it is
+# not a top-level instruction, so it can never appear in the movement list below. It is not lost:
+# "rent follows the funds", so claiming or reclaiming closes the account and returns it.
+ESCROW_RENT_LAMPORTS = (128 + settlement.STATE_LEN) * 3480 * 2      # 1_454_640
 
 _SYS_CREATE_ACCOUNT = 0
 _SYS_TRANSFER = 2
@@ -95,6 +115,48 @@ _SYS_CREATE_ACCOUNT_WITH_SEED = 3
 _SYS_ADVANCE_NONCE = 4
 _SYS_WITHDRAW_NONCE = 5
 _SYS_TRANSFER_WITH_SEED = 11
+
+
+def _message_version(raw: bytes) -> int | None:
+    """None if `raw` is a LEGACY transaction, else the message's version number (0 for v0).
+
+    This exists because `Transaction.from_bytes` does NOT reject a versioned transaction — that
+    claim, made in an earlier review of this file, is wrong and was checked: a real MessageV0
+    compiled with an AddressLookupTableAccount deserialises through the legacy parser without
+    complaint. What actually happens is that the legacy parser reads v0's `0x80` version prefix
+    as the message header's `num_required_signatures` and reports 128 of them, which trips the
+    unrelated `single_signer` check further down.
+
+    That is an accident, and it is load-bearing. A v0 transaction resolves instruction program
+    ids through address lookup tables, whose contents are NOT in the transaction — so every
+    program-id check in this module (`no_unexpected_programs`, the settlement/system/compute
+    -budget dispatch in `_lamport_movements`) is reading an account list that does not contain
+    the accounts the runtime will actually use. The moment `single_signer` is relaxed for any
+    ordinary reason — a multisig depositor, a fee payer separate from the signer — an ALT bypass
+    of the entire verifier reopens with nothing to catch it. So refuse non-legacy on its own
+    terms, up front, before anything else reads the bytes.
+
+    Layout: compact-u16 signature count || signatures || message. A legacy message begins with
+    `num_required_signatures`, which is a plain count; a versioned one begins with `0x80 | ver`.
+    The high bit is the discriminator, so it cannot collide with a legal legacy header.
+    """
+    n = shift = idx = 0
+    while True:
+        if idx >= len(raw):
+            raise ValueError("truncated transaction: no signature-count prefix")
+        b = raw[idx]
+        idx += 1
+        n |= (b & 0x7F) << shift
+        if not b & 0x80:
+            break
+        shift += 7
+        if shift > 14:
+            raise ValueError("malformed compact-u16 signature count")
+    off = idx + n * 64
+    if off >= len(raw):
+        raise ValueError("truncated transaction: no message after the signature array")
+    first = raw[off]
+    return (first & 0x7F) if first & 0x80 else None
 
 
 def _u32(b: bytes, off: int) -> int:
@@ -204,7 +266,17 @@ def _lamport_movements(msg, keys, program, expected_pda) -> tuple[list[dict], li
             undecodable.append(f"ix{n}: program index {cix.program_id_index} out of range")
             continue
         prog_key = keys[cix.program_id_index]
-        accts = [keys[i] for i in cix.accounts if i < len(keys)]
+        if any(i >= len(keys) for i in cix.accounts):
+            # Do NOT filter these out and carry on: dropping an index SHIFTS every account after
+            # it, so `from`/`to` would name the wrong wallets in a movement the human then reads
+            # as authoritative. from_bytes does not sanitise account indices — that was checked.
+            undecodable.append(f"ix{n}: account index {max(cix.accounts)} out of range "
+                               f"({len(keys)} account keys) — malformed transaction")
+            movements.append({"program": str(prog_key), "kind": "account_index_out_of_range",
+                              "ix": n, "lamports": None, "from": None, "to": None,
+                              "decoded": False})
+            continue
+        accts = [keys[i] for i in cix.accounts]
         data = bytes(cix.data)
         if prog_key == settlement.CB:
             continue                                     # priced separately, in _transaction_fee
@@ -312,7 +384,15 @@ def draft_deposit(rpc_url: str, depositor: Pubkey, recipient: Pubkey, amount_lam
 
 
 def _find_deposit_ix(tx: Transaction, program: Pubkey) -> tuple[bytes, list[Pubkey]]:
-    """Locate the settlement deposit instruction and return (data, resolved account pubkeys)."""
+    """Locate the settlement deposit instruction and return (data, resolved account pubkeys).
+
+    Raises ValueError — and ONLY ValueError — on anything malformed, because ValueError is what
+    verify_draft catches to fail closed. `keys[i] for i in cix.accounts` was an unguarded
+    IndexError path: `Transaction.from_bytes` does not bounds-check compiled account indices
+    against the account-key array (verified), so an attacker-supplied transaction carrying an
+    out-of-range index unwound an IndexError straight out of verify_draft and broke its
+    documented contract of always returning a VerifyResult.
+    """
     msg = tx.message
     keys = list(msg.account_keys)
     for cix in msg.instructions:
@@ -320,6 +400,11 @@ def _find_deposit_ix(tx: Transaction, program: Pubkey) -> tuple[bytes, list[Pubk
             continue
         data = bytes(cix.data)
         if data[:1] == b"\x00" and len(data) == _DEPOSIT_DATA_LEN:
+            if any(i >= len(keys) for i in cix.accounts):
+                raise ValueError(
+                    f"the deposit instruction references account index {max(cix.accounts)} but "
+                    f"the transaction carries only {len(keys)} account keys — malformed, "
+                    "refusing to interpret it")
             return data, [keys[i] for i in cix.accounts]
     raise ValueError(f"no deposit (tag 0) instruction for program {program} found in transaction")
 
@@ -327,6 +412,7 @@ def _find_deposit_ix(tx: Transaction, program: Pubkey) -> tuple[bytes, list[Pubk
 def verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt_hex: str,
                  expect_amount_lamports: int, expect_depositor: Pubkey,
                  expect_program: Pubkey | None = None,
+                 expect_escrow_id_hex: str | None = None,
                  max_fee_lamports: int = MAX_TX_FEE_LAMPORTS) -> VerifyResult:
     """Independently check that a drafted transaction does what its summary claims.
 
@@ -351,12 +437,27 @@ def verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt_
     program = expect_program or settlement.program_id()
     try:
         raw = base64.b64decode(unsigned_tx_b64, validate=True)
+        version = _message_version(raw)
         tx = Transaction.from_bytes(raw)
     except Exception as e:
         return VerifyResult(ok=False, checks=[{"name": "deserialize", "ok": False,
                                                "expected": "a valid Solana transaction",
                                                "actual": str(e)[:200]}],
                             failures=["deserialize"])
+
+    # Explicit, and first, because everything after it reads program ids out of the account-key
+    # array — which a versioned transaction is entitled to complete from address lookup tables
+    # that are not in these bytes. See _message_version for why the old code only survived this
+    # by accident.
+    if version is not None:
+        record("legacy_transaction", False, "a legacy (unversioned) transaction",
+               f"a v{version} transaction. Its instructions can resolve program ids through "
+               "address lookup tables whose contents are not in the transaction, so no check "
+               "in this verifier can be trusted about it. This path only ever drafts legacy "
+               "transactions; refusing.")
+        return VerifyResult(ok=False, checks=checks, failures=failures)
+    record("legacy_transaction", True, "a legacy (unversioned) transaction",
+           "legacy — every program id is resolvable from the transaction itself")
 
     msg = tx.message
     keys = list(msg.account_keys)
@@ -380,11 +481,28 @@ def verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt_
     record("deposit_instruction_present", True, f"tag-0 ix for {program}", "found")
 
     escrow_id = data[1:33]
+    escrow_id_hex = escrow_id.hex()
     amount = struct.unpack("<Q", data[33:41])[0]
     commitment_in_tx = data[41:73]
     unlock = struct.unpack("<q", data[73:81])[0]
 
     record("amount", amount == expect_amount_lamports, expect_amount_lamports, amount)
+
+    # The escrow id is the CLAIM TICKET's primary key, and until now it was never checked and
+    # never even surfaced: a verified draft could fund escrow Y while the ticket handed to the
+    # recipient named escrow X. Nothing is stolen — the commitment still pins the beneficiary —
+    # but the recipient's claim finds nothing, and the depositor has to dig the real id out of
+    # the confirmed transaction before they can reclaim. A stranded payment certified as safe is
+    # exactly what this tool exists to prevent, so the id is always reported, and checked
+    # whenever the caller can supply the one their ticket says.
+    if expect_escrow_id_hex is None:
+        record("escrow_id", True,
+               "no expectation supplied — COMPARE THIS AGAINST THE ESCROW ID ON YOUR CLAIM "
+               "TICKET; if they differ the recipient cannot claim what you are about to fund",
+               escrow_id_hex)
+    else:
+        want = str(expect_escrow_id_hex).strip().lower()
+        record("escrow_id", want == escrow_id_hex, want, escrow_id_hex)
 
     # The load-bearing check: does the hidden beneficiary actually resolve to who we were told?
     try:
@@ -433,8 +551,22 @@ def verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt_
 
     total_out = sum(m["lamports"] or 0 for m in movements)
     record("total_lamport_movement", total_out == expect_amount_lamports and not undecodable,
-           f"{expect_amount_lamports} lamports (the deposit and nothing else)",
+           f"{expect_amount_lamports} lamports moved by the instructions in this transaction — "
+           "the deposit and nothing else. This is NOT the whole debit: rent and fees are also "
+           "charged at execution, see additional_charges_at_execution below",
            f"{total_out} lamports" + (" + undecodable instructions" if undecodable else ""))
+
+    # The line above is the one a human actually reads before signing, and on its own it read as
+    # "this is what leaves my wallet". It is not: the escrow account's rent and the network fee
+    # are charged by the runtime, not by an instruction, so neither can ever appear in the
+    # itemisation. Saying so in the residual-risk section of a review is not saying so to the
+    # person holding the key.
+    record("additional_charges_at_execution", True,
+           "charged by the runtime, not by an instruction — invisible in the itemisation above",
+           f"~{ESCROW_RENT_LAMPORTS} lamports rent for the {settlement.STATE_LEN}-byte escrow "
+           f"account (refunded to whoever claims or reclaims it) + {fee_lamports} lamports "
+           f"network fee. Approximate total debit: "
+           f"~{total_out + ESCROW_RENT_LAMPORTS + fee_lamports} lamports")
 
     dests = {m["to"] for m in movements if (m["lamports"] or 0) > 0}
     record("destinations", dests == {str(expected_pda)},
@@ -448,8 +580,12 @@ def verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt_
            + (f" + {fee_detail['additional_fee_lamports']} additional"
               if fee_detail["additional_fee_lamports"] else ""))
     record("max_transaction_fee", fee_lamports <= max_fee_lamports,
-           f"<= {max_fee_lamports} lamports", f"{fee_lamports} lamports [{how}]")
+           f"<= {max_fee_lamports} lamports (an honest draft of this shape costs "
+           f"{HONEST_TX_FEE_LAMPORTS})",
+           f"{fee_lamports} lamports [{how}]"
+           + (f" — {fee_lamports / HONEST_TX_FEE_LAMPORTS:.0f}x the honest cost"
+              if fee_lamports > HONEST_TX_FEE_LAMPORTS * 2 else ""))
 
     return VerifyResult(ok=not failures, checks=checks, failures=failures,
                         movements=movements, total_lamports_out=total_out,
-                        fee_lamports=fee_lamports)
+                        fee_lamports=fee_lamports, escrow_id_hex=escrow_id_hex)
