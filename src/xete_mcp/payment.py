@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import struct
+import time
 
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -21,11 +22,36 @@ from solders.system_program import ID as SYSTEM_PROGRAM_ID
 from solders.transaction import Transaction
 from solana.rpc.api import Client
 from solana.rpc.commitment import Confirmed
+from solders.transaction_status import TransactionConfirmationStatus
 from solana.rpc.types import TxOpts
 
 PROGRAM_ID = Pubkey.from_string("GLdM82RspCLDFmAUqty2Ef8GBGursZVgMD9cqeNHDq2U")
 TREASURY = Pubkey.from_string("XETEsj7sRmSQf1PHVU9FkmZW2n8z75UycWRrpJ8tRMv")
 LAMPORTS_PER_BLOB = 1_000_000  # 0.001 SOL
+
+
+_DURABLE = (TransactionConfirmationStatus.Confirmed, TransactionConfirmationStatus.Finalized)
+
+
+class PaymentNotSettled(RuntimeError):
+    """Submitted, but this client cannot say it succeeded. ALWAYS carries the signature.
+
+    Split from a bare RuntimeError because the caller's remedy differs completely from an
+    ordinary failure: the transaction may be live, so the one thing it must not do is
+    silently retry. The signature is the whole recovery path.
+    """
+
+    def __init__(self, message: str, *, signature: str):
+        super().__init__(message)
+        self.signature = signature
+
+
+class PaymentUnconfirmed(PaymentNotSettled):
+    """No durable status inside the window. It may still land."""
+
+
+class PaymentFailedOnChain(PaymentNotSettled):
+    """Confirmed, and the transaction errored. It definitively did not pay."""
 
 
 def _derive_pda(nonce: str) -> tuple[Pubkey, int]:
@@ -158,15 +184,47 @@ def pay_herd(rpc_url: str, payer: Keypair, payment_nonce: str, blob_count: int,
         raise
 
     # ── FROM HERE THE TRANSACTION MAY BE LIVE. Nothing below is ever released. ──────
+    #
+    # The signature is taken from the transaction we built, not from the endpoint's reply,
+    # so a submit that raises after the write still leaves us able to name what may be live.
+    sig_local = tx.signatures[0]
     sig = client.send_transaction(tx, opts=TxOpts(skip_preflight=False, preflight_commitment=Confirmed)).value
-    # confirm
-    import time
+
+    # This loop used to `break` on ANY confirmation_status and then `return str(sig)` when
+    # it simply ran out — so a payment that never confirmed, or that CONFIRMED WITH AN
+    # ERROR, was reported to the caller as sent. Three separate ways to certify a payment
+    # that did not happen:
+    #
+    #   1. falling out of the loop after 15s returned success with no status at all;
+    #   2. `Processed` was accepted, and settlement.py in this same package refuses it in
+    #      as many words -- "one validator's opinion, and it can still be forked away";
+    #   3. `st.err` was never read, so a transaction that landed and FAILED read as success.
+    #
+    # Now nothing but a durable, error-free status returns normally.
+    last_status = None
     for _ in range(30):
         time.sleep(0.5)
-        st = client.get_signature_statuses([sig]).value[0]
-        if st and st.confirmation_status:
-            break
-    return str(sig)
+        try:
+            st = client.get_signature_statuses([sig]).value[0]
+        except Exception:
+            # A polling failure is not evidence about the transaction. Keep waiting; the
+            # signature is already known locally, so nothing is lost by an unreadable poll.
+            continue
+        if st is None:
+            continue
+        last_status = st
+        if st.err is not None:
+            raise PaymentFailedOnChain(
+                f"the payment transaction {sig_local} was confirmed on chain and FAILED. "
+                "Nothing was delivered and the network fee was still spent.", signature=str(sig_local))
+        if st.confirmation_status in _DURABLE:
+            return str(sig)
+
+    raise PaymentUnconfirmed(
+        f"the payment transaction {sig_local} was submitted but did not reach a durable "
+        f"commitment within 15s (last status: {last_status.confirmation_status if last_status else 'none'}). "
+        "IT MAY STILL LAND. Do not retry blindly -- check this signature on chain first, "
+        "or the same payment can be made twice.", signature=str(sig_local))
 
 
 def sol_balance(rpc_url: str, pubkey: Pubkey) -> float:

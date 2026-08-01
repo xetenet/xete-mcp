@@ -442,7 +442,14 @@ class FakeRpc:
         return SimpleNamespace(value=tx.signatures[0])
 
     def get_signature_statuses(self, sigs):
-        return SimpleNamespace(value=[SimpleNamespace(confirmation_status="confirmed")])
+        # A REAL status object: `err` present, and a durable enum variant -- not the
+        # string "confirmed". pay_herd now requires both (it used to accept any truthy
+        # confirmation_status and never looked at err, so a transaction that landed and
+        # FAILED read as a successful payment). A stub that omits them can only pass
+        # against the lenient version.
+        from solders.transaction_status import TransactionConfirmationStatus
+        return SimpleNamespace(value=[SimpleNamespace(
+            confirmation_status=TransactionConfirmationStatus.Confirmed, err=None)])
 
 
 @pytest.fixture()

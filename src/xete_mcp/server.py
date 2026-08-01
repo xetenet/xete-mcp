@@ -125,7 +125,7 @@ from .client import XeteClient, load_or_create_identity
 from . import alias_chain, draft, payment, settlement, signguard
 from . import txguard as txguard_mod
 from .safehttp import (EndpointError, as_bool, as_int, as_name, as_str, distinct_endpoints,
-                       get_json, post_json, project, redact_url, require_secure_url,
+                       get_json, post_json, project, redact_url, require_secure_url, scrub,
                        sanitize_text)
 
 SERVER_URL = os.environ.get("XETE_SERVER_URL", "https://xete.net")
@@ -436,8 +436,30 @@ def xete_send_message(recipient_agent_id: str, message: str, subject: str = "") 
             "tx_signature": sig,
             "server_confirm": confirm.get("status"),
         }, indent=2)
+    except payment.PaymentNotSettled as e:
+        # A submitted transaction is NOT a clean failure. This branch exists so the
+        # generic handler below can never swallow one: that handler returns
+        # {"status": "failed"} with no signature, which tells an agent the payment did not
+        # happen and invites a retry -- and a blind retry pays twice if the first one
+        # landed. The signature is the entire recovery path, so it is the one thing that
+        # must survive.
+        return json.dumps({
+            "status": "payment_unconfirmed",
+            "to": recipient_agent_id,
+            "mode": "paid",
+            "payment_nonce": invoice.get("payment_nonce"),
+            "tx_signature": e.signature,
+            "definitively_failed": isinstance(e, payment.PaymentFailedOnChain),
+            "error": scrub(str(e))[:400],
+            "DO_NOT_RETRY_BLINDLY": (
+                "This payment was SUBMITTED. Unless definitively_failed is true it may "
+                "still land. Check tx_signature on chain before sending again, or the "
+                "same message can be paid for twice."),
+        }, indent=2)
     except Exception as e:
-        return json.dumps({"status": "failed", "error": str(e)[:300]})
+        # scrub, not raw: `_signing_rpc_url()` may carry a provider token in its path or
+        # query, and third-party client exceptions quote the URL they were given in full.
+        return json.dumps({"status": "failed", "error": scrub(str(e))[:300]})
 
 
 @mcp.tool()
