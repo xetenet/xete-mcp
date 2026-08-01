@@ -25,6 +25,7 @@ Run with:  python -m pytest test_alias_read_hardening.py -v
 from __future__ import annotations
 
 import json
+import os
 import time
 import sys
 from pathlib import Path
@@ -1080,3 +1081,139 @@ def test_one_quote_response_cannot_deliver_a_paragraph(net):
     # And nothing the server wrote is outside the box.
     flat = {k: v for k, v in got.items() if k != "untrusted_server_text"}
     assert "N" * 20 not in all_text(flat) and "S" * 20 not in all_text(flat)
+
+
+def test_the_read_path_honours_the_operators_ranked_alias_endpoints(monkeypatch):
+    """XETE_ALIAS_RPC is the variable an operator sets to say WHO answers questions about
+    where money goes. `_alias_view` — behind xete_alias_resolve and xete_resolve — called
+    resolve_owner() with no endpoint, which walks XETE_SOLANA_RPC -> XETE_RPC_URL ->
+    public default and never reads XETE_ALIAS_RPC at all. An operator who pointed it at
+    their own validator was still answered by a third-party host, with `verified: true`
+    on the result and no way to change it.
+
+    Found by the fresh-context gate pass as the read half of the corroboration finding.
+    This asserts the ranked list is CONSULTED; the two-of-two agreement rule deliberately
+    stays on the spending path (see _resolve_recipient_corroborated) — asking two
+    endpoints on every read doubles RPC cost and makes ordinary node lag a hard failure
+    in a tool whose job is to answer.
+    """
+    monkeypatch.setenv("XETE_ALIAS_RPC", "https://operators-own-validator.internal")
+    monkeypatch.setenv(alias_chain.ENV_RPC, "https://some-other-host.example")
+
+    used = []
+
+    def _spy(name, rpc=None):
+        used.append(rpc)
+        return None
+
+    monkeypatch.setattr(alias_chain, "resolve_owner", _spy)
+    server._alias_view("somename")
+
+    assert used, "resolve_owner was never called"
+    assert used[0] == "https://operators-own-validator.internal", (
+        f"the read used {used[0]!r} instead of the endpoint the operator ranked first — "
+        "XETE_ALIAS_RPC is being ignored")
+
+
+# ── anti-weakening gaps found by the final gate's test-integrity lens ────────────────
+# All three are MISSING assertions rather than loosened ones: the suite stayed green
+# through defects it should have caught. Tests only — no production code changes.
+
+def test_the_encryption_core_is_actually_pinned():
+    """The G1 keystore-migration fix cites `test_crypto_unification.py` as its assurance
+    that the crypto core was left alone. The gate's test-integrity lens showed that
+    citation is close to worthless: catastrophic defects can be introduced in
+    `_shared_key`/`encrypt` and the whole suite stays green.
+
+    Pin the two properties that make the mailbox private, so a future edit that breaks
+    either goes red here:
+      1. ECDH is real — the key depends on BOTH secrets, so A->B and B->A agree and an
+         unrelated third party derives something different. A `_shared_key` that ignored
+         `their_x_public` (or returned a constant) would make every mailbox readable by
+         anyone and is the defect this catches.
+      2. The nonce is not reused across encryptions. AES-GCM nonce reuse under one key is
+         a total break, not a weakness.
+    """
+    from nacl.bindings import crypto_scalarmult_base
+    from xete_mcp import client as C
+
+    a_sec, b_sec, c_sec = os.urandom(32), os.urandom(32), os.urandom(32)
+    a_pub, b_pub, c_pub = (crypto_scalarmult_base(s) for s in (a_sec, b_sec, c_sec))
+
+    # 1. the shared key is a real function of both halves, and is not a constant
+    assert C._shared_key(a_sec, b_pub) == C._shared_key(b_sec, a_pub), \
+        "ECDH is broken: A->B and B->A disagree"
+    assert C._shared_key(a_sec, b_pub) != C._shared_key(a_sec, c_pub), \
+        "the shared key ignores the recipient — every mailbox is readable by anyone"
+    assert C._shared_key(a_sec, b_pub) != C._shared_key(c_sec, b_pub), \
+        "the shared key ignores our own secret"
+
+    # ...and a stranger cannot open it
+    nonce, ct = C.encrypt(a_sec, b_pub, "the quick brown fox")
+    assert C.decrypt(b_sec, a_pub, nonce, ct) == "the quick brown fox"
+    with pytest.raises(Exception):
+        C.decrypt(c_sec, a_pub, nonce, ct)
+
+    # 2. nonces are not reused
+    nonces = {C.encrypt(a_sec, b_pub, "same plaintext")[0] for _ in range(64)}
+    assert len(nonces) == 64, "AES-GCM nonce reuse under one key is a total break"
+
+
+def _write_014_keystore(path):
+    """A keystore in the 0.1.4 shape: `x_secret` is a RANDOM secret, not one derived from
+    `ed_seed`. That is what makes it legacy — `Identity.__post_init__` re-derives the
+    sending key and demotes the stored random one to `legacy_x_secrets`, which is the ONLY
+    condition under which `_migrate_keystore` does anything at all.
+    """
+    import base64
+    ed_seed = os.urandom(32)
+    random_x = os.urandom(32)          # 0.1.4 generated this independently of ed_seed
+    path.write_text(json.dumps({
+        "ed_seed": base64.b64encode(ed_seed).decode(),
+        "x_secret": base64.b64encode(random_x).decode(),
+        "agent_id": "00000000-0000-4000-8000-00000000dead",
+    }))
+    return random_x
+
+
+def test_the_migration_never_overwrites_an_existing_backup(tmp_path):
+    """`_migrate_keystore`'s docstring calls never-overwriting the backup the thing that
+    prevents key-material loss, and the gate's test-integrity lens found it unasserted. It
+    is NEW code from the G1 fix, in the same failure class (silent, unrecoverable loss of a
+    pre-upgrade messaging secret) as the critical bug G1 was fixing.
+
+    TWO earlier versions of this test were hollow, and both are worth naming so nobody
+    rebuilds them:
+      1. Starting from a freshly generated keystore — there is no legacy secret, so
+         `_migrate_keystore` returns at its first line and the backup code never runs.
+      2. Migrating the SAME 0.1.4 keystore twice — an idempotency check returns early once
+         the on-disk content already matches what would be written, so again the backup
+         code never runs.
+    Both passed with the `if not backup.exists()` guard deleted.
+
+    The guard only does work when migration runs AGAIN with DIFFERENT content and a backup
+    is already on disk — a user restoring an older keystore over a migrated one, or a
+    downgrade-then-re-upgrade. That is what this drives. Verified red with the guard
+    removed.
+    """
+    from xete_mcp import client as C
+
+    p = tmp_path / "identity.json"
+    bak = Path(str(p) + ".pre-derived-key.bak")
+
+    _write_014_keystore(p)
+    first = C.load_or_create_identity(p)
+    assert first.legacy_x_secrets, "fixture is wrong — no legacy secret, migration is a no-op"
+    assert bak.exists(), "the first migration did not write a backup at all"
+    precious = bak.read_text()
+
+    # A DIFFERENT pre-upgrade keystore is now put in place — restored from a copy, or an
+    # older machine's file. Migration runs for real again (different content, so the
+    # idempotency check does not short-circuit it).
+    _write_014_keystore(p)
+    second = C.load_or_create_identity(p)
+    assert second.legacy_x_secrets
+
+    assert bak.read_text() == precious, (
+        "the migration overwrote an existing backup. That backup held the only copy of the "
+        "FIRST pre-upgrade messaging secret, and the mailbox it opens is now unrecoverable.")

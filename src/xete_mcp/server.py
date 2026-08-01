@@ -654,8 +654,23 @@ def _alias_view(name: str) -> dict:
         return {"error": str(e), "reason": "invalid_name"}
 
     out: dict = {"name": bare}
+    # Read through the endpoint the OPERATOR ranked first. This used to call resolve_owner(bare)
+    # with no rpc, which walks XETE_SOLANA_RPC -> XETE_RPC_URL -> default and never reads
+    # XETE_ALIAS_RPC at all — so an operator who configured their own validator there, precisely
+    # to control who answers questions about where money goes, was silently answered by a public
+    # default instead. Honouring the ranked list is not a policy change; ignoring it was a bug.
+    #
+    # Deliberately still ONE endpoint. Asking two here would double the RPC cost of every alias
+    # read and turn ordinary node lag into a hard "endpoints disagree" failure on a tool whose
+    # job is to answer, not to refuse — tried it, and it broke 15 tests for exactly that reason.
+    # The corroboration rule stays where the money decision is made, and the warning below stays
+    # to say so. See _resolve_recipient_corroborated.
     try:
-        owner = alias_chain.resolve_owner(bare)
+        _ranked = distinct_endpoints(alias_rpc_endpoints())
+    except Exception:
+        _ranked = []
+    try:
+        owner = alias_chain.resolve_owner(bare, _ranked[0] if _ranked else None)
     except (alias_chain.AliasChainError, EndpointError) as e:
         return _chain_error(bare, e)
 
