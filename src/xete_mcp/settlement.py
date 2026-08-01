@@ -68,6 +68,25 @@ _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 # refusal to conclude, never a discarded claim ticket.
 STATE_LEN = 81
 
+# The rent-exempt minimum for a STATE_LEN-byte account: (128 bytes of account overhead +
+# STATE_LEN) x 3480 lamports/byte-year x the 2-year exemption threshold. Also read straight off
+# mainnet on 2026-08-01: getMinimumBalanceForRentExemption(81) = 1_454_640, which is what this
+# arithmetic produces.
+#
+# IT IS NOT AN ADDITIONAL CHARGE ON THE DEPOSITOR, and the code used to say it was. The same
+# read-only deposit cited above settles it: the program's inner createAccount CPI funds the
+# escrow PDA with lamports = 69_000_000, which is EXACTLY the instruction's `amount` field, and
+# the depositor's balance moves 90_000_000 -> 20_994_940, i.e. -69_005_060 = amount + the 5_060
+# network fee. Nothing extra is taken for rent. The reserve is carved OUT of the amount and comes
+# back with it — "rent follows the funds" — when a claim or reclaim closes the account.
+#
+# What that DOES make it is a FLOOR. An `amount` below this cannot create a rent-exempt 81-byte
+# account, the runtime rejects the transaction (insufficient funds for rent), and the deposit can
+# never land no matter how well-formed everything else is. Hence the check in `deposit_ix` below
+# and the matching `amount_covers_rent` check in the draft verifier, which reads this constant
+# rather than computing its own (finding [G12]).
+RENT_EXEMPT_LAMPORTS = (128 + STATE_LEN) * 3480 * 2      # 1_454_640
+
 # How long to keep asking the cluster about a submitted transaction. RPC nodes rebroadcast a
 # transaction for roughly 60-90s (until its blockhash dies); a client that gives up sooner is
 # not observing a failure, it is looking away while the transaction is still alive.
@@ -415,6 +434,32 @@ def _await_confirmation(client: Client, sig, bh, label: str, ticket: dict | None
         signature=str(sig), outcome="unconfirmed", ticket=ticket)
 
 
+def validate_deposit_amount(amount_lamports: int) -> None:
+    """Refuse an amount the settlement program cannot turn into an escrow. Raises ValueError.
+
+    `> 0` was the only bound, and it is the wrong one — finding [G12]. The program creates the
+    escrow account with EXACTLY this amount (see RENT_EXEMPT_LAMPORTS), so anything below the
+    rent-exempt minimum for STATE_LEN bytes is a transaction the runtime rejects: it costs a
+    signature and a network fee and escrows nothing. The draft verifier certified such a draft
+    "SAFE TO REVIEW AND SIGN" because nothing anywhere checked it.
+
+    Called from `deposit_ix`, so the signing path and the unsigned-draft path cannot disagree
+    about what is buildable, AND from `deposit` before the spend gate — an impossible deposit is
+    not a spending decision, and `deposit` records against the 24h window at approval time
+    without ever releasing it.
+    """
+    if amount_lamports <= 0:
+        raise ValueError("amount_lamports must be > 0")
+    if amount_lamports < RENT_EXEMPT_LAMPORTS:
+        raise ValueError(
+            f"amount_lamports={amount_lamports} is below {RENT_EXEMPT_LAMPORTS}, the rent-exempt "
+            f"minimum for the {STATE_LEN}-byte escrow account. The program funds that account "
+            f"with exactly this amount, so the account cannot be created and the transaction "
+            f"would fail on chain after costing a fee. Deposit at least "
+            f"{RENT_EXEMPT_LAMPORTS} lamports ({RENT_EXEMPT_LAMPORTS / 1e9} SOL); the reserve is "
+            f"returned with the funds when the escrow is claimed or reclaimed.")
+
+
 def deposit_ix(program: Pubkey, depositor: Pubkey, escrow_id: bytes, amount_lamports: int,
                commitment_bytes: bytes, unlock: int = 0) -> Instruction:
     """The deposit (tag 0) instruction, on its own. Factored out so the signing path (`deposit`)
@@ -424,8 +469,7 @@ def deposit_ix(program: Pubkey, depositor: Pubkey, escrow_id: bytes, amount_lamp
         raise ValueError(f"escrow_id must be 32 bytes, got {len(escrow_id)}")
     if len(commitment_bytes) != 32:
         raise ValueError(f"commitment must be 32 bytes, got {len(commitment_bytes)}")
-    if amount_lamports <= 0:
-        raise ValueError("amount_lamports must be > 0")
+    validate_deposit_amount(amount_lamports)
     data = (bytes([0]) + escrow_id + struct.pack("<Q", amount_lamports)
             + commitment_bytes + struct.pack("<q", unlock))
     return Instruction(
@@ -456,6 +500,13 @@ def deposit(rpc_url: str, depositor: Keypair, recipient: Pubkey, amount_lamports
     commitment and the deposit is unclaimable forever. Handing the ticket over first means a
     timeout can lose the confirmation but never the money."""
     from .spendguard import authorize
+
+    # BEFORE the gate, deliberately. A deposit below the escrow's rent-exempt minimum cannot
+    # execute at all (see validate_deposit_amount), and this function records against the 24h
+    # window at approval time and never releases it — so gating first would charge a day's
+    # budget for a transaction that was never going to exist. Nothing here can spend: it reads
+    # one constant and raises.
+    validate_deposit_amount(int(amount_lamports))
 
     authorize(int(amount_lamports), "xete_settle_create", detail=f"recipient={recipient}")
 

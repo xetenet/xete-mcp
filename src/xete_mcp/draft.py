@@ -102,12 +102,18 @@ HONEST_TX_FEE_LAMPORTS = LAMPORTS_PER_SIGNATURE + 60
 # Callers who really do need more must say so explicitly via max_fee_lamports and own it.
 MAX_TX_FEE_LAMPORTS = 50_000
 
-# Rent-exempt minimum for the 81-byte escrow account: (128 bytes of account overhead + 81) x
-# 3480 lamports/byte-year x the 2-year exemption threshold. The depositor is charged this at
-# EXECUTION by the system program's account creation inside the settlement program's CPI — it is
-# not a top-level instruction, so it can never appear in the movement list below. It is not lost:
-# "rent follows the funds", so claiming or reclaiming closes the account and returns it.
-ESCROW_RENT_LAMPORTS = (128 + settlement.STATE_LEN) * 3480 * 2      # 1_454_640
+# Rent-exempt minimum for the 81-byte escrow account. Re-exported from settlement rather than
+# recomputed here: it is the floor `deposit_ix` enforces and the floor this verifier checks, and
+# two independently-derived copies of a constant on an IMMUTABLE program is how one of them ends
+# up certifying what the other refuses.
+#
+# THIS IS NOT AN EXTRA DEBIT ON THE SIGNER, and this file used to tell them it was — finding
+# [G12]. The program creates the escrow account with exactly the deposit `amount`, so the
+# rent-exempt reserve comes OUT of the amount and the depositor pays `amount + fee`. See
+# settlement.RENT_EXEMPT_LAMPORTS for the read-only mainnet balance deltas that establish it.
+# The reserve is still real and still worth disclosing — it is what makes `amount` a floor
+# rather than merely positive — it is just not money leaving the wallet on top of the amount.
+ESCROW_RENT_LAMPORTS = settlement.RENT_EXEMPT_LAMPORTS              # 1_454_640
 
 _SYS_CREATE_ACCOUNT = 0
 _SYS_TRANSFER = 2
@@ -541,6 +547,27 @@ def _verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt
 
     record("amount", amount == expect_amount_lamports, expect_amount_lamports, amount)
 
+    # A DEPOSIT THAT CANNOT LAND IS NOT A SAFE DEPOSIT — finding [G12]. The program funds the
+    # escrow account with exactly `amount`, so an amount below the rent-exempt minimum for
+    # STATE_LEN bytes cannot create it: the runtime rejects the transaction for insufficient
+    # funds for rent. `deposit_ix` used to validate only `amount > 0`, and this verifier said
+    # nothing at all, so a draft that was never going to execute came back "SAFE TO REVIEW AND
+    # SIGN". Nothing is stolen; the human spends a signature and a network fee on a transaction
+    # that escrows nothing, against a tool whose entire promise is that it refuses anything that
+    # is not the deposit that was asked for.
+    #
+    # Checked against the amount IN THE TRANSACTION, not the caller's expectation: the question
+    # is what these bytes will do, and `amount` above already reports any disagreement.
+    record("amount_covers_rent", amount >= ESCROW_RENT_LAMPORTS,
+           f">= {ESCROW_RENT_LAMPORTS} lamports — the rent-exempt minimum for the "
+           f"{settlement.STATE_LEN}-byte escrow account, which the program creates with exactly "
+           f"the deposit amount",
+           f"{amount} lamports" + ("" if amount >= ESCROW_RENT_LAMPORTS else
+                                   f" — {ESCROW_RENT_LAMPORTS - amount} lamports short. This "
+                                   "transaction CANNOT execute: the escrow account would not be "
+                                   "rent-exempt, so the runtime rejects it after charging the "
+                                   "fee. Do not sign it."))
+
     # The escrow id is the CLAIM TICKET's primary key, and until now it was never checked and
     # never even surfaced: a verified draft could fund escrow Y while the ticket handed to the
     # recipient named escrow X. Nothing is stolen — the commitment still pins the beneficiary —
@@ -580,6 +607,23 @@ def _verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt
     record("depositor_signs", bool(accounts) and accounts[0] == expect_depositor,
            expect_depositor, accounts[0] if accounts else "<missing>")
 
+    # accounts[2] must be the system program — finding [G14]. The deposit's account list was
+    # checked at [0] (depositor) and [1] (escrow PDA) and then stopped, so an attacker key in
+    # slot 2 verified ok=True with zero failures. `no_unexpected_programs` below does NOT cover
+    # it: the system program appears here as an ACCOUNT, and that check only looks at instruction
+    # program ids.
+    #
+    # Not theft — the program's internal create_account CPI fails at execution — but it is not
+    # the deposit that was asked for, it will never fund the escrow, and it costs the human a fee
+    # plus a spent approval. The same reasoning as amount_covers_rent above: a transaction that
+    # cannot do what the summary says must not be certified, whether the reason is arithmetic or
+    # a wrong account.
+    record("system_program_account", len(accounts) > 2 and accounts[2] == settlement.SYS,
+           f"{settlement.SYS} (the system program, which the deposit's internal create_account "
+           "CPI requires in this position)",
+           accounts[2] if len(accounts) > 2 else
+           f"<missing — the deposit carries only {len(accounts)} accounts>")
+
     # Anything else touching the program, or any extra instruction that moves value, is suspect.
     other = [keys[c.program_id_index] for c in msg.instructions
              if c.program_id_index < len(keys)
@@ -608,21 +652,31 @@ def _verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt
     total_out = sum(m["lamports"] or 0 for m in movements)
     record("total_lamport_movement", total_out == expect_amount_lamports and not undecodable,
            f"{expect_amount_lamports} lamports moved by the instructions in this transaction — "
-           "the deposit and nothing else. This is NOT the whole debit: rent and fees are also "
+           "the deposit and nothing else. This is NOT the whole debit: the network fee is also "
            "charged at execution, see additional_charges_at_execution below",
            f"{total_out} lamports" + (" + undecodable instructions" if undecodable else ""))
 
     # The line above is the one a human actually reads before signing, and on its own it read as
-    # "this is what leaves my wallet". It is not: the escrow account's rent and the network fee
-    # are charged by the runtime, not by an instruction, so neither can ever appear in the
-    # itemisation. Saying so in the residual-risk section of a review is not saying so to the
-    # person holding the key.
+    # "this is what leaves my wallet". It is not: the network fee is charged by the runtime, not
+    # by an instruction, so it can never appear in the itemisation. Saying so in the
+    # residual-risk section of a review is not saying so to the person holding the key.
+    #
+    # It used to add the rent-exempt reserve on top as well, and that was WRONG — finding [G12].
+    # The program funds the escrow with exactly `amount`, so the reserve comes out of the amount
+    # and the debit is amount + fee. Overstating it by 1_454_640 lamports on every single draft
+    # is not a harmlessly cautious rounding: this is the figure a person reconciles against their
+    # wallet afterwards, and a disclosure that never matches is one they stop reading. The
+    # reserve is still stated, because it is why `amount` has a floor and why the recipient
+    # receives more than they were promised.
     record("additional_charges_at_execution", True,
            "charged by the runtime, not by an instruction — invisible in the itemisation above",
-           f"~{ESCROW_RENT_LAMPORTS} lamports rent for the {settlement.STATE_LEN}-byte escrow "
-           f"account (refunded to whoever claims or reclaims it) + {fee_lamports} lamports "
-           f"network fee. Approximate total debit: "
-           f"~{total_out + ESCROW_RENT_LAMPORTS + fee_lamports} lamports")
+           f"{fee_lamports} lamports network fee. Approximate total debit: "
+           f"~{total_out + fee_lamports} lamports (the deposit + the fee). The escrow account's "
+           f"{ESCROW_RENT_LAMPORTS}-lamport rent-exempt reserve for its "
+           f"{settlement.STATE_LEN} bytes is NOT charged on top of the deposit: the program "
+           f"creates that account with exactly the deposit amount, so the reserve is taken out "
+           f"of it and is returned with the funds when whoever claims or reclaims closes the "
+           f"account.")
 
     dests = {m["to"] for m in movements if (m["lamports"] or 0) > 0}
     record("destinations", dests == {str(expected_pda)},

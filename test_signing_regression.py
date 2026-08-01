@@ -883,9 +883,10 @@ def test_a_name_the_registry_cannot_hold_is_refused_unsigned(alias_server, monke
     Driven against txguard directly. Since the alias-read track merged,
     xete_alias_claim normalises the name at the top of the tool and refuses an
     unclaimable one BEFORE any network call at all — strictly earlier than this guard.
-    That end-to-end path is asserted in test_alias_read.py (`net.calls == []`). This
-    test keeps txguard's own guard covered, so it still holds if that early refusal is
-    ever removed or bypassed by a different caller.
+    That end-to-end path is asserted in test_alias_read_hardening.py, by
+    test_claim_refuses_an_impossible_name_before_touching_anything (`net.calls == []`).
+    This test keeps txguard's own guard covered, so it still holds if that early refusal
+    is ever removed or bypassed by a different caller.
     """
     server = alias_server
     from xete_mcp.client import load_or_create_identity
@@ -908,6 +909,40 @@ def test_a_name_the_registry_cannot_hold_is_refused_unsigned(alias_server, monke
         assert "not a claimable" in str(e), f"refused for the wrong reason: {e}"
     else:
         raise AssertionError("txguard accepted a name the registry cannot hold")
+
+
+def test_the_coverage_handoff_above_names_the_file_that_actually_has_it():
+    """Finding [G23]. The test above narrowed its own scope on the strength of coverage it
+    says lives somewhere else. That sentence named test_alias_read.py; the assertion is in
+    test_alias_read_hardening.py. A wrong pointer in a handoff like this is worse than none:
+    the next person to check whether the end-to-end refusal is still covered looks in a file
+    where all five `net.calls == []` hits belong to other paths, finds one, and concludes the
+    handoff is honoured.
+
+    So the pointer is now executable. If the named file, the named test, or its assertion
+    moves again, this fails instead of quietly going stale.
+    """
+    import ast
+    import re
+
+    here = Path(__file__).resolve()
+    tree = ast.parse(here.read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "test_a_name_the_registry_cannot_hold_is_refused_unsigned")
+    doc = ast.get_docstring(fn) or ""
+
+    named = sorted(set(re.findall(r"test_[a-z0-9_]+\.py", doc)))
+    assert named, "the docstring no longer names the file it hands its coverage off to"
+
+    for filename in named:
+        target = here.parent / filename
+        assert target.exists(), f"the docstring hands coverage off to {filename}, which does not exist"
+        body = target.read_text(encoding="utf-8")
+        assert "def test_claim_refuses_an_impossible_name_before_touching_anything" in body, (
+            f"{filename} does not contain the end-to-end refusal this docstring relies on")
+        assert "no challenge may be requested for a name that cannot exist" in body, (
+            f"{filename} does not contain the `net.calls == []` assertion this docstring cites")
 
 
 # ── repair [6]: a transaction that failed on chain did not claim anything ────────────

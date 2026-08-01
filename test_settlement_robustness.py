@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import struct
 import sys
 from pathlib import Path
@@ -1206,7 +1207,13 @@ def test_an_out_of_range_index_on_a_non_deposit_instruction_is_also_refused():
 
 # ── [24] the report told a signer the deposit was the whole debit ─────────────────────
 
-def test_the_report_says_rent_and_fees_are_charged_on_top():
+def test_the_report_states_the_rent_reserve_and_the_fee_where_the_signer_reads():
+    """Renamed, not weakened — every assertion below is the one finding [24] shipped with.
+    Only the title's claim changed: the network fee IS charged on top, the rent-exempt
+    reserve is NOT (finding [G12] — the program funds the escrow with exactly the deposit
+    amount). Both must still be disclosed to the signer, which is what this asserts. The
+    corrected arithmetic has its own test in the final-gate section at the bottom of this
+    file."""
     r = _verify(_honest())
     assert r.ok
     total = [c for c in r.checks if c["name"] == "total_lamport_movement"][0]
@@ -2798,3 +2805,195 @@ def test_a_confusable_name_is_refused_on_the_verify_path_too(chain, drafting, na
     assert v["verified"] is False
     assert "ASCII" in json.dumps(v), "the endpoint-count refusal masked the real reason"
     assert not chain.calls, "a confusable name must be refused before any lookup"
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════
+# FINAL GATE — the draft/verify correctness findings [G12] and [G14].
+#
+# Both are about what `xete_verify_settlement_tx` tells a HUMAN before they put a key on a
+# transaction, which is the one output on this path with no second chance behind it.
+# ═════════════════════════════════════════════════════════════════════════════════════
+
+def _raw_deposit_ix(*, escrow_id=ESCROW_ID, amount=AMOUNT, recipient=None, salt=SALT,
+                    accounts=None):
+    """A tag-0 deposit instruction built WITHOUT `settlement.deposit_ix`'s guards.
+
+    The verifier's whole premise is that the bytes in front of it were chosen by somebody
+    else, so its tests must be able to build shapes the honest builder refuses to emit.
+    """
+    prog = settlement.program_id()
+    data = (bytes([0]) + escrow_id + struct.pack("<Q", amount)
+            + settlement.commitment(recipient or RECIPIENT.pubkey(), salt)
+            + struct.pack("<q", 0))
+    if accounts is None:
+        accounts = [
+            AccountMeta(DEPOSITOR.pubkey(), True, True),
+            AccountMeta(settlement.escrow_pda(prog, escrow_id), False, True),
+            AccountMeta(settlement.SYS, False, False),
+        ]
+    return Instruction(program_id=prog, data=data, accounts=accounts)
+
+
+def _wrapped(ix):
+    return _tx_b64([settlement._cb_limit(60_000), settlement._cb_price(1_000), ix])
+
+
+# ── [G12] the disclosure double-counted the rent-exempt reserve ──────────────────────
+
+def test_the_rent_reserve_is_not_disclosed_as_a_charge_on_top_of_the_amount():
+    """The signer was told `Approximate total debit: ~{amount + rent + fee}`. It is
+    `amount + fee`.
+
+    Read-only from mainnet, deposit 4zAVuxHQ... on the deployed (immutable) program:
+    the inner createAccount CPI allocates space=81 with lamports=69_000_000, i.e. EXACTLY
+    the instruction's amount; the depositor goes 90_000_000 -> 20_994_940, a debit of
+    69_005_060 = amount + the 5_060 fee; the PDA goes 0 -> +69_000_000. The rent-exempt
+    reserve is carved OUT of the amount, it is not added to it.
+
+    Overstating a debit is the safe direction for a scare and the wrong direction for a
+    disclosure: this is the number a person reconciles against their wallet, and a figure
+    that is 1_454_640 lamports too high on every draft teaches them the tool is
+    approximately wrong, which is how the fee line stops being read too.
+    """
+    r = _verify(_honest())
+    assert r.ok, r.failures
+    actual = [c for c in r.checks if c["name"] == "additional_charges_at_execution"][0]["actual"]
+
+    assert str(AMOUNT + r.fee_lamports) in actual, actual
+    assert str(AMOUNT + draft.ESCROW_RENT_LAMPORTS + r.fee_lamports) not in actual, actual
+    # The reserve is still disclosed — it is real, it is just not an extra debit.
+    assert str(draft.ESCROW_RENT_LAMPORTS) in actual
+
+
+def test_a_deposit_too_small_to_create_the_escrow_is_not_certified_safe():
+    """The consequence of the same misunderstanding, and the one that costs money. Because
+    the program funds the escrow account with exactly `amount`, an amount below the
+    rent-exempt minimum for 81 bytes cannot create the account: the runtime rejects the
+    transaction for insufficient funds for rent. `deposit_ix` validated only `amount > 0`
+    and the verifier certified the result SAFE TO REVIEW AND SIGN — a human signs, pays the
+    fee, and escrows nothing.
+    """
+    small = draft.ESCROW_RENT_LAMPORTS - 1
+    r = _verify(_wrapped(_raw_deposit_ix(amount=small)), expect_amount_lamports=small)
+
+    assert not r.ok
+    assert "amount_covers_rent" in r.failures, r.failures
+    assert str(draft.ESCROW_RENT_LAMPORTS) in _blob(r)
+
+
+def test_a_deposit_exactly_at_the_rent_minimum_still_verifies():
+    """The boundary, in the other direction: the refusal above must not cost anyone a
+    legitimate draft. `>=`, not `>`."""
+    exact = draft.ESCROW_RENT_LAMPORTS
+    r = _verify(_wrapped(_raw_deposit_ix(amount=exact)), expect_amount_lamports=exact)
+
+    assert r.ok, r.failures
+
+
+def test_the_instruction_builder_refuses_an_amount_that_cannot_create_the_escrow():
+    """Same guard at the source both paths share, so the signing path (`settlement.deposit`,
+    which holds a key) refuses it too instead of only the advisory one. Nothing is signed or
+    submitted here — this builds an instruction and never gets one."""
+    args = (settlement.program_id(), DEPOSITOR.pubkey(), ESCROW_ID)
+    c = settlement.commitment(RECIPIENT.pubkey(), SALT)
+
+    with pytest.raises(ValueError) as ei:
+        settlement.deposit_ix(*args, draft.ESCROW_RENT_LAMPORTS - 1, c)
+    assert "rent-exempt" in str(ei.value)
+    assert str(settlement.RENT_EXEMPT_LAMPORTS) in str(ei.value)
+
+    # The boundary is a legal deposit and must still build.
+    settlement.deposit_ix(*args, draft.ESCROW_RENT_LAMPORTS, c)
+
+
+def test_the_rent_constant_is_the_one_the_program_actually_needs():
+    """One source of truth for both modules. `draft.ESCROW_RENT_LAMPORTS` used to be
+    computed independently of anything in settlement.py, which is a drift risk on an
+    IMMUTABLE program: the verifier's floor and the builder's floor must be the same number
+    or one of them certifies what the other refuses."""
+    assert draft.ESCROW_RENT_LAMPORTS is settlement.RENT_EXEMPT_LAMPORTS
+    assert settlement.RENT_EXEMPT_LAMPORTS == (128 + settlement.STATE_LEN) * 3480 * 2
+    # getMinimumBalanceForRentExemption(81) on mainnet, 2026-08-01.
+    assert settlement.RENT_EXEMPT_LAMPORTS == 1_454_640
+
+
+# ── [G14] the deposit's third account was never checked ──────────────────────────────
+
+def test_a_deposit_whose_third_account_is_not_the_system_program_is_refused():
+    """`_verify_draft` checked accounts[0] (depositor) and accounts[1] (escrow PDA) and
+    stopped. accounts[2] must be the system program — the deposit's internal create_account
+    CPI needs it — and an attacker key there verified ok=True with zero failures.
+
+    Not theft: the CPI fails at execution. But it is not the deposit that was asked for, it
+    will never fund the escrow, and it costs the human a network fee plus one spent human
+    approval — against a tool whose stated contract is that it "refuses unless the total and
+    the destinations are exactly the deposit that was asked for".
+
+    `no_unexpected_programs` does not cover this: the system program appears here as an
+    ACCOUNT, not as an instruction's program id, so that check never looks at it.
+    """
+    prog = settlement.program_id()
+    ix = _raw_deposit_ix(accounts=[
+        AccountMeta(DEPOSITOR.pubkey(), True, True),
+        AccountMeta(settlement.escrow_pda(prog, ESCROW_ID), False, True),
+        AccountMeta(ATTACKER.pubkey(), False, False),
+    ])
+    r = _verify(_wrapped(ix))
+
+    assert not r.ok
+    assert "system_program_account" in r.failures, r.failures
+    assert str(settlement.SYS) in _blob(r)
+
+
+def test_a_deposit_with_the_system_program_account_missing_is_refused():
+    """Same check, the truncation case — an index that is simply not there must not read as
+    a pass. Two accounts is one short, and `accounts[2]` on that list is an IndexError, which
+    is exactly how this class of check gets written wrong."""
+    prog = settlement.program_id()
+    ix = _raw_deposit_ix(accounts=[
+        AccountMeta(DEPOSITOR.pubkey(), True, True),
+        AccountMeta(settlement.escrow_pda(prog, ESCROW_ID), False, True),
+    ])
+    r = _verify(_wrapped(ix))
+
+    assert not r.ok
+    assert "system_program_account" in r.failures, r.failures
+
+
+def test_an_honest_draft_from_the_real_builder_still_passes_both_new_checks():
+    """The two additions must not refuse what this package itself drafts. Anchored on the
+    real builder rather than on a hand-built instruction, so a change to `deposit_ix`'s
+    account order is caught here rather than in production."""
+    r = _verify(_honest())
+
+    assert r.ok, r.failures
+    names = {c["name"] for c in r.checks}
+    assert {"system_program_account", "amount_covers_rent"} <= names
+    assert all(c["ok"] for c in r.checks if c["name"] in
+               {"system_program_account", "amount_covers_rent"})
+
+
+def test_a_deposit_that_cannot_land_is_refused_before_the_budget_is_charged(spend_ok, tmp_path,
+                                                                            monkeypatch):
+    """An impossible deposit is not a spending decision, so it must not consume one.
+
+    `settlement.deposit` records against the 24h window at APPROVAL time and — unlike
+    `payment.pay_herd`, which releases the record when the failure provably precedes
+    submission — never gives it back. Putting the rent floor only in `deposit_ix`, which runs
+    after the gate, would mean an amount that can never create an escrow still charges the
+    budget. So it is checked before the gate as well as at the shared builder.
+    """
+    class _Bomb:
+        def __init__(self, *_a, **_k):
+            raise AssertionError("the RPC client was constructed for an impossible deposit")
+
+    monkeypatch.setattr(settlement, "Client", _Bomb)
+
+    with pytest.raises(ValueError) as ei:
+        settlement.deposit("http://127.0.0.1:1", DEPOSITOR, RECIPIENT.pubkey(),
+                           settlement.RENT_EXEMPT_LAMPORTS - 1)
+    assert "rent-exempt" in str(ei.value)
+
+    ledger = Path(os.environ[spendguard.ENV_LEDGER])
+    entries = json.loads(ledger.read_text())["entries"] if ledger.exists() else []
+    assert entries == [], f"an impossible deposit consumed spend budget: {entries}"

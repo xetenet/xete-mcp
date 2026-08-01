@@ -159,8 +159,16 @@ def normalize_name(name: str) -> str:
             "%name can.")
     encoded = bare.encode("utf-8")
     if len(encoded) > MAX_NAME_BYTES:
+        # `bare` on THIS branch is by definition longer than the 32-byte field, and nothing
+        # bounds how much longer — the whitespace branch above sanitises, this one used to
+        # interpolate the lot. That put an unbounded caller-chosen string into `error`, the
+        # very field every caller of this function treats as the safe half of its refusal
+        # (finding [G21]). A payload with no whitespace in it — hyphens and dots do fine —
+        # skips the branch above and lands here, so "sanitised" was true of one route and
+        # not the other.
         raise InvalidAliasName(
-            f"%{bare} is {len(encoded)} bytes; the registry stores at most {MAX_NAME_BYTES}.")
+            f"%{sanitize_text(bare, 48)} is {len(encoded)} bytes; the registry stores at most "
+            f"{MAX_NAME_BYTES}.")
     return bare
 
 

@@ -544,27 +544,193 @@ def test_every_signing_site_is_gated_or_explicitly_exempt():
     )
 
 
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _gate_and_sign_lines(tree, funcname):
+    """(gate-call lines, sign/submit lines, gate-call lines that run INSIDE A LOOP) in `funcname`.
+
+    The third value exists because "how many times does the source SAY authorize()" and "how many
+    times does it RUN" are different questions, and only the second one is about money. One call
+    in a loop body is one line and N charges.
+    """
+    func = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == funcname)
+
+    gate_lines, sign_lines, looped_gates = [], [], []
+
+    def visit(node, in_loop: bool) -> None:
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+            if name in ("authorize", "_authorize_spend"):
+                gate_lines.append(node.lineno)
+                if in_loop:
+                    looped_gates.append(node.lineno)
+            if getattr(node.func, "attr", None) in SUBMIT_OR_SIGN:
+                sign_lines.append(node.lineno)
+
+        # Per-node accuracy, not a blanket "anything under a loop node". A `for`'s iterable and
+        # a `for`/`while`'s `else:` run exactly once; the body does not, and a `while`'s test is
+        # re-evaluated every iteration.
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            visit(node.target, in_loop)
+            visit(node.iter, in_loop)
+            for stmt in node.body:
+                visit(stmt, True)
+            for stmt in node.orelse:
+                visit(stmt, in_loop)
+            return
+        if isinstance(node, ast.While):
+            visit(node.test, True)
+            for stmt in node.body:
+                visit(stmt, True)
+            for stmt in node.orelse:
+                visit(stmt, in_loop)
+            return
+        if isinstance(node, _COMPREHENSIONS):
+            for child in ast.iter_child_nodes(node):
+                visit(child, True)
+            return
+
+        for child in ast.iter_child_nodes(node):
+            visit(child, in_loop)
+
+    visit(func, False)
+    return sorted(gate_lines), sorted(sign_lines), sorted(looped_gates)
+
+
+def _assert_gate_discipline(tree, filename, funcname):
+    """The three properties a directly-gated spending path must have: it gates, it gates
+    EXACTLY ONCE, and it gates before it signs.
+
+    Factored out of the test so the test below can run it against a deliberately
+    double-gated source and prove the middle property is actually enforced.
+    """
+    gate_lines, sign_lines, looped_gates = _gate_and_sign_lines(tree, funcname)
+
+    assert gate_lines, f"{filename}:{funcname} never calls the spend gate"
+
+    # A count of SOURCE LINES is not a count of CHARGES. One authorize() inside a loop body is
+    # one line and N ledger entries, so `len(gate_lines) == 1` alone would wave it through —
+    # raised by the fresh-context reviewer of the G22 fix as the cheapest way past the new rule.
+    assert not looped_gates, (
+        f"{filename}:{funcname} calls the spend gate inside a loop (line(s) {looped_gates}). "
+        "That is one line and one charge per iteration. Authorize the whole spend once, "
+        "outside the loop.")
+
+    # EXACTLY ONCE — finding [G22]. `authorize()` records against the 24h window at approval
+    # time, so a path that gates twice charges the ledger twice for one spend. That is
+    # precisely the defect the integrator's hunk-3 merge resolution was guarding against (the
+    # naive union merge reinstated a dropped early gate), and this tripwire — which asserted
+    # only that a gate EXISTS and PRECEDES signing — passed on the double-gated source. The
+    # only thing that went red was an unrelated window-cap figure in one signing fixture:
+    # XETE_SPEND_WINDOW_LAMPORTS=100000000 against a 50M + 51.6M double charge. A slightly
+    # larger fixture figure and the double-charge ships green. The guard the resolution
+    # depends on now has an assertion of its own rather than a coincidence.
+    assert len(gate_lines) == 1, (
+        f"{filename}:{funcname} calls the spend gate {len(gate_lines)} times "
+        f"(lines {gate_lines}). One spend must charge the ledger once: authorize() records "
+        "against the 24h window at approval time, so a second call double-charges it and "
+        "locks the agent out early having delivered one message."
+    )
+
+    if sign_lines:
+        assert min(gate_lines) < min(sign_lines), (
+            f"{filename}:{funcname} signs at line {min(sign_lines)} before gating at "
+            f"line {min(gate_lines)} — the gate must run first"
+        )
+
+
 def test_the_gated_paths_really_call_the_gate_before_they_sign():
     for filename, funcname in GATED_DIRECTLY:
         tree = ast.parse((SRC / "xete_mcp" / filename).read_text(encoding="utf-8"))
-        func = next(n for n in ast.walk(tree)
-                    if isinstance(n, ast.FunctionDef) and n.name == funcname)
+        _assert_gate_discipline(tree, filename, funcname)
 
-        gate_lines, sign_lines = [], []
-        for node in ast.walk(func):
-            if isinstance(node, ast.Call):
-                name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
-                if name in ("authorize", "_authorize_spend"):
-                    gate_lines.append(node.lineno)
-                if getattr(node.func, "attr", None) in SUBMIT_OR_SIGN:
-                    sign_lines.append(node.lineno)
 
-        assert gate_lines, f"{filename}:{funcname} never calls the spend gate"
-        if sign_lines:
-            assert min(gate_lines) < min(sign_lines), (
-                f"{filename}:{funcname} signs at line {min(sign_lines)} before gating at "
-                f"line {min(gate_lines)} — the gate must run first"
-            )
+# The naive union merge of hunk 3, reduced to its shape: the early gate that the integrator
+# dropped is reinstated alongside the one that was kept. Both of the tripwire's original
+# assertions hold on this — a gate exists, and the first gate precedes the first signature.
+_DOUBLE_GATED_SOURCE = '''
+def deposit(rpc_url, depositor, recipient, amount_lamports, on_ticket=None):
+    from .spendguard import authorize
+
+    authorize(int(amount_lamports), "xete_settle_create", detail="")
+    client = Client(rpc_url)
+    authorize(int(amount_lamports), "xete_settle_create", detail="")
+    return client.send_transaction(tx)
+'''
+
+
+# The cheapest way past a rule that counts source lines: charge N times from one line. Raised by
+# the fresh-context reviewer of the G22 fix.
+_LOOP_GATED_SOURCE = '''
+def deposit(rpc_url, depositor, recipients, amount_lamports, on_ticket=None):
+    from .spendguard import authorize
+
+    client = Client(rpc_url)
+    for recipient in recipients:
+        authorize(int(amount_lamports), "xete_settle_create", detail="")
+        client.send_transaction(tx)
+'''
+
+# The over-refusal guard for the loop rule: a gate outside a loop, in a function that HAS loops
+# (which every confirmation poll in this package does), must still pass.
+_LOOP_ELSEWHERE_SOURCE = '''
+def deposit(rpc_url, depositor, recipient, amount_lamports, on_ticket=None):
+    from .spendguard import authorize
+
+    authorize(int(amount_lamports), "xete_settle_create", detail="")
+    client = Client(rpc_url)
+    sig = client.send_transaction(tx)
+    for _ in range(30):
+        if client.get_signature_statuses([sig]):
+            break
+    return sig
+'''
+
+
+def test_the_tripwire_itself_catches_a_path_that_gates_twice():
+    """Finding [G22]: proves the single-call rule bites, rather than being a line of source
+    that happens to be true today. Without the `len(gate_lines) == 1` assertion this passes
+    the tripwire silently, which is how the double-charge would have shipped."""
+    tree = ast.parse(_DOUBLE_GATED_SOURCE)
+
+    # Both properties the tripwire checked BEFORE this finding hold on the double-gated source.
+    gate_lines, sign_lines, _looped = _gate_and_sign_lines(tree, "deposit")
+    assert gate_lines and sign_lines
+    assert min(gate_lines) < min(sign_lines)
+
+    # And the tripwire as a whole must still refuse it.
+    with pytest.raises(AssertionError, match="calls the spend gate 2 times"):
+        _assert_gate_discipline(tree, "settlement.py", "deposit")
+
+
+def test_the_tripwire_catches_one_gate_that_charges_many_times():
+    """A single authorize() in a loop body is ONE line and N ledger entries, so a rule that
+    counts source lines waves it through. Counting lines was the fix for [G22]; this is the
+    hole in that fix, found by the fresh-context pass on it."""
+    tree = ast.parse(_LOOP_GATED_SOURCE)
+
+    # The line count says one gate, which is exactly why the count alone is not enough.
+    gate_lines, _sign, looped = _gate_and_sign_lines(tree, "deposit")
+    assert len(gate_lines) == 1
+    assert looped == gate_lines
+
+    with pytest.raises(AssertionError, match="inside a loop"):
+        _assert_gate_discipline(tree, "settlement.py", "deposit")
+
+
+def test_the_loop_rule_does_not_refuse_a_confirmation_poll():
+    """Over-refusal guard. Every submitting function in this package polls for confirmation in a
+    `for` loop AFTER gating once — `settlement.deposit` and `payment.pay_herd` both do. A rule
+    that flagged "this function contains a loop" instead of "this gate runs inside one" would
+    have gone red on the real code, and the honest response to that is to weaken the rule."""
+    tree = ast.parse(_LOOP_ELSEWHERE_SOURCE)
+
+    gate_lines, _sign, looped = _gate_and_sign_lines(tree, "deposit")
+    assert gate_lines and not looped
+
+    _assert_gate_discipline(tree, "settlement.py", "deposit")     # must not raise
 
 
 # ── the gate is really wired, not merely present in the source ───────────────────────
@@ -608,7 +774,16 @@ def test_settlement_deposit_refuses_before_touching_the_network(ledger, monkeypa
 
 
 def test_an_allowed_spend_passes_the_gate_and_is_recorded(ledger, monkeypatch):
-    """The other direction: within limits, execution continues and the ledger records it."""
+    """The other direction: within limits, execution continues and the ledger records it.
+
+    The figure moved from 1_000_000 to 2_000_000 and NOTHING else about this test changed —
+    same three assertions, same strength. 1_000_000 lamports is below the escrow account's
+    rent-exempt minimum (1_454_640), so since finding [G12] it is a deposit that can never
+    execute and `settlement.deposit` refuses it before the gate. It used to reach `Client`
+    only because the mock raised before `deposit_ix` would have; the fixture was choosing an
+    impossible amount to prove a possible spend is recorded. 2_000_000 is a deposit that could
+    really happen, which is what this test is about.
+    """
     from xete_mcp import settlement
 
     reached = []
@@ -621,10 +796,10 @@ def test_an_allowed_spend_passes_the_gate_and_is_recorded(ledger, monkeypatch):
     monkeypatch.setattr(settlement, "Client", Marker)
     monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
     with pytest.raises(RuntimeError, match="stop here"):
-        settlement.deposit("http://127.0.0.1:1", object(), object(), 1_000_000)
+        settlement.deposit("http://127.0.0.1:1", object(), object(), 2_000_000)
 
     assert reached, "the gate refused a spend that was within limits"
-    assert _entries(ledger)[0]["lamports"] == 1_000_000
+    assert _entries(ledger)[0]["lamports"] == 2_000_000
     assert _entries(ledger)[0]["path"] == "xete_settle_create"
 
 
