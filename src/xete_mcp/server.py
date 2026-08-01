@@ -14,6 +14,13 @@ Config (env):
   XETE_SOL_KEYPAIR  path to a funded Solana keypair (JSON array). Used to pay only on
                     a server that charges to send; messaging on xete.net is free, and
                     identity and inbox never need it.
+  XETE_PERMIT_URL   base URL of the %alias permit server — the separate service that
+                    prices and co-signs a %name claim. Defaults to XETE_SERVER_URL.
+                    Must be https:// unless the host is loopback. It is NOT trusted for
+                    who owns a name: ownership is read from the chain (see below).
+  XETE_SOLANA_RPC   Solana RPC used to read the %alias registry, which is the source of
+                    truth for which wallet a %name points to
+                    (default https://solana-rpc.publicnode.com).
 
 Spend limits (env) — enforced on this side, before anything is signed, on every path
 that can spend: xete_send_message, xete_alias_claim, xete_settle_create. There is no
@@ -36,7 +43,9 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from .client import XeteClient, load_or_create_identity
-from . import payment, settlement
+from . import alias_chain, payment, settlement
+from .safehttp import (EndpointError, as_bool, as_int, as_str, get_json, project,
+                       require_secure_url)
 
 SERVER_URL = os.environ.get("XETE_SERVER_URL", "https://xete.net")
 RPC_URL = os.environ.get("XETE_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -197,9 +206,197 @@ def xete_check_inbox(limit: int = 20) -> str:
 # ── %alias registry tools ────────────────────────────────────────────────────
 # Names that resolve to a wallet (%alex). quote/resolve/reverse are read-only (no signing,
 # no cost). claim runs the full on-chain flow and is paid by THIS agent's identity wallet.
+#
+# WHO IS TRUSTED FOR WHAT. Ownership of a %name — the fact that decides where a payment
+# addressed by name actually goes — is read from the Solana registry, never from the
+# permit server (alias_chain.py). The permit server is used only for what is genuinely
+# its own: the price of a claim, and the .sol side lookups. Anything sourced from it is
+# returned under an `unverified` key, and where the chain can check it (a reverse lookup
+# proposes a name; the chain says who owns that name) it is checked and dropped if wrong.
+
+PERMIT_TIMEOUT = 15
+MAX_PERMIT_BYTES = 64 * 1024
+
+# Allow-lists: the only fields read out of a permit-server answer. Anything else is
+# dropped by name so the server cannot inject keys into what an agent reads back.
+_QUOTE_FIELDS = {
+    "name": as_str, "length": as_int, "status": as_str, "premium": as_bool,
+    "in_grace_window": as_bool, "floor_lamports": as_int, "land_rush_lamports": as_int,
+    "your_rush_lamports": as_int, "total_lamports": as_int, "note": as_str,
+}
+
+
+def _as_pubkey(value):
+    """A base58 32-byte address, or None. Keeps junk out of anything address-shaped."""
+    import base58
+
+    if not isinstance(value, str) or not 32 <= len(value) <= 44:
+        return None
+    try:
+        return value if len(base58.b58decode(value)) == 32 else None
+    except Exception:
+        return None
+
+
+_RESOLVE_FIELDS = {"name": as_str, "alias_owner": _as_pubkey, "sol_owner": _as_pubkey,
+                   "owns_both": as_bool, "sol_mismatch": as_bool}
+_REVERSE_FIELDS = {"name": as_str, "sol_owner": _as_pubkey, "owns_both": as_bool,
+                   "names_count": as_int}
+
 
 def _permit_url(path: str) -> str:
-    return f"{PERMIT_URL.rstrip('/')}{path}"
+    """The permit endpoint URL, re-read from the environment and checked on every call.
+
+    Checked here rather than at import so a bad XETE_PERMIT_URL surfaces as a refusal on
+    the tool that would have used it, instead of stopping the whole MCP server from
+    loading (identity and inbox do not involve the permit server at all).
+    """
+    base = os.environ.get("XETE_PERMIT_URL") or PERMIT_URL
+    return f"{require_secure_url(base, 'XETE_PERMIT_URL').rstrip('/')}{path}"
+
+
+def _permit_get(path: str, params: dict) -> dict:
+    return get_json(_permit_url(path), params=params, timeout=PERMIT_TIMEOUT,
+                    max_bytes=MAX_PERMIT_BYTES)
+
+
+def _endpoint_error(e: EndpointError, **extra) -> dict:
+    """A permit-server failure as a specific, actionable object — not a stray exception string."""
+    out = {"error": str(e), "reason": e.kind, "permit_server": os.environ.get("XETE_PERMIT_URL")
+           or PERMIT_URL}
+    if e.status is not None:
+        out["status"] = e.status
+    if e.kind == "endpoint_not_available":
+        out["hint"] = ("this xete server does not implement that %alias endpoint — the deployed "
+                       "relay predates it. Point XETE_PERMIT_URL at a server that does. Nothing "
+                       "is wrong with the name you asked about.")
+    elif e.kind == "insecure_endpoint":
+        out["hint"] = ("set XETE_PERMIT_URL to an https:// URL, or a loopback address "
+                       "(http://127.0.0.1:PORT) for local testing.")
+    out.update(extra)
+    return out
+
+
+def _chain_source() -> dict:
+    return {"source": "chain", "verified": True, "program": str(alias_chain.AXTREG),
+            "rpc": os.environ.get(alias_chain.ENV_RPC) or alias_chain.DEFAULT_RPC}
+
+
+def _alias_view(name: str) -> dict:
+    """Owner of a %name from the chain, plus the permit server's unverified extras.
+
+    Shared by xete_alias_resolve and xete_resolve so both answer from the same source.
+    """
+    try:
+        bare = alias_chain.normalize_name(name)
+    except alias_chain.InvalidAliasName as e:
+        return {"error": str(e), "reason": "invalid_name"}
+
+    out: dict = {"name": bare}
+    try:
+        owner = alias_chain.resolve_owner(bare)
+    except alias_chain.AliasChainError as e:
+        return {"name": bare, "error": str(e), "reason": "chain_unavailable",
+                "note": "the registry could not be read, and this tool does not fall back to a "
+                        "server's word about who owns a name."}
+
+    out["alias_owner"] = owner
+    out["claimed"] = owner is not None
+    out["resolution"] = _chain_source()
+
+    unverified: dict = {
+        "source": "permit_server",
+        "verified": False,
+        "note": "the permit server's word, not checked against the chain — do not decide where "
+                "money goes on this alone.",
+    }
+    try:
+        data = _permit_get("/alias/resolve", {"name": bare})
+    except EndpointError as e:
+        unverified["unavailable"] = _endpoint_error(e)
+    else:
+        picked = project(data, _RESOLVE_FIELDS)
+        claimed_owner = picked.get("alias_owner")
+        sol_owner = picked.get("sol_owner")
+        unverified["alias_owner_per_server"] = claimed_owner
+        unverified["sol_owner"] = sol_owner
+        unverified["sol_mismatch"] = picked.get("sol_mismatch")
+        # owns_both is recomputed here from the CHAIN owner rather than taken from the
+        # server: the badge means "one wallet holds both", and half of that we know.
+        unverified["owns_both"] = bool(owner and sol_owner and sol_owner == owner)
+        if picked.get("fields_ignored"):
+            unverified["fields_ignored"] = picked["fields_ignored"]
+        if claimed_owner and claimed_owner != owner:
+            out["permit_server_disagrees"] = True
+            out["warning"] = (
+                f"the permit server says %{bare} is owned by {claimed_owner}, the on-chain "
+                f"registry says {owner}. The chain is authoritative and the server's answer is "
+                "being ignored. A server that reports a different owner is either broken or "
+                "trying to redirect payments — stop trusting it.")
+    out["unverified"] = unverified
+    return out
+
+
+def _reverse_view(wallet: str) -> dict:
+    """Best %name for a wallet: the permit server proposes, the chain confirms.
+
+    A reverse lookup cannot be done from the chain alone without scanning the registry,
+    which public RPCs throttle. So the untrusted answer is taken as a CANDIDATE and then
+    resolved forward on-chain: a name is only returned if the registry agrees this wallet
+    owns it. A server can therefore hide a name, but it cannot invent one.
+    """
+    w = _as_pubkey((wallet or "").strip())
+    if w is None:
+        return {"error": f"{wallet!r} is not a base58 wallet address.", "reason": "invalid_wallet"}
+
+    out: dict = {"wallet": w, "name": None}
+    try:
+        data = _permit_get("/alias/reverse", {"wallet": w})
+    except EndpointError as e:
+        return {**out, **_endpoint_error(e), "verified": False}
+
+    picked = project(data, _REVERSE_FIELDS)
+    proposed = picked.get("name")
+    unverified = {"source": "permit_server", "verified": False,
+                  "sol_owner": picked.get("sol_owner"), "names_count": picked.get("names_count"),
+                  "owns_both_per_server": picked.get("owns_both")}
+    if picked.get("fields_ignored"):
+        unverified["fields_ignored"] = picked["fields_ignored"]
+    out["unverified"] = unverified
+
+    if proposed is None:
+        out["verified"] = True
+        out["note"] = ("the permit server reports no %name for this wallet; show the truncated "
+                       "address. (A server can hide a name it does not like — this is the one "
+                       "answer the chain cannot contradict without scanning the registry.)")
+        return out
+
+    out["proposed_name"] = proposed
+    try:
+        bare = alias_chain.normalize_name(proposed)
+        chain_owner = alias_chain.resolve_owner(bare)
+    except alias_chain.AliasChainError as e:
+        out["verified"] = False
+        out["error"] = str(e)
+        out["reason"] = "chain_unavailable"
+        out["note"] = (f"the permit server proposed %{str(proposed)[:40]} but it could not be "
+                       "confirmed on-chain, so it is not being returned as this wallet's name.")
+        return out
+
+    if chain_owner == w:
+        out["name"] = bare
+        out["verified"] = True
+        out["resolution"] = _chain_source()
+        unverified["owns_both"] = bool(picked.get("sol_owner") and picked.get("sol_owner") == w)
+    else:
+        out["verified"] = False
+        out["reason"] = "reverse_lookup_unconfirmed"
+        out["permit_server_disagrees"] = True
+        out["warning"] = (
+            f"the permit server proposed %{bare} for {w}, but the on-chain registry says that "
+            f"name is owned by {chain_owner or 'nobody'}. The name has been dropped rather than "
+            "shown as this wallet's identity. Stop trusting this server.")
+    return out
 
 
 @mcp.tool()
@@ -208,39 +405,55 @@ def xete_alias_quote(name: str, wallet: str = "") -> str:
     lines anyone can recompute from on-chain data: floor (scarcity by length — names of 6+
     letters are free), land_rush (a global demand toll that rises and decays), and your_rush
     (a per-wallet surcharge, only returned if you pass your wallet). Lamports; 1 SOL = 1e9
-    lamports. Read-only — costs nothing to ask. Call this before xete_alias_claim."""
+    lamports. Read-only — costs nothing to ask. Call this before xete_alias_claim.
+
+    The price is the permit server's own quote, so it is returned marked unverified; it is not
+    what you end up paying if it exceeds your spend limits, which xete_alias_claim checks
+    before anything is signed."""
     try:
-        params = {"name": name}
-        if wallet:
-            params["wallet"] = wallet
-        r = requests.get(_permit_url("/alias/quote"), params=params, timeout=15)
-        return json.dumps(r.json(), indent=2)
-    except Exception as e:
-        return json.dumps({"error": str(e)[:300]})
+        bare = alias_chain.normalize_name(name)
+    except alias_chain.InvalidAliasName as e:
+        return json.dumps({"input": name, "error": str(e), "reason": "invalid_name"}, indent=2)
+    params = {"name": bare}
+    if wallet:
+        checked = _as_pubkey(wallet.strip())
+        if checked is None:
+            return json.dumps({"input": name, "error": f"{wallet!r} is not a base58 wallet "
+                                                       "address.", "reason": "invalid_wallet"},
+                              indent=2)
+        params["wallet"] = checked
+    try:
+        data = _permit_get("/alias/quote", params)
+    except EndpointError as e:
+        return json.dumps(_endpoint_error(e, input=name, name=bare), indent=2)
+    out = project(data, _QUOTE_FIELDS)
+    out["input"] = name
+    out["source"] = "permit_server"
+    out["verified"] = False
+    return json.dumps(out, indent=2)
 
 
 @mcp.tool()
 def xete_alias_resolve(name: str) -> str:
-    """Resolve a xete %name: its on-chain owner, whether a matching .sol exists, and whether the
-    SAME wallet holds both (owns_both — the verified-identity condition). Use it to confirm a
-    name points where you expect before you trust or pay it. Read-only."""
-    try:
-        r = requests.get(_permit_url("/alias/resolve"), params={"name": name}, timeout=15)
-        return json.dumps(r.json(), indent=2)
-    except Exception as e:
-        return json.dumps({"error": str(e)[:300]})
+    """Resolve a xete %name to the wallet that owns it, READ FROM THE SOLANA REGISTRY — not from
+    any server, so a compromised or hostile permit server cannot redirect where a payment goes.
+    `alias_owner` is chain truth (null means the name is unclaimed). The .sol side — whether a
+    matching .sol exists and whether the SAME wallet holds both (owns_both) — comes from the
+    permit server and is returned under `unverified`. If that server names a different owner than
+    the chain, its answer is ignored and the disagreement is reported. Use this to confirm a name
+    points where you expect before you trust or pay it. Read-only."""
+    return json.dumps({"input": name, **_alias_view(name)}, indent=2)
 
 
 @mcp.tool()
 def xete_alias_reverse(wallet: str) -> str:
-    """Reverse-resolve a wallet to its best xete %name — the identity to show for a raw address —
-    plus whether it also holds the matching .sol. Returns name:null when the wallet holds no
-    name (callers then fall back to the truncated address). Read-only."""
-    try:
-        r = requests.get(_permit_url("/alias/reverse"), params={"wallet": wallet}, timeout=15)
-        return json.dumps(r.json(), indent=2)
-    except Exception as e:
-        return json.dumps({"error": str(e)[:300]})
+    """Reverse-resolve a wallet to its best xete %name — the identity to show for a raw address.
+    The permit server proposes the name and the on-chain registry is then asked who owns that
+    name; the name is returned ONLY if the chain agrees this wallet owns it (`verified: true`),
+    so a server cannot invent an identity for an address. Returns name:null when the wallet holds
+    no name, or when the proposal did not check out — callers then fall back to the truncated
+    address. Read-only."""
+    return json.dumps(_reverse_view(wallet), indent=2)
 
 
 @mcp.tool()
@@ -326,7 +539,9 @@ def xete_alias_claim(name: str) -> str:
 
 # ── unified resolver ─────────────────────────────────────────────────────────────────
 # One call to turn any xete identifier (wallet | %alias | .sol) into a single identity view.
-# Pure addressing over the alias permit server — no messaging, no inbox, no decryption.
+# Pure addressing — no messaging, no inbox, no decryption. A %alias is answered from the
+# chain; a .sol name has no on-chain path here and is answered by the permit server, which
+# is why that one case comes back verified:false.
 
 def _classify_identifier(identifier: str):
     """(kind, query) — kind in {handle, wallet, sol, alias}; query is the lookup key (a wallet
@@ -352,25 +567,51 @@ def xete_resolve(identifier: str) -> str:
     """Resolve any xete identifier to one identity view. Pass a wallet address, a %alias, or a .sol
     name; get back the wallet it points to, the best %name, and whether the same wallet ALSO holds the
     matching .sol (the verified-identity / owns_both badge). Read-only addressing — it does not send,
-    receive, or decrypt anything. (@handle is not yet supported.)"""
+    receive, or decrypt anything. (@handle is not yet supported.)
+
+    A %alias is resolved against the on-chain registry, so `wallet` for an alias is chain truth and
+    carries verified:true. A wallet's %name is proposed by the permit server and then confirmed
+    on-chain before it is returned. A .sol name has no on-chain path here, so that case is answered
+    by the permit server alone and comes back verified:false — do not send funds on it."""
     kind, query = _classify_identifier(identifier)
     if kind == "handle":
         return json.dumps({"input": identifier, "kind": "handle", "supported": False,
                            "note": "@handle resolution is not yet available"}, indent=2)
+
+    if kind == "wallet":
+        view = _reverse_view(query)
+        return json.dumps({"input": identifier, "kind": "wallet", **view}, indent=2)
+
+    if kind == "alias":
+        view = _alias_view(query)
+        return json.dumps({"input": identifier, "kind": "alias",
+                           "wallet": view.get("alias_owner"),
+                           "verified": bool(view.get("resolution")), **view}, indent=2)
+
+    # kind == "sol": SNS is not resolved on-chain by this package, so the permit server is
+    # the only source and the answer is labelled as such rather than dressed up as truth.
     try:
-        if kind == "wallet":
-            rev = requests.get(_permit_url("/alias/reverse"), params={"wallet": query}, timeout=15).json()
-            return json.dumps({"input": identifier, "kind": "wallet", "wallet": query,
-                               "name": rev.get("name"), "owns_both": rev.get("owns_both", False),
-                               "names_count": rev.get("names_count")}, indent=2)
-        res = requests.get(_permit_url("/alias/resolve"), params={"name": query}, timeout=15).json()
-        wallet = res.get("sol_owner") if kind == "sol" else res.get("alias_owner")
-        return json.dumps({"input": identifier, "kind": kind, "name": query, "wallet": wallet,
-                           "alias_owner": res.get("alias_owner"), "sol_owner": res.get("sol_owner"),
-                           "owns_both": res.get("owns_both", False),
-                           "sol_mismatch": res.get("sol_mismatch")}, indent=2)
-    except Exception as e:
-        return json.dumps({"input": identifier, "error": str(e)[:300]})
+        bare = alias_chain.normalize_name(query)
+    except alias_chain.InvalidAliasName as e:
+        return json.dumps({"input": identifier, "kind": "sol", "error": str(e),
+                           "reason": "invalid_name"}, indent=2)
+    try:
+        data = _permit_get("/alias/resolve", {"name": bare})
+    except EndpointError as e:
+        return json.dumps(_endpoint_error(e, input=identifier, kind="sol", name=bare,
+                                          wallet=None, verified=False), indent=2)
+    picked = project(data, _RESOLVE_FIELDS)
+    return json.dumps({
+        "input": identifier, "kind": "sol", "name": bare,
+        "wallet": picked.get("sol_owner"),
+        "sol_owner": picked.get("sol_owner"),
+        "alias_owner_per_server": picked.get("alias_owner"),
+        "verified": False,
+        "source": "permit_server",
+        "note": "a .sol owner is the permit server's word — this package has no on-chain SNS "
+                "lookup. Resolve the %alias instead if you need a verified destination.",
+        "fields_ignored": picked.get("fields_ignored"),
+    }, indent=2)
 
 
 # ── confidential settlement tools (the "tab": agent->agent value transfer) ───────────
@@ -380,21 +621,28 @@ def xete_resolve(identifier: str) -> str:
 
 def _resolve_recipient_wallet(recipient: str):
     """(wallet Pubkey, messageable_handle | None). Accepts a base58 wallet pubkey directly, or a
-    %alias / name resolved via the permit server to its on-chain owner wallet."""
+    %alias resolved AGAINST THE CHAIN to its owner wallet.
+
+    This function chooses the destination of a transfer, so it takes no server's word for
+    it and has no HTTP fallback: if the registry cannot be read, or the name is not
+    claimed, it raises and nothing is deposited. A permit server that could answer here
+    could silently redirect every payment addressed by name.
+    """
     import base58
     from solders.pubkey import Pubkey
 
-    r = recipient.strip()
+    r = (recipient or "").strip()
     try:
         if len(base58.b58decode(r)) == 32:
             return Pubkey.from_string(r), None  # raw wallet; not messageable by itself
     except Exception:
         pass
-    name = r.lstrip("%")
-    resp = requests.get(_permit_url("/alias/resolve"), params={"name": name}, timeout=15).json()
-    owner = resp.get("alias_owner")
+    name = alias_chain.normalize_name(r)
+    owner = alias_chain.resolve_owner(name)     # raises AliasChainError if it cannot be read
     if not owner:
-        raise RuntimeError(f"could not resolve recipient '{recipient}' to a wallet (no %{name} owner on-chain)")
+        raise RuntimeError(
+            f"could not resolve recipient '{recipient}': %{name} is not claimed in the on-chain "
+            f"alias registry ({alias_chain.AXTREG}). Nothing was deposited.")
     return Pubkey.from_string(owner), f"%{name}"
 
 
