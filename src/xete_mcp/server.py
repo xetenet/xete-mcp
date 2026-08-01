@@ -34,6 +34,11 @@ identify. Full reasoning in src/xete_mcp/txguard.py and src/xete_mcp/signguard.p
   XETE_ALIAS_TX_TOLERANCE_LAMPORTS  how far above the quoted price the claim transaction
                                     may debit, covering rent + fees a quote excludes
                                                                      (default 5000000)
+  XETE_ALIAS_TREASURY               the only account a claim's price may be paid into
+                                    (defaults to the live xete treasury)
+  XETE_ALIAS_REQUIRE_SIMULATION     0 to let a claim proceed when the RPC could not
+                                    simulate it; the full ceiling is then charged
+                                    against the spend limits    (default 1, fail closed)
 """
 from __future__ import annotations
 
@@ -265,10 +270,13 @@ def xete_alias_claim(name: str) -> str:
     registered (claiming binds the name to your agent).
 
     The permit server's transaction is DECODED and allow-listed before your key touches it:
-    every instruction must be the alias registry, the compute budget, or a bounded System
-    transfer, the name's account must be the one you asked for, durable-nonce constructions
-    are refused, and the lamports it can take from you are bounded by the quote plus rent.
-    Anything else is refused unsigned, and the result reports what was verified."""
+    the registry instruction must be the CLAIM operation, must name the name you asked for in
+    its own data, must carry a price equal to the quote, and must put your wallet, the name's
+    account and the xete treasury in the positions a claim puts them in. Top-level System
+    instructions and durable-nonce constructions are refused outright. The network is then
+    asked what the transaction really moves, and a claim that cannot be simulated is refused
+    rather than signed. Anything else is refused unsigned, and the result reports what was
+    verified."""
     # Load the identity directly: claim depends on the permit server + its relay DB, NOT on the
     # messaging relay being reachable — so don't force a messaging-server login here.
     ident = load_or_create_identity(IDENTITY_PATH)
@@ -323,35 +331,26 @@ def xete_alias_claim(name: str) -> str:
         )
 
         # ── AND ASK THE NETWORK WHAT IT ACTUALLY MOVES ──────────────────────────────
-        # Static decoding cannot see lamports moved by a cross-program invocation (the
-        # claim funds its own PDA rent exactly that way). Simulation can. A simulated
-        # debit over the ceiling, or a transaction the network says fails, is a hard
-        # refusal; an unreachable RPC is not evidence of an attack, so that degrades to
-        # the static bound and says so in the result.
-        simulated = None
-        simulation_note = None
-        try:
-            simulated = txguard_mod.simulated_debit(RPC_URL, tx_b64, Pubkey.from_string(pubkey))
-            txguard_mod.check_debit_within(simulated, 0, inspection.ceiling_lamports,
-                                       who=f"{pubkey} (alias claim %{name})")
-        except txguard_mod.TransactionRejected:
-            raise
-        except Exception as e:
-            simulation_note = (f"could not simulate before signing ({str(e)[:120]}); the static "
-                               "instruction allow-list and the spend limits still applied")
+        # Static decoding cannot see the PDA rent, which the registry funds by CPI.
+        # Simulation can, and it is MANDATORY here by default: an RPC that 429s is not
+        # evidence a transaction is safe. Fails closed, or (only if the operator turned
+        # the requirement off) returns a note and charges the full ceiling below.
+        simulated, simulation_note = txguard_mod.bounded_simulated_debit(
+            RPC_URL, tx_b64, Pubkey.from_string(pubkey), inspection,
+            who=f"{pubkey} (alias claim %{name})")
 
-        # SPEND GATE — still before our signature exists, and now fed the largest figure
-        # anyone can justify rather than only the server's own quote: the declared price,
-        # what the instructions visibly debit, and what simulation says actually leaves
-        # the wallet. See reviews/DDR-spend-caps-20260731.md, D2 — this is the part of D2
-        # that the transaction guard closes.
+        # SPEND GATE — still before our signature exists, and fed the largest figure
+        # anyone can justify: the declared price, the price the instruction data itself
+        # carries, and what simulation says actually leaves the wallet — or the whole
+        # ceiling when simulation did not run. See reviews/DDR-spend-caps-20260731.md, D2.
         from .spendguard import authorize as _authorize_spend
 
-        charged = max(quoted, inspection.static_debit_lamports, simulated or 0)
+        charged = txguard_mod.spend_charge(quoted, inspection, simulated)
         _authorize_spend(charged, "xete_alias_claim",
                          detail=f"name=%{name} quoted={quoted} observed={simulated}")
 
-        tx.partial_sign([claimer], tx.message.recent_blockhash)
+        # Signs the exact message that was inspected, and refuses any other.
+        txguard_mod.approve_and_sign(tx, inspection, claimer)
         rpc = Client(RPC_URL)
         onchain = rpc.send_raw_transaction(bytes(tx)).value
         # wait for settlement, then ask the permit server to verify the on-chain owner

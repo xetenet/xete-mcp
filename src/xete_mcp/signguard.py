@@ -61,12 +61,21 @@ _ALLOWED_BYTES = frozenset(range(0x20, 0x7F)) | {0x0A}
 # structure into the signed bytes.
 _NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
-# Clock skew allowed on a challenge timestamp. The relay expires challenges at 300s;
-# these are wider so a mildly wrong client clock does not lock the user out, while
-# still refusing a "challenge" pinned to a fixed moment (which is what a replayed or
-# hand-crafted oracle payload looks like).
+# Clock skew allowed on a challenge timestamp, in BOTH directions. The relay expires
+# challenges at 300s against its own clock; this window is wider, and symmetric,
+# because it is measured against the CLIENT's clock and the client's clock is not a
+# security input. An asymmetric window (900s past, 300s future) meant a laptop resumed
+# from sleep with a clock five minutes SLOW saw every relay timestamp as "in the
+# future" and failed every login — a new hard failure on the already-published login
+# path, where none of the four shipped tools works without login().
+#
+# Widening the future side costs nothing: a timestamp in the future cannot be a replay
+# of a past challenge. What actually stops replay here is the nonce, which must match
+# the nonce the server returned in a separate field, plus the relay's own 300s expiry
+# against its own clock. This bound exists only to refuse a "challenge" pinned to a
+# fixed moment, which is what a hand-crafted oracle payload looks like.
 MAX_CHALLENGE_AGE_SECONDS = 900
-MAX_CHALLENGE_FUTURE_SECONDS = 300
+MAX_CHALLENGE_FUTURE_SECONDS = 900
 
 
 class RefusedToSign(RuntimeError):
@@ -180,16 +189,23 @@ def _check_timestamp(raw: str, *, where: str, now: float | None = None) -> int:
             "Nothing was signed."
         )
     ts = int(raw)
+    skew_hint = (
+        f"This is measured against THIS MACHINE's clock, which currently reads "
+        f"{int(now)} — if the two disagree by more than the allowed window the cause "
+        "is usually a wrong local clock (a resumed laptop, a container with no NTP), "
+        "not an attack. Check the system time before assuming the server is at fault."
+    )
     if ts < now - MAX_CHALLENGE_AGE_SECONDS:
         raise RefusedToSign(
             f"REFUSED TO SIGN ({where}): the challenge is dated {ts}, which is more "
             f"than {MAX_CHALLENGE_AGE_SECONDS}s in the past. A stale challenge is a "
-            "replayed one. Nothing was signed."
+            f"replayed one. {skew_hint} Nothing was signed."
         )
     if ts > now + MAX_CHALLENGE_FUTURE_SECONDS:
         raise RefusedToSign(
             f"REFUSED TO SIGN ({where}): the challenge is dated {ts}, which is more "
-            f"than {MAX_CHALLENGE_FUTURE_SECONDS}s in the future. Nothing was signed."
+            f"than {MAX_CHALLENGE_FUTURE_SECONDS}s in the future. {skew_hint} "
+            "Nothing was signed."
         )
     return ts
 

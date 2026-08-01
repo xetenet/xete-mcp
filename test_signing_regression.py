@@ -315,3 +315,246 @@ def test_alias_claim_refuses_the_derivation_constant_as_a_challenge(alias_server
         got = base58.b58decode(body.get("signature", "") or "1")
         assert got != leak, "the permit server extracted the messaging-key signature"
     assert not sent, "nothing should be sent after refusing to sign"
+
+
+# ── the adversarial claims from the second review, driven end to end ─────────────────
+# Each of these was signed AND SUBMITTED through the real tool before this change.
+
+ALIAS_PROGRAM_ID = "AXTREGuYbpgcWFbZy124jcWDN2nd7mtmrCDsUojktZrd"
+XETE_TREASURY = "CmraiWB8rTfR4td7iC7TmvrjMGbJv1nqkvJsbz2MJaDq"
+
+
+def _solders():
+    from solders.hash import Hash
+    from solders.instruction import AccountMeta, Instruction
+    from solders.keypair import Keypair
+    from solders.message import Message
+    from solders.pubkey import Pubkey
+    from solders.transaction import Transaction
+    return Hash, AccountMeta, Instruction, Keypair, Message, Pubkey, Transaction
+
+
+def _claim_ix_data(name: str, price: int, *, disc: int = 2, record: bytes = bytes(32)) -> bytes:
+    """02 | u8 name_len | name | 32-byte record key | u64 price — the mainnet layout."""
+    raw = name.encode()
+    return bytes([disc, len(raw)]) + raw + record + struct.pack("<Q", price)
+
+
+def _mainnet_shaped_claim(pubkey: str, name: str = "mcptestname", *, price: int = 0,
+                          disc: int = 2, data: bytes = None, treasury: str = XETE_TREASURY,
+                          extra_ixs=(), accounts=None) -> str:
+    """A claim transaction with the exact shape the permit server serves today."""
+    Hash, AccountMeta, Instruction, Keypair, Message, Pubkey, Transaction = _solders()
+    program = Pubkey.from_string(ALIAS_PROGRAM_ID)
+    me = Pubkey.from_string(pubkey)
+    if accounts is None:
+        accounts = [
+            AccountMeta(me, True, True),
+            AccountMeta(me, True, True),
+            AccountMeta(Pubkey.find_program_address([b"alias", name.encode()], program)[0],
+                        False, True),
+            AccountMeta(Pubkey.find_program_address([b"config"], program)[0], False, False),
+            AccountMeta(Pubkey.from_string(treasury), False, True),
+            AccountMeta(Pubkey.from_string("11111111111111111111111111111111"), False, False),
+        ]
+    claim = Instruction(program_id=program,
+                        data=data if data is not None else _claim_ix_data(name, price, disc=disc),
+                        accounts=accounts)
+    msg = Message.new_with_blockhash([claim, *extra_ixs], me, Hash.default())
+    return base64.b64encode(bytes(Transaction.new_unsigned(msg))).decode()
+
+
+def _top_level_transfer(src: str, lamports: int):
+    Hash, AccountMeta, Instruction, Keypair, Message, Pubkey, Transaction = _solders()
+    return Instruction(
+        program_id=Pubkey.from_string("11111111111111111111111111111111"),
+        data=struct.pack("<I", 2) + struct.pack("<Q", lamports),
+        accounts=[AccountMeta(Pubkey.from_string(src), True, True),
+                  AccountMeta(Keypair().pubkey(), False, True)])
+
+
+def _run_claim(server, monkeypatch, tx_b64, *, price_lamports=0, name="mcptestname"):
+    from xete_mcp.client import load_or_create_identity
+
+    pubkey = load_or_create_identity(server.IDENTITY_PATH).pubkey_b58
+    _fake_permit(server, monkeypatch, tx_b64, pubkey, price_lamports=price_lamports)
+    return pubkey, json.loads(server.xete_alias_claim(name))
+
+
+def _assert_refused(result):
+    assert not _FakeRpcClient.submitted, "the transaction was signed and SUBMITTED on-chain"
+    assert result.get("status") == "refused", result
+    assert result.get("signed") is False and result.get("submitted") is False, result
+    return result["reason"]
+
+
+def test_claim_price_in_the_data_must_match_the_declared_price(alias_server, monkeypatch):
+    """Finding #9, end to end. Hostile permit server declares `price_lamports: 0` and
+    serves a correctly-shaped claim whose trailing u64 moves 3 SOL by CPI. Previously:
+    static debit 10,000, spendguard charged the 2,000,000 floor, status=claimed."""
+    server = alias_server
+    from xete_mcp.client import load_or_create_identity
+
+    pubkey = load_or_create_identity(server.IDENTITY_PATH).pubkey_b58
+    tx_b64 = _mainnet_shaped_claim(pubkey, price=3_000_000_000)
+    _, result = _run_claim(server, monkeypatch, tx_b64, price_lamports=0)
+    assert "3000000000" in _assert_refused(result)
+
+
+def test_claim_refuses_a_registry_operation_that_is_not_a_claim(alias_server, monkeypatch):
+    """Finding #10(a): discriminator 0x03 transfers a name away. It was accepted,
+    signed and submitted as 'the claim you asked for'."""
+    server = alias_server
+    from xete_mcp.client import load_or_create_identity
+
+    pubkey = load_or_create_identity(server.IDENTITY_PATH).pubkey_b58
+    tx_b64 = _mainnet_shaped_claim(pubkey, disc=3)
+    _, result = _run_claim(server, monkeypatch, tx_b64)
+    assert "operation 0x03" in _assert_refused(result)
+
+
+def test_claim_refuses_an_opaque_registry_blob(alias_server, monkeypatch):
+    """Finding #10(b): discriminator 0xFF with 399 bytes of payload and an attacker
+    account attached — accepted, signed, submitted."""
+    server = alias_server
+    from xete_mcp.client import load_or_create_identity
+
+    pubkey = load_or_create_identity(server.IDENTITY_PATH).pubkey_b58
+    _, AccountMeta, _, Keypair, _, Pubkey, _ = _solders()
+    program = Pubkey.from_string(ALIAS_PROGRAM_ID)
+    me = Pubkey.from_string(pubkey)
+    accounts = [
+        AccountMeta(me, True, True),
+        AccountMeta(Pubkey.find_program_address([b"alias", b"mcptestname"], program)[0],
+                    False, True),
+        AccountMeta(Keypair().pubkey(), False, True),
+    ]
+    tx_b64 = _mainnet_shaped_claim(pubkey, data=bytes([0xFF]) + bytes(range(256))[:398],
+                                   accounts=accounts)
+    _, result = _run_claim(server, monkeypatch, tx_b64)
+    assert "operation 0xff" in _assert_refused(result)
+
+
+def test_claim_refuses_a_top_level_transfer_the_quote_pays_for(alias_server, monkeypatch):
+    """Finding #11: price_lamports 8,000,000 declared, plus a top-level System transfer
+    of 8,000,000 to an attacker. spendguard saw 8,010,000 < its 10,000,000 cap and the
+    tool signed and submitted."""
+    server = alias_server
+    from xete_mcp.client import load_or_create_identity
+
+    pubkey = load_or_create_identity(server.IDENTITY_PATH).pubkey_b58
+    tx_b64 = _mainnet_shaped_claim(pubkey, price=8_000_000,
+                                   extra_ixs=[_top_level_transfer(pubkey, 8_000_000)])
+    _, result = _run_claim(server, monkeypatch, tx_b64, price_lamports=8_000_000)
+    assert "NO top-level System instruction" in _assert_refused(result)
+
+
+def test_claim_refuses_a_transfer_that_hides_inside_the_tolerance(alias_server, monkeypatch):
+    """Finding #11, the quiet version: quoted 0, and 4,985,000 lamports to an arbitrary
+    address rides through inside the 5,000,000 default tolerance."""
+    server = alias_server
+    from xete_mcp.client import load_or_create_identity
+
+    pubkey = load_or_create_identity(server.IDENTITY_PATH).pubkey_b58
+    tx_b64 = _mainnet_shaped_claim(pubkey, extra_ixs=[_top_level_transfer(pubkey, 4_985_000)])
+    _, result = _run_claim(server, monkeypatch, tx_b64)
+    assert "NO top-level System instruction" in _assert_refused(result)
+
+
+def test_claim_refuses_to_pay_a_treasury_that_is_not_xetes(alias_server, monkeypatch):
+    """Finding #11: the price moves by CPI to whatever account the instruction names."""
+    server = alias_server
+    from xete_mcp.client import load_or_create_identity
+
+    _, _, _, Keypair, _, _, _ = _solders()
+    pubkey = load_or_create_identity(server.IDENTITY_PATH).pubkey_b58
+    # 8,000,000 sits under spendguard's 10,000,000 default per-transaction cap, so the
+    # spend gate does NOT stop this one — the destination check is the only thing that does.
+    tx_b64 = _mainnet_shaped_claim(pubkey, price=8_000_000, treasury=str(Keypair().pubkey()))
+    _, result = _run_claim(server, monkeypatch, tx_b64, price_lamports=8_000_000)
+    assert "would pay" in _assert_refused(result)
+
+
+def test_claim_refuses_when_the_rpc_cannot_simulate(alias_server, monkeypatch):
+    """Finding #9: simulation is the only view of CPI-moved lamports, and any RPC error
+    used to be swallowed into a `simulation_note` while the claim went through. The
+    fixture points XETE_RPC_URL at an unreachable host, so this is that path exactly."""
+    server = alias_server
+    from xete_mcp.client import load_or_create_identity
+
+    pubkey = load_or_create_identity(server.IDENTITY_PATH).pubkey_b58
+    _, result = _run_claim(server, monkeypatch, _mainnet_shaped_claim(pubkey))
+    assert "could not be simulated" in _assert_refused(result)
+
+
+class _AcceptingRpcClient:
+    """Records the submission instead of failing it, for the one test that must show a
+    LEGITIMATE claim still completes."""
+    submitted: list = []
+
+    def __init__(self, *_a, **_kw):
+        pass
+
+    def send_raw_transaction(self, raw, *a, **kw):
+        _AcceptingRpcClient.submitted.append(raw)
+
+        class _R:
+            value = "5ig"
+        return _R()
+
+    def get_signature_statuses(self, *_a, **_kw):
+        class _S:
+            confirmation_status = "confirmed"
+
+        class _R:
+            value = [_S()]
+        return _R()
+
+
+def test_a_legitimate_claim_still_completes(alias_server, monkeypatch):
+    """Finding #13: there was no end-to-end test that an honest claim survives the
+    guard, so every 'compatibility' claim rested on a script that is not in the repo.
+    This one is: mainnet-shaped transaction, honest price, simulation answering with
+    price + rent + fee."""
+    import solana.rpc.api
+
+    server = alias_server
+    from xete_mcp.client import load_or_create_identity
+
+    _AcceptingRpcClient.submitted = []
+    monkeypatch.setattr(solana.rpc.api, "Client", _AcceptingRpcClient)
+    monkeypatch.setattr(server.txguard_mod, "simulated_debit",
+                        lambda *_a, **_k: 50_000_000 + 1_628_640 + 10_000)
+    monkeypatch.setenv("XETE_SPEND_MAX_LAMPORTS", "100000000")
+    monkeypatch.setenv("XETE_SPEND_WINDOW_LAMPORTS", "100000000")
+
+    pubkey = load_or_create_identity(server.IDENTITY_PATH).pubkey_b58
+    tx_b64 = _mainnet_shaped_claim(pubkey, price=50_000_000)
+    _, result = _run_claim(server, monkeypatch, tx_b64, price_lamports=50_000_000)
+
+    assert result["status"] == "claimed", result
+    assert _AcceptingRpcClient.submitted, "an honest claim was not submitted"
+    verified = result["verified_before_signing"]
+    assert verified["claim_price_lamports"] == 50_000_000
+    assert verified["claim_name"] == "mcptestname"
+    assert verified["treasury"] == XETE_TREASURY and verified["treasury_pinned"] is True
+    assert result["simulated_debit_lamports"] == 51_638_640
+
+
+def test_the_permit_server_and_the_relay_are_the_same_party_by_default(tmp_path, monkeypatch):
+    """Finding #14, recorded as a test so it cannot drift silently: XETE_PERMIT_URL
+    defaults to XETE_SERVER_URL, so 'hostile relay' and 'hostile permit server' are ONE
+    adversary in the default configuration. Every threat model for this tool has to be
+    read with that substitution, and txguard's docstring says so."""
+    import importlib
+
+    monkeypatch.delenv("XETE_PERMIT_URL", raising=False)
+    monkeypatch.setenv("XETE_SERVER_URL", "https://relay.example")
+    monkeypatch.setenv("XETE_IDENTITY", str(tmp_path / "identity.json"))
+
+    import xete_mcp.server as server
+    server = importlib.reload(server)
+    assert server.PERMIT_URL == server.SERVER_URL == "https://relay.example"
+
+    from xete_mcp import txguard
+    assert "THE SAME" in txguard.__doc__ and "XETE_PERMIT_URL" in txguard.__doc__
