@@ -43,6 +43,10 @@ ESCROW_ID_HEX_LEN = ESCROW_ID_BYTES * 2
 MAX_SALT_BYTES = 64
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
+# depositor[0:32] amount[32:40] commitment[40:72] unlock[72:80] bump[80]. An account at the
+# escrow PDA that is not EXACTLY this long is not this program's state, whatever else it is.
+STATE_LEN = 81
+
 # How long to keep asking the cluster about a submitted transaction. RPC nodes rebroadcast a
 # transaction for roughly 60-90s (until its blockhash dies); a client that gives up sooner is
 # not observing a failure, it is looking away while the transaction is still alive.
@@ -167,9 +171,19 @@ def _send(client: Client, signers, ixs, payer: Keypair, label: str,
     tx = Transaction(signers, Message.new_with_blockhash([_cb_limit(60_000), _cb_price(1_000)] + ixs, payer.pubkey(), bh), bh)
     sig = client.send_transaction(tx, opts=TxOpts(skip_preflight=False, preflight_commitment=Confirmed)).value
     budget = confirm_seconds()
+
+    # A WALL CLOCK, not a poll count. The previous shape was
+    #     for i in range(int(budget / _POLL_SECONDS)): sleep(_POLL_SECONDS); <rpc round trip>
+    # which spends `budget` seconds sleeping PLUS one RPC round trip per iteration — and the
+    # round trip is timed by the RPC, which is the untrusted party here. At the 90s default that
+    # is 300 iterations; against a 0.5s RPC it blocks the agent's stdio session for 240s, and
+    # claim/reclaim inherit it. `budget` must be the total time this function can take, so the
+    # deadline is fixed once, up front, and the RPC's latency is spent out of it rather than
+    # added to it. A slow RPC now costs polls, never extra seconds.
+    deadline = time.monotonic() + budget
     seen = False
-    for i in range(max(1, int(budget / _POLL_SECONDS))):
-        time.sleep(_POLL_SECONDS)
+    i = 0
+    while True:
         st = client.get_signature_statuses([sig]).value[0]
         if st is not None:
             if st.err:
@@ -187,6 +201,11 @@ def _send(client: Client, signers, ixs, payer: Keypair, label: str,
             raise SettlementSubmitError(
                 f"{label} was dropped: its blockhash expired before the cluster ever saw it",
                 signature=str(sig), outcome="dropped", ticket=ticket)
+        i += 1
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(_POLL_SECONDS, remaining))
     # Out of patience is NOT the same as failed, and saying "failed" here is what makes a
     # congestion spike destructive: the caller retries or discards state for a transaction that
     # then lands anyway. Report it as unknown and hand back the signature to resolve it with.
@@ -305,26 +324,58 @@ def status(rpc_url: str, escrow_id_hex: str, expect_commitment_hex: str | None =
     is indistinguishable from yours. Supply `expect_commitment_hex` (use `commitment(you, salt)`)
     and `beneficiary_verified` becomes a real True/False; leave it out and it stays None, meaning
     nothing has been verified.
+
+    `open` IS THE MACHINE-READABLE ANSWER and it is only ever True for an account that this
+    program owns and that is exactly the escrow layout. Two reasons that matters:
+
+      * Agents branch on `open`, not on the English in `verdict` — and the timeout guidance in
+        xete_settle_create names `open` as the "did my deposit land" signal. A field that says
+        True for anything sitting at the address is not that signal. Anyone can pay the rent
+        minimum to create a 0-data, system-owned account at a known PDA, and before this it read
+        back as an open escrow.
+      * The account is bytes from an RPC, and the RPC is the untrusted party. `owner` is what
+        makes the rest of the struct mean anything: without it, `commitment` — the whole value of
+        this function — is compared against 32 bytes a hostile or MITM'd endpoint chose. The
+        owner check is what turns "these bytes say so" into "the chain says so".
+
+    Both checks fail CLOSED: a response with no owner field at all is not an escrow either.
     """
     eid = parse_escrow_id(escrow_id_hex)
+    # Echo the canonical form, never the caller's raw string. parse_escrow_id tolerates
+    # surrounding space and upper case, so echoing the input back hands a caller who is string
+    # comparing this field against their ticket a spurious mismatch.
+    escrow_id_norm = eid.hex()
     client = Client(rpc_url)
     prog = program_id()
     pda = escrow_pda(prog, eid)
     info = client.get_account_info(pda, commitment=Confirmed).value
     if info is None:
-        return {"escrow_id": escrow_id_hex, "pda": str(pda), "open": False,
+        return {"escrow_id": escrow_id_norm, "pda": str(pda), "open": False, "is_escrow": False,
                 "beneficiary_verified": None, "note": "settled or never opened"}
     data = bytes(info.data)
-    out = {"escrow_id": escrow_id_hex, "pda": str(pda), "open": True, "lamports": info.lamports,
-           "beneficiary_verified": None}
-    if len(data) >= 40:
-        out["depositor"] = str(Pubkey.from_bytes(data[0:32]))
-        out["amount_lamports"] = struct.unpack("<Q", data[32:40])[0]
-    if len(data) < 72:
-        out["commitment"] = None
-        out["verdict"] = (f"UNKNOWN ACCOUNT — {len(data)} bytes at this address, which is not a "
-                          "settlement escrow (81 expected). Treat it as unrelated, not as yours.")
+    owner = getattr(info, "owner", None)
+    out = {"escrow_id": escrow_id_norm, "pda": str(pda), "open": False, "is_escrow": False,
+           "lamports": info.lamports, "account_owner": None if owner is None else str(owner),
+           "beneficiary_verified": None, "commitment": None}
+
+    if owner is None or str(owner) != str(prog):
+        out["verdict"] = (
+            f"NOT AN ESCROW — the account at {pda} is owned by "
+            f"{'no program the RPC would name' if owner is None else str(owner)}, not the "
+            f"settlement program {prog}. Its contents are NOT this program's state, so no "
+            "depositor, amount or commitment is read out of them. Anyone can put an account at a "
+            "known address; only the program can put escrow state in one.")
         return out
+    if len(data) != STATE_LEN:
+        out["verdict"] = (f"UNKNOWN ACCOUNT — {len(data)} bytes at this address, which is not a "
+                          f"settlement escrow ({STATE_LEN} expected). Treat it as unrelated, not "
+                          "as yours.")
+        return out
+
+    out["open"] = True
+    out["is_escrow"] = True
+    out["depositor"] = str(Pubkey.from_bytes(data[0:32]))
+    out["amount_lamports"] = struct.unpack("<Q", data[32:40])[0]
     out["commitment"] = data[40:72].hex()
     if expect_commitment_hex is None:
         out["verdict"] = UNVERIFIED_NOTE
