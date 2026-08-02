@@ -60,6 +60,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 
 from solders.pubkey import Pubkey
 
@@ -323,13 +324,27 @@ def normalize_name(name: str) -> str:
     bare = name.strip().lstrip("%").strip().lower()
     if not bare:
         raise InvalidAliasName("an empty string is not a %name.")
-    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in bare):
+    # Cf (FORMAT) IS IN THIS LIST BECAUSE IT SATISFIES NONE OF THE OTHER THREE. Zero-width
+    # space, RTL override, word joiner and soft hyphen are not whitespace, are not below
+    # 0x20, and are not 0x7F — so they passed, and `bare` is then interpolated RAW as
+    # `%{bare}` into three AliasChainError messages whose docstring promises "this client's
+    # own words, end to end". `%al<ZWSP>ice` renders as `%alice` in the sentence the agent
+    # is told to trust, so an operator reading a failure cannot tell which name actually
+    # failed; U+202E reverses the rendering of the rest of the line in a terminal.
+    #
+    # Refused HERE rather than sanitised at the three interpolations, so the next site that
+    # interpolates `bare` inherits the guarantee instead of having to remember. Nothing
+    # legitimate is lost: `canonical_name` already enforces [a-z0-9_], so a name containing
+    # an invisible character is not one this registry could ever hold.
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F
+           or unicodedata.category(ch) == "Cf" for ch in bare):
         # `name` can be a string an untrusted server proposed, and this message is read
         # by an agent. Echo it flattened and short — enough to identify the input,
-        # not enough to be a paragraph of instructions with newlines in it.
+        # not enough to be a paragraph of instructions with newlines in it. sanitize_text
+        # drops Cf, so the refusal cannot echo the character it is refusing.
         raise InvalidAliasName(
-            f"{sanitize_text(name, 48)!r} contains whitespace or control characters, which no "
-            "%name can.")
+            f"{sanitize_text(name, 48)!r} contains whitespace, control or invisible "
+            "formatting characters, which no %name can.")
     encoded = bare.encode("utf-8")
     if len(encoded) > MAX_NAME_BYTES:
         # `bare` on THIS branch is by definition longer than the 32-byte field, and nothing

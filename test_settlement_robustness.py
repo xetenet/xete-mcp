@@ -1392,6 +1392,21 @@ def test_listing_the_same_endpoint_twice_does_not_manufacture_agreement(chain, d
 
 # ── [15] round 2, tail: confusable Unicode reached the money path ─────────────────────
 
+# Two DIFFERENT classes of confusable arrive here, and after the Cf fix they are refused by
+# two different guards with two different (correct) messages. Asserting one string for both
+# would either weaken the test to "some error happened" or pin the wrong reason to half the
+# inputs, so the expectation is derived from the input's own class.
+#
+#   Cf (zero-width space, RTL override) -> normalize_name, "invisible formatting characters"
+#   non-ASCII homoglyphs (Cyrillic o, je) -> _reject_confusable_name, "ASCII"
+#
+# Refusing Cf inside normalize_name is what makes AliasChainError's "this client's own
+# words, end to end" true; before it, `bare` carried the character into three messages.
+def _expected_refusal(name: str) -> str:
+    import unicodedata
+    return ("formatting" if any(unicodedata.category(c) == "Cf" for c in name) else "ASCII")
+
+
 @pytest.mark.parametrize("name", [
     "%jo​hn",          # zero-width space
     "%jоhn",           # Cyrillic o
@@ -1407,7 +1422,8 @@ def test_a_confusable_name_is_refused_on_the_money_path(chain, drafting, name):
     chain["john"] = str(RECIPIENT.pubkey())
     out = json.loads(drafting.xete_draft_settlement_tx(name, 1.0))
     assert out["status"] == "failed"
-    assert "ASCII" in out["error"]
+    assert _expected_refusal(name) in out["error"], (
+        f"refused, but not for the reason that applies to {name!r}: {out['error']!r}")
     assert not chain.calls, "a confusable name must be refused before any lookup"
 
 
@@ -2822,7 +2838,8 @@ def test_a_confusable_name_is_refused_on_the_verify_path_too(chain, drafting, na
     chain["john"] = str(RECIPIENT.pubkey())
     v = json.loads(drafting.xete_verify_settlement_tx(_honest(), name, SALT.hex(), 1.0))
     assert v["verified"] is False
-    assert "ASCII" in json.dumps(v), "the endpoint-count refusal masked the real reason"
+    assert _expected_refusal(name) in json.dumps(v), (
+        "the endpoint-count refusal masked the real reason")
     assert not chain.calls, "a confusable name must be refused before any lookup"
 
 
