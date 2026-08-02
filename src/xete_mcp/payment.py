@@ -55,6 +55,36 @@ class PaymentFailedOnChain(PaymentNotSettled):
     """Confirmed, and the transaction errored. It definitively did not pay."""
 
 
+# The two spellings a Solana node uses to say "I already have this transaction". The prose
+# form is the JSON-RPC error message; the enum form is what solders stringifies. Neither is
+# a substring of the other, which is why both are matched rather than one being assumed to
+# cover the other.
+_ALREADY_PROCESSED = ("already been processed", "alreadyprocessed")
+
+
+def says_already_processed(text) -> bool:
+    """Is this endpoint refusing BECAUSE IT ALREADY HAS THE TRANSACTION?
+
+    THE ONE REFUSAL THAT IS EVIDENCE OF SUCCESS. With `skip_preflight=False` a node
+    simulates before forwarding, so a refusal is ordinarily deterministic and final — a
+    wrong salt, an escrow already claimed, not enough lamports — and reporting it as
+    `failed` is both correct and the useful thing to say, because it tells the caller to fix
+    the cause rather than retry.
+
+    `AlreadyProcessed` inverts that. The node is declining precisely because the signature
+    is already on the cluster. Folding it into the same `failed` verdict tells a caller that
+    nothing moved about a transaction that DID land, on a path where the obvious next move
+    is to do it again — which on the settlement path means a second escrow deposit and on
+    the payment path means paying twice.
+
+    Lives in this module because `settlement` imports from `payment` and not the reverse;
+    one definition, because the last defect here was a parallel implementation inheriting a
+    design AND its bug by being copied.
+    """
+    low = str(text).lower()
+    return any(marker in low for marker in _ALREADY_PROCESSED)
+
+
 def _derive_pda(nonce: str) -> tuple[Pubkey, int]:
     d = hashlib.sha256(nonce.encode()).digest()
     return Pubkey.find_program_address([b"payment", d[:16]], PROGRAM_ID)
@@ -211,6 +241,16 @@ def pay_herd(rpc_url: str, payer: Keypair, payment_nonce: str, blob_count: int,
         returned = client.send_transaction(
             tx, opts=TxOpts(skip_preflight=False, preflight_commitment=Confirmed)).value
     except RPCException as e:
+        if says_already_processed(e):
+            # THE NODE ALREADY HAS IT. This refusal is evidence the payment LANDED, and
+            # "nothing was paid" would be a false statement to a caller whose obvious next
+            # move is to pay again.
+            raise PaymentUnconfirmed(
+                f"the payment was already processed: signature {sig_local}. The endpoint "
+                f"refused to forward it BECAUSE IT ALREADY HAS THIS TRANSACTION, which "
+                f"means it landed rather than failed. DO NOT PAY AGAIN — check this "
+                f"signature on chain to see whether it succeeded. Endpoint said: "
+                f"{type(e).__name__}: {str(e)[:160]}", signature=str(sig_local)) from e
         # The node simulated it (skip_preflight=False) and declined to forward it. Nothing
         # moved. Reported as the failure it is — but WITH the signature, because an
         # endpoint lying about not having forwarded it looks exactly like this from here.

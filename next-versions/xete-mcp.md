@@ -72,3 +72,43 @@ Fix is a webroot file copy on the production box, no rebuild and no service rest
 login page whose crypto library did not load at all. Fix was the page plus the versioned
 filename (the unversioned name is kept — `setup.html` and `pwa-install.html` reference it).
 Backup: `/root/webroot-backups/xete-login.html.20260801-171156`.
+
+## Deferred from the 2026-08-01 publish sprint
+
+Four items reviewed, classified, and deliberately NOT fixed before 0.1.5. Each is written
+down with why it is safe to defer, so the next person inherits the reasoning and not just
+the item.
+
+### One endpoint still licenses a `failed` verdict for an ordinary rejection
+
+`settlement._send` and `payment.pay_herd` report `outcome="failed"` on a single endpoint's
+preflight refusal. The self-contradicting case (`AlreadyProcessed` — the endpoint refusing
+because it ALREADY HAS the transaction) is fixed; the general case is not.
+
+Why deferred: routing every refusal through a second endpoint doubles RPC cost on the
+submit path and turns ordinary node lag into a hard failure. The identical trade was tried
+on the alias-read path and reverted — it broke 15 tests for exactly that reason
+(`DDR-alias-freshness-20260801`, "Open, unchanged and deliberate"). Doing it properly means
+corroborating only the refusal, not every submit, and that needs its own design.
+
+### The permit server's raw status on the DURABLE claim path
+
+`server.py` writes the permit server's status verbatim on the durable branch, unbounded and
+unsanitised, while the adjacent `settled` key sanitises the same value through
+`sanitize_text(..., 40)`. Cannot forge ownership — durable chain evidence is required
+independently — so it is untrusted prose in a field, not an authorisation defect.
+
+### `blockhash_is_live` is never passed at its only call site
+
+`txguard.py`'s staleness check is dead code, and the test that covers it passes the argument
+explicitly, so the test is green about a path production never takes. Durable-nonce
+staleness is closed twice elsewhere, so the floor is zero. Delete the dead code or wire it —
+do not leave a green test standing over an unreachable branch.
+
+### `05cf0cf` narrowed one half of the spendguard seam scan
+
+The merge replaced `ast.walk(func)` with body-only scanning, so decorator expressions,
+argument defaults, kw_defaults and return annotations are scanned by NO scope — and those
+evaluate at IMPORT time, which is the exact scope class the merge existed to cover. A
+widened rescan of real `src/` finds the identical 17 sites, so nothing is missed today. It
+is a detection gap, not a live hole.

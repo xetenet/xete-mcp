@@ -43,7 +43,7 @@ from solana.rpc.types import TxOpts
 # the MCP transcript and the host's logs, on every call. That is the precise defect
 # redact_url's own docstring says the alias path was hardened against; the fix never reached
 # here.
-from .payment import _release_recorded_spend
+from .payment import _release_recorded_spend, says_already_processed
 from .safehttp import endpoint_identity, redact_url
 
 try:                                     # the JSON-RPC error type, as distinct from transport
@@ -278,6 +278,18 @@ def _send(client: Client, signers, ixs, payer: Keypair, label: str,
     except SettlementSubmitError:
         raise
     except RPCException as e:
+        if says_already_processed(e):
+            # THE NODE ALREADY HAS IT — the one refusal that is evidence of SUCCESS. The
+            # branch below calls this "failed", which the tools surface as
+            # `"status": "failed"` and an agent reads as "nothing moved, safe to retry".
+            # On this path a retry is a SECOND ESCROW DEPOSIT of real lamports.
+            raise SettlementSubmitError(
+                f"{label} was ALREADY PROCESSED: signature {sig_local}. The endpoint "
+                f"refused to forward it BECAUSE IT ALREADY HAS THIS TRANSACTION — so it "
+                f"landed rather than failed, and this is NOT a clean failure you can "
+                f"retry. DO NOT RESUBMIT: check this signature on chain first. Endpoint "
+                f"said: {type(e).__name__}: {str(e)[:160]}",
+                signature=sig_local, outcome="unconfirmed", ticket=ticket) from e
         # THE ENDPOINT ANSWERED, and its answer is a refusal. With skip_preflight=False the node
         # simulates the transaction and declines to forward what fails, so this is the ordinary
         # deterministic rejection — a wrong salt, an escrow already claimed, not enough lamports
