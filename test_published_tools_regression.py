@@ -621,12 +621,31 @@ def test_a_release_cannot_take_a_concurrent_calls_entry(paying):
 
 
 def test_a_submitted_transaction_that_errors_still_counts(paying):
-    """The other direction: once it is on the wire it may have landed, so it is charged."""
+    """The other direction: once it is on the wire it may have landed, so it is charged.
+
+    THE EXPECTED EXCEPTION TYPE CHANGED HERE AND THE PROPERTY DID NOT. This asserted a
+    bare `TimeoutError` escaping `pay_herd`, which was the defect it was sitting next to:
+    the raw transport error carried NO signature, so a caller who caught it could not tell
+    whether they had paid, and `send_multi` mints a fresh nonce per call — the obvious
+    retry pays twice. `TimeoutError` is now wrapped into `PaymentUnconfirmed`, which
+    carries the signature computed before submission.
+
+    Recorded explicitly because "changed a test so my fix passes" is the move a reviewer
+    flagged in another lane today: the original property — the spend is NOT released once
+    the transaction may be live — is asserted below exactly as it was, and the assertions
+    added around it are strictly stronger than what they replace. Nothing here got easier.
+    """
     FakeRpc.send_error = TimeoutError("read timeout waiting for the RPC's answer")
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(payment.PaymentUnconfirmed) as ei:
         payment.pay_herd("https://rpc.invalid", paying.payer, "nonce-5", 1)
 
+    assert ei.value.signature, "the signature must survive; it is the whole recovery path"
+    assert isinstance(ei.value.__cause__, TimeoutError), (
+        "the underlying transport error must stay reachable as __cause__ — wrapping it "
+        "must not throw away what actually went wrong")
+
+    # UNCHANGED, and the reason this test exists: submitted means charged.
     assert len(_entries(paying.ledger)) == 1
     assert len(FakeRpc.submitted) == 1
 

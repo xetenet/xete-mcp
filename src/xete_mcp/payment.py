@@ -23,6 +23,7 @@ from solders.transaction import Transaction
 from solana.rpc.api import Client
 from solana.rpc.commitment import Confirmed
 from solders.transaction_status import TransactionConfirmationStatus
+from solana.rpc.core import RPCException
 from solana.rpc.types import TxOpts
 
 PROGRAM_ID = Pubkey.from_string("GLdM82RspCLDFmAUqty2Ef8GBGursZVgMD9cqeNHDq2U")
@@ -194,7 +195,61 @@ def pay_herd(rpc_url: str, payer: Keypair, payment_nonce: str, blob_count: int,
     # The signature is taken from the transaction we built, not from the endpoint's reply,
     # so a submit that raises after the write still leaves us able to name what may be live.
     sig_local = tx.signatures[0]
-    sig = client.send_transaction(tx, opts=TxOpts(skip_preflight=False, preflight_commitment=Confirmed)).value
+
+    # THE SPLIT IS TWO-BRANCH, NOT A BLANKET WRAP, and that is deliberate.
+    # `DDR-settlement-submit-receipt-20260801` D2 records a reviewer's blanket
+    # `except Exception` here as an over-correction: it turned every deterministic
+    # rejection into "MAY BE LIVE", which tells an agent not to retry the very thing it
+    # should fix. An endpoint that ANSWERED with a refusal and an endpoint that never
+    # answered are different facts and get different reports.
+    #
+    # NOTE ON MESSAGE ORDER, both branches: OUR signature leads. The tools truncate
+    # `str(e)` at 300-400 characters and the endpoint chooses its own text, so a message
+    # that ends with "check signature X" can lose X while attacker-supplied
+    # signature-shaped text survives at the front.
+    try:
+        returned = client.send_transaction(
+            tx, opts=TxOpts(skip_preflight=False, preflight_commitment=Confirmed)).value
+    except RPCException as e:
+        # The node simulated it (skip_preflight=False) and declined to forward it. Nothing
+        # moved. Reported as the failure it is — but WITH the signature, because an
+        # endpoint lying about not having forwarded it looks exactly like this from here.
+        raise PaymentNotSettled(
+            f"the payment was REJECTED at submit: signature {sig_local}. The endpoint "
+            f"simulated it and refused to forward it, so it did not execute and nothing "
+            f"was paid. Fix the cause and retry. (If you have reason to doubt that "
+            f"endpoint, check the signature on chain first — a node that refused a "
+            f"transaction it had already forwarded would look identical.) Endpoint said: "
+            f"{type(e).__name__}: {str(e)[:160]}", signature=str(sig_local)) from e
+    except Exception as e:                      # noqa: BLE001 — deliberate, see above
+        # NO ANSWER. An endpoint that forwarded the transaction and then dropped the
+        # socket on the reply is indistinguishable, from this client, from one that never
+        # forwarded it. The signature was computed locally two lines above for exactly
+        # this moment, and it used to die here — leaving the caller with a bare exception,
+        # no signature, and every incentive to retry. `send_multi` mints a fresh nonce per
+        # call, so that retry is NOT idempotent: it pays a second time.
+        raise PaymentUnconfirmed(
+            f"the payment MAY ALREADY BE LIVE: check signature {sig_local} on chain "
+            f"BEFORE retrying or discarding anything. The transaction is SIGNED and the "
+            f"submit call failed without an answer from the endpoint. This is NOT a "
+            f"confirmed failure, and a blind retry pays twice. Submit error was: "
+            f"{type(e).__name__}: {str(e)[:160]}", signature=str(sig_local)) from e
+
+    # THE ENDPOINT DOES NOT GET TO NAME OUR TRANSACTION. `settlement.py` refuses this and
+    # explains why; this module was the second instance, not the counter-example. If the
+    # returned string were adopted, the entire recovery story — "check signature X on
+    # chain" — would confirm a STRANGER'S transaction as ours, and the poll below would
+    # ask a possibly-hostile endpoint about a transaction it chose. Free check, so make
+    # it, and poll the local value regardless of what came back.
+    if str(returned) != str(sig_local):
+        raise PaymentUnconfirmed(
+            f"SIGNATURE MISMATCH: this client signed {sig_local}, and that is the only "
+            f"transaction to look for. The endpoint answered with a different signature, "
+            f"so nothing it says about either transaction can be trusted. The payment MAY "
+            f"BE LIVE — check ours against a different endpoint before retrying or "
+            f"discarding anything. It returned: {str(returned)[:96]}",
+            signature=str(sig_local))
+    sig = sig_local
 
     # This loop used to `break` on ANY confirmation_status and then `return str(sig)` when
     # it simply ran out — so a payment that never confirmed, or that CONFIRMED WITH AN
