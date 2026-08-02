@@ -1,8 +1,8 @@
 """On-chain PayHerd payment for the MCP server.
 
-Sending a message costs SOL (anti-spam). After /agent/send-multi returns an
-invoice, the sender pays the xete payment contract on-chain, then calls
-/agent/confirm-payment. This mirrors the proven concierge flow.
+When a relay answers /agent/send-multi with an invoice, this module pays the xete
+payment contract on-chain and then calls /agent/confirm-payment. Whether a relay
+issues an invoice at all is a property of that relay, not of this client.
 
 Money-critical constants are hardcoded here (not server-supplied): the program
 id and treasury cannot be redirected by a malicious server.

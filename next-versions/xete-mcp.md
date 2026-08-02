@@ -129,3 +129,30 @@ appears in a tool RESULT, never in a listing, a manifest, a README or a tool des
 Flagged for John rather than decided unilaterally. If the directive is meant to cover
 runtime diagnostics as well as published copy, this is the site, and the replacement needs
 to keep the remediation ("set XETE_SOL_KEYPAIR") intact.
+
+### CONFLICT FOR JOHN: spendguard.py's module docstring vs. the frozen-file rule
+
+`spendguard.py` line 9 reads:
+
+    The amount charged for a message is quoted by the server being paid, and the %alias
+    claim transaction is BUILT by the permit server.
+
+That asserts messaging has a price, which the copy directive forbids on any published
+surface, and the file ships in the wheel.
+
+It is ALSO under a standing freeze: byte-identical to `ee81682`, because it is the money
+gate and every edit demands deliberate re-verification. Editing a docstring does not change
+behaviour, but it does break the byte-identity invariant that several checks and DDRs
+assert, and "it was only a comment" is exactly how a frozen file stops being frozen.
+
+TWO STANDING RULES COLLIDE. Not resolved unilaterally in either direction. The options:
+
+  (a) Edit the docstring and re-baseline the freeze to a new SHA, updating every check and
+      DDR that cites `ee81682`. Cheap, but it spends the invariant.
+  (b) Leave it. Module docstrings do not reach an MCP tool picker; the exposure is
+      doc-ingesting directories reading the published artifact.
+  (c) Narrow the freeze to executable content rather than bytes — the largest change, and
+      the only one that removes the collision permanently instead of deferring it.
+
+`test_copy_compliance.py` excludes `spendguard.py` and names this file, so the exclusion is
+a visible pointer rather than a silent carve-out.
