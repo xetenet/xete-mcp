@@ -1,0 +1,63 @@
+name: Tests
+
+# NOTHING RAN THE TEST SUITE. Not this repo's four other workflows, not the pre-commit
+# hook, not the publish job. Every "N tests passing" figure this project has quoted came
+# from a human running an explicit list of files by hand, and the only thing standing
+# between a regression and PyPI was that human remembering to do it.
+#
+# It was found the way these things always are: a reviewer went to verify a README claim,
+# tried to run the suite from a clean checkout, and could not -- three root-level scripts
+# named `test_*.py` killed collection outright (see conftest.py). So the suite was both
+# unenforced AND unrunnable by anyone who had not learned the incantation.
+#
+# This job is the enforcement half. It runs the same bare `pytest` a contributor runs, so
+# the two cannot drift apart, and it runs on the publish path as well as on PRs -- a green
+# suite that is not checked before upload is a green suite that proves nothing about what
+# was uploaded.
+
+on:
+  pull_request:
+  push:
+    branches: [main, integration]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the package and its test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Installed the same way an operator installs it, so a packaging mistake that
+          # makes the published artifact unimportable fails HERE rather than after upload.
+          # That exact failure shipped once: 0.1.0 declared `mcp>=1.2.0` unbounded,
+          # resolved mcp 2.x, and every install exited 1 on ModuleNotFoundError.
+          pip install -e .
+          pip install pytest
+
+      - name: Run the suite
+        # A bare `pytest`, deliberately. Any narrowing here (-k, an explicit file list, a
+        # marker filter) recreates the exact gap this job exists to close: the tests that
+        # run in CI would stop being the tests that exist.
+        run: pytest -q
+
+      - name: Confirm the tool inventory the manifests advertise
+        # The registry record, README, llms.txt and server.json all state a tool count.
+        # An import-time failure or a lost decorator drops a tool silently -- the server
+        # still starts, and the listing is simply wrong for everyone who reads it.
+        run: |
+          python - <<'PY'
+          import asyncio
+          from xete_mcp.server import mcp
+          n = len(asyncio.run(mcp.list_tools()))
+          print(f"{n} tools registered at runtime")
+          assert n == 15, f"expected 15 tools, found {n}"
+          PY

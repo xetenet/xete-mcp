@@ -26,9 +26,78 @@ identity.json
 *.key
 *.pem
 
+# ops / coordination — LOCAL ONLY, never publish (echo internals, drafts,
+# the agent-to-agent transcript archive, the chat tool). The echo's *existence*
+# is public; its under-the-hood is not.
+echo_agent.py
+ECHO_AGENT_SECURITY_AUDIT.md
+TOOL_DESCRIPTION_PROPOSAL.md
+DIRECTORY_SUBMISSIONS_DRAFT.md
+xete_chat.py
+watch_inbox.py
+worker_watch.py
+manager_watch.py
+archive/
+
+# ops / coordination (cont.) — LOCAL ONLY agent tooling, drafts, logs, run docs.
+# Several contain keys/addresses/internal procedure; none belong in the public package.
+_msg_*
+_send_*
+_resend_*
+msg_*.py
+my_agent_*.py
+*_chat.py
+watch_*.py
+watch-*.out
+watch-*.err
+agentloop_demo.py
+mainnet_agent_loop.py
+devnet_faucet.py
+presigned_tx.py
+DEMO_CAPTURE.md
+MAINNET_GO.md
+TEAM_STARTUP_PROMPTS.md
+
 # OS / editor
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
 mcp-publisher.exe
+
+# secrets / PII hardening (audit finding mcp-keys, 2026-07-31)
+# The bare 'identity.json' rule above is an exact-basename match and missed
+# real key files whose names carry a host/user prefix before "-identity.json",
+# which sat untracked and UNIGNORED in this public repo's root. Broaden the net.
+*identity*.json
+*.xete*
+Usersjshed*
+infra_monitor.py
+*.pkl
+
+# Security: vulnerability-research corpus (BM-*.md documents live, unfixed
+# exploit paths). Master lives in the private xete-agent-skills repo. Never
+# track it here - this repo is public or pushes to a public remote.
+benchmarks/
+
+# --- xete estate secret hygiene (2026-07-31, gitignore-estate) ---
+# Globs, deliberately NOT exact basenames: two real ed25519 private keys sat
+# untracked-and-unignored in a public repo root because the rule was the exact
+# name "identity.json". Backstopped by .githooks/pre-push.
+*keypair*.json
+id_ed25519*
+id_rsa*
+.env.*
+*SEEDPHRASE*
+*CREDENTIALS*
+!.env.example
+!.env.sample
+!.env.template
+# --- end xete estate secret hygiene ---
+uv.lock
+
+# Internal orientation docs. s1/growth-distribution flagged this for stripping before
+# the package push; it reached the public `integration` branch before that handoff
+# arrived. Nothing secret is in it (it says so itself), but internal architecture and
+# agent-fleet notes do not belong in a public package repo.
+knowledge/

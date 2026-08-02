@@ -1,0 +1,192 @@
+#!/bin/sh
+# Xete pre-commit gate — enforces doubt-driven-review artifacts on protected paths.
+# Install into a repo with: git config core.hooksPath .githooks
+# Protected paths are defined in .githooks/protected-paths (one pattern per line, extended regex).
+#
+# Also installed as .githooks/pre-merge-commit: git invokes it before creating a
+# non-fast-forward merge commit, closing the local "merge a feature branch into trunk
+# without any hook firing" bypass. Fast-forward merges run NO hook — that residual is
+# covered only by the server-side ddr-gate required check + branch protection.
+
+HOOKDIR="$(dirname "$0")"
+PATTERNS_FILE="$HOOKDIR/protected-paths"
+
+# ---------------------------------------------------------------------------
+# SECRET SCAN  (audit finding "gitleaks", 2026-07-31)
+#
+# Runs on EVERY staged file, on EVERY branch, and BEFORE any of the
+# doubt-driven-review logic below. That ordering is the whole point: all three
+# of the DDR early-exits underneath -- protected-paths file missing, nothing
+# staged matching a protected pattern, and "feature branch, warn only" --
+# return 0 without a single byte of file content ever being looked at. Under
+# the old hook a stray key file anywhere outside src/xete_mcp/ committed
+# completely cleanly, because protected-paths only lists src/xete_mcp/*.py and
+# pyproject.toml, and nothing in this hook did any secret scanning at all.
+#
+# This is the fast local pre-filter. The authoritative scanner is gitleaks, in
+# .github/workflows/gitleaks.yml. The shapes below are a deliberately small,
+# high-signal subset of gitleaks' rules, chosen to stop a secret before it
+# reaches the reflog -- after that, removing it stops being easy.
+#
+# Two escape hatches, both visible in review:
+#   - put the marker  gitleaks:allow  on the offending line. CI's gitleaks
+#     honours the same marker, so one annotation satisfies both scanners.
+#   - git commit --no-verify
+#
+# Each content regex below is written so the character following its fixed
+# prefix is a regex metacharacter and never a token character. That is why
+# this hook can scan its own source without blocking its own commit; there is
+# no path exemption for .githooks/, and there must not be one.
+# ---------------------------------------------------------------------------
+SECRET_TMP=$(mktemp -d 2>/dev/null) || SECRET_TMP="${TMPDIR:-/tmp}/xete-secretscan.$$"
+mkdir -p "$SECRET_TMP" 2>/dev/null || true
+trap 'rm -rf "$SECRET_TMP"' EXIT HUP INT TERM
+
+SECRET_LIST="$SECRET_TMP/staged"
+SECRET_HITS="$SECRET_TMP/hits"
+: > "$SECRET_HITS"
+git diff --cached --name-only --diff-filter=ACMR > "$SECRET_LIST" 2>/dev/null || : > "$SECRET_LIST"
+
+while IFS= read -r sf; do
+  [ -z "$sf" ] && continue
+  sbase=${sf##*/}
+
+  # --- 1. filename shapes --------------------------------------------------
+  shape=""
+  case "$sbase" in
+    .env|.env.*|*.env)                      shape="dotenv / environment file" ;;
+    *identity*.json)                        shape="identity key JSON" ;;
+    *keypair*.json|*-keypair.json)          shape="keypair JSON" ;;
+    id_rsa|id_dsa|id_ecdsa|id_ed25519)      shape="ssh private key" ;;
+    *.pem|*.p12|*.pfx|*.jks|*.keystore)     shape="key / cert container" ;;
+    *.key)                                  shape="private key file" ;;
+    service-account*.json|credentials.json) shape="cloud credential file" ;;
+    *.kdbx|*.ovpn)                          shape="credential store" ;;
+  esac
+  # ...minus the obvious non-secret variants of those names.
+  case "$sbase" in
+    *.example|*.example.*|*.sample|*.template|*.dist) shape="" ;;
+  esac
+  [ -n "$shape" ] && echo "$sf  ->  $shape (by filename)" >> "$SECRET_HITS"
+
+  # --- 2. content shapes ---------------------------------------------------
+  ssize=$(git cat-file -s ":$sf" 2>/dev/null || echo 0)
+  case "$ssize" in ''|*[!0-9]*) ssize=0 ;; esac
+  [ "$ssize" -eq 0 ] && continue
+  [ "$ssize" -gt 2000000 ] && continue           # skip very large blobs
+  sblob="$SECRET_TMP/blob"
+  git show ":$sf" > "$sblob" 2>/dev/null || continue
+  grep -qI . "$sblob" 2>/dev/null || continue    # skip binaries
+  sclean="$SECRET_TMP/clean"
+  grep -v 'gitleaks:allow' "$sblob" > "$sclean" 2>/dev/null || : > "$sclean"
+
+  grep -qE -e '-----BEGIN [A-Z0-9 ]*PRIVATE KEY' "$sclean" 2>/dev/null \
+    && echo "$sf  ->  PEM private key block" >> "$SECRET_HITS"
+  grep -qE -e 'github_pat_[A-Za-z0-9_]{20,}' "$sclean" 2>/dev/null \
+    && echo "$sf  ->  GitHub fine-grained PAT" >> "$SECRET_HITS"
+  grep -qE -e 'gh[pousr]_[A-Za-z0-9]{20,}' "$sclean" 2>/dev/null \
+    && echo "$sf  ->  GitHub token" >> "$SECRET_HITS"
+  grep -qE -e '(AKIA|ASIA)[0-9A-Z]{16}' "$sclean" 2>/dev/null \
+    && echo "$sf  ->  AWS access key id" >> "$SECRET_HITS"
+  # Solana / ed25519 keypair files are a bare JSON array of 64 bytes. Strip all
+  # whitespace first so a pretty-printed one is caught too.
+  tr -d ' \011\015\012' < "$sclean" 2>/dev/null \
+    | grep -qE -e '\[[0-9]{1,3}(,[0-9]{1,3}){63,}\]' 2>/dev/null \
+    && echo "$sf  ->  64+ integer byte array (raw keypair shape)" >> "$SECRET_HITS"
+done < "$SECRET_LIST"
+
+if [ -s "$SECRET_HITS" ]; then
+  echo "" >&2
+  echo "[xete-secret-scan] COMMIT BLOCKED - staged content matches secret shapes:" >&2
+  sort -u "$SECRET_HITS" | sed 's/^/  - /' >&2
+  echo "" >&2
+  echo "  If this is a REAL secret: unstage it (git restore --staged <file>)," >&2
+  echo "  add it to .gitignore, and rotate the credential. Do not just amend." >&2
+  echo "" >&2
+  echo "  If it is genuinely a false positive: put the marker  gitleaks:allow" >&2
+  echo "  on that line (CI's gitleaks scan honours it too), then commit again." >&2
+  echo "" >&2
+  echo "  --no-verify skips this check and CI will still catch it. Reaching for" >&2
+  echo "  it means the secret only stops being your problem once it is public." >&2
+  echo "" >&2
+  exit 1
+fi
+rm -rf "$SECRET_TMP"
+trap - EXIT HUP INT TERM
+# --------------------------- end secret scan -------------------------------
+
+if [ ! -f "$PATTERNS_FILE" ]; then
+  echo "[xete-gate] WARNING: $PATTERNS_FILE missing; gate disabled." >&2
+  exit 0
+fi
+
+STAGED=$(git diff --cached --name-only)
+[ -z "$STAGED" ] && exit 0
+
+TOUCHED_PROTECTED=""
+while IFS= read -r pattern; do
+  case "$pattern" in ""|\#*) continue;; esac
+  MATCH=$(echo "$STAGED" | grep -E "$pattern" || true)
+  if [ -n "$MATCH" ]; then
+    TOUCHED_PROTECTED="$TOUCHED_PROTECTED$MATCH\n"
+  fi
+done < "$PATTERNS_FILE"
+
+if [ -z "$TOUCHED_PROTECTED" ]; then
+  exit 0
+fi
+
+# Branch-aware enforcement: feature branches commit freely (warn only);
+# the hard gate is at the merge boundary — direct commits to the trunk branch, and the
+# ddr-gate Actions check on PRs. This matches skills/git-discipline: atomic
+# WIP commits on a branch must not each demand a review artifact.
+#
+# The trunk branch list is configurable because not every Xete repo uses main/master
+# (xete-relay-clone's trunk is "Artery"). Set it per repo with:
+#   git config xete.trunk "Artery"        (space-separated list allowed)
+# Default: "main master".
+TRUNKS=$(git config --get xete.trunk || echo "main master")
+BRANCH=$(git symbolic-ref --short -q HEAD || echo detached)
+IS_TRUNK=0
+for T in $TRUNKS; do
+  [ "$BRANCH" = "$T" ] && IS_TRUNK=1
+done
+if [ "$IS_TRUNK" -eq 0 ]; then
+  echo "[xete-gate] Protected paths staged on branch '$BRANCH' — allowed (feature branch; trunk=$TRUNKS)." >&2
+  echo "[xete-gate] Reminder: merging to trunk requires reviews/DDR-*.md with Verdict: SHIP (enforced by the ddr-gate PR check)." >&2
+  exit 0
+fi
+
+# A protected path is staged on trunk. Require a staged DDR artifact in the same commit.
+DDR=$(echo "$STAGED" | grep -E '^reviews/DDR-.*\.md$' || true)
+
+if [ -z "$DDR" ]; then
+  echo "" >&2
+  echo "[xete-gate] COMMIT BLOCKED — protected paths staged without a review artifact:" >&2
+  printf "$TOUCHED_PROTECTED" | sed 's/^/  - /' >&2
+  echo "" >&2
+  echo "  Run the doubt-driven-review skill (CLAIM -> EXTRACT -> DOUBT -> RECONCILE)," >&2
+  echo "  write reviews/DDR-<name>-$(date +%Y%m%d).md with verdict SHIP, and stage it" >&2
+  echo "  in this commit. See skills/doubt-driven-review/SKILL.md." >&2
+  echo "" >&2
+  echo "  Emergency bypass (logged, use sparingly): git commit --no-verify" >&2
+  exit 1
+fi
+
+# DDR present — verify it carries a SHIP verdict and no open security gates.
+for f in $DDR; do
+  if [ -f "$f" ]; then
+    if ! grep -qiE '^##? *Verdict: *SHIP' "$f"; then
+      echo "[xete-gate] COMMIT BLOCKED — $f has no 'Verdict: SHIP' line." >&2
+      echo "  Reconcile all doubts and set the verdict, or split this commit." >&2
+      exit 1
+    fi
+    if grep -qiE 'OPEN-GATE' "$f"; then
+      echo "[xete-gate] COMMIT BLOCKED — $f contains OPEN-GATE markers from security review." >&2
+      exit 1
+    fi
+  fi
+done
+
+echo "[xete-gate] Protected-path commit allowed: DDR artifact present with SHIP verdict."
+exit 0

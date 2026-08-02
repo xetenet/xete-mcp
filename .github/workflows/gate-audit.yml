@@ -1,0 +1,58 @@
+name: Gate Audit
+
+# Weekly self-audit of the gate system. If the audit finds weaknesses (bypassed
+# commits, rubber-stamp DDRs, thin reviews), it opens or updates a GitHub issue
+# containing the report. That issue is the trigger for the gate-retrospective
+# skill: the next agent session sees it and produces an improvement PR.
+
+on:
+  schedule:
+    - cron: "0 14 * * 1"   # Mondays 14:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  gate-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run audit
+        id: audit
+        run: |
+          chmod +x scripts/gate-audit.sh
+          set +e
+          bash scripts/gate-audit.sh 90 > audit-report.md
+          echo "findings=$?" >> "$GITHUB_OUTPUT"
+          set -e
+          cat audit-report.md
+
+      - name: Open or update findings issue
+        if: steps.audit.outputs.findings == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="Gate audit findings — action required"
+          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number' || true)
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            gh issue comment "$EXISTING" --body-file audit-report.md
+          else
+            gh issue create --title "$TITLE" \
+              --body-file audit-report.md \
+              --label "gate-retrospective"
+          fi
+
+      - name: Close stale findings issue when clean
+        if: steps.audit.outputs.findings == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EXISTING=$(gh issue list --state open --search "Gate audit findings in:title" --json number --jq '.[0].number' || true)
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            gh issue close "$EXISTING" --comment "Latest weekly audit is clean. Closing."
+          fi

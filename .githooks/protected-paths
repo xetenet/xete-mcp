@@ -1,0 +1,7 @@
+# Protected paths — xete-mcp (public MCP server: E2E crypto, payment verification, settlement)
+# Layout-calibrated 2026-07-05.
+^src/xete_mcp/.*\.py$
+^pyproject\.toml$
+
+# Deliberately NOT gated: e2e/ harness scripts, agent demo runtime (echo/tour/ollama handlers),
+# README — add agent_runtime.py if it ever grows key handling.

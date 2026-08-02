@@ -1,0 +1,130 @@
+#!/bin/sh
+# XETE-ESTATE-PREPUSH-GUARD v1
+# Installed 2026-07-31 by the "gitignore-estate" remediation wave.
+#
+# WHY: on 2026-07-31 a PUBLIC repo was found with two real ed25519 private keys
+# sitting untracked-and-unignored in its root. The .gitignore rule meant to catch
+# them ("identity.json") was an exact-basename match and missed the actual files.
+# .gitignore alone is a suggestion; this hook is the backstop that says no.
+#
+# WHAT: scans every commit in the push range for
+#   - "BEGIN ... PRIVATE KEY" blocks
+#   - GitHub tokens (github_pat_, ghp_)
+#   - AWS access key ids (AKIA...)
+#   - 64-integer byte arrays (Solana/ed25519 keypair JSON)
+#   - secret-shaped filenames (*identity*.json, *keypair*.json, *.pem, *.key,
+#     id_ed25519*, id_rsa*, .env, .env.*, *SEEDPHRASE*, *CREDENTIALS*, *.xete*,
+#     Usersjshed*, *.pkl)
+# and BLOCKS the push on a hit.
+#
+# BYPASS (only when you have actually looked): XETE_PREPUSH_BYPASS=1 git push ...
+#
+# NOTE: setting core.hooksPath silently disables .git/hooks/*. This hook therefore
+# re-runs a legacy .git/hooks/pre-push if one exists, so nothing already installed
+# there (e.g. the "owl incident" non-fast-forward guard) is lost.
+
+set -u
+
+ZERO=0000000000000000000000000000000000000000
+REMOTE_NAME="${1:-origin}"
+EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+MAX_COMMITS=300
+
+TMPD=$(mktemp -d 2>/dev/null) || exit 1
+trap 'rm -rf "$TMPD"' EXIT
+STDIN_COPY="$TMPD/stdin"
+REPORT="$TMPD/report"
+: > "$REPORT"
+cat > "$STDIN_COPY"
+
+CONTENT_RE='(BEGIN [A-Z0-9 ]*PRIVATE KEY|github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|\[ *[0-9]{1,3}( *, *[0-9]{1,3}){63} *\])'
+
+check_names() {
+  # stdin: list of paths
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    b=${f##*/}
+    case "$b" in
+      .env.example|.env.sample|.env.template) continue ;;
+    esac
+    case "$b" in
+      *identity*.json|*keypair*.json|*.pem|*.key|id_ed25519*|id_rsa*|.env|.env.*|*SEEDPHRASE*|*CREDENTIALS*|*.xete*|Usersjshed*|*.pkl)
+        echo "  [filename] $1 : $f" >> "$REPORT" ;;
+    esac
+  done
+}
+
+check_content() {
+  # $1 = label, stdin = a diff
+  grep -E '^\+' 2>/dev/null | grep -nE "$CONTENT_RE" 2>/dev/null | cut -c1-200 | \
+    while IFS= read -r hit; do
+      echo "  [content]  $1 : $hit" >> "$REPORT"
+    done
+}
+
+scan_ref() {
+  base="$1"; tip="$2"
+  if [ "$base" = "$ZERO" ]; then
+    commits=$(git rev-list "$tip" --not --remotes="$REMOTE_NAME" 2>/dev/null)
+  else
+    commits=$(git rev-list "$base..$tip" 2>/dev/null)
+  fi
+  [ -z "$commits" ] && return 0
+  n=$(printf '%s\n' "$commits" | wc -l | tr -d ' ')
+
+  if [ "$n" -le "$MAX_COMMITS" ]; then
+    for c in $commits; do
+      git show --no-color --pretty=format: --name-only "$c" 2>/dev/null | check_names "$c"
+      git show --no-color --pretty=format: --unified=0 "$c" 2>/dev/null | check_content "$c"
+    done
+  else
+    echo "  [note] $n commits in range; scanning the collapsed range diff only." >&2
+    if [ "$base" = "$ZERO" ]; then
+      oldest=$(printf '%s\n' "$commits" | tail -1)
+      baserev="$oldest^"
+      git rev-parse -q --verify "$baserev^{commit}" >/dev/null 2>&1 || baserev="$EMPTY_TREE"
+    else
+      baserev="$base"
+    fi
+    git diff --no-color --name-only "$baserev" "$tip" 2>/dev/null | check_names "$baserev..$tip"
+    git diff --no-color --unified=0 "$baserev" "$tip" 2>/dev/null | check_content "$baserev..$tip"
+  fi
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "${local_sha:-}" ] && continue
+  [ "$local_sha" = "$ZERO" ] && continue      # branch deletion
+  scan_ref "$remote_sha" "$local_sha"
+done < "$STDIN_COPY"
+
+if [ -s "$REPORT" ]; then
+  echo "" >&2
+  echo "==================== PUSH BLOCKED: possible secret ====================" >&2
+  echo "xete estate pre-push guard found secret-shaped content in the commits" >&2
+  echo "you are about to push to '$REMOTE_NAME':" >&2
+  echo "" >&2
+  cat "$REPORT" >&2
+  echo "" >&2
+  echo "History is forever on a public remote. Do NOT just re-push with --no-verify." >&2
+  echo "Rewrite the offending commits (git rebase -i / git filter-repo), rotate the" >&2
+  echo "exposed credential, and add the path to .gitignore." >&2
+  echo "Deliberate override: XETE_PREPUSH_BYPASS=1 git push ..." >&2
+  echo "=======================================================================" >&2
+  if [ "${XETE_PREPUSH_BYPASS:-0}" = "1" ]; then
+    echo "XETE_PREPUSH_BYPASS=1 set -- allowing the push anyway." >&2
+  else
+    exit 1
+  fi
+fi
+
+# Re-run a legacy .git/hooks/pre-push that core.hooksPath would otherwise disable.
+GITDIR=$(git rev-parse --git-dir 2>/dev/null) || GITDIR=""
+if [ -n "$GITDIR" ] && [ -f "$GITDIR/hooks/pre-push" ]; then
+  self=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
+  legacy=$(cd "$(dirname "$GITDIR/hooks/pre-push")" 2>/dev/null && pwd)/pre-push
+  if [ "$self" != "$legacy" ] && ! grep -q 'XETE-ESTATE-PREPUSH-GUARD' "$GITDIR/hooks/pre-push" 2>/dev/null; then
+    sh "$GITDIR/hooks/pre-push" "$@" < "$STDIN_COPY" || exit 1
+  fi
+fi
+
+exit 0
