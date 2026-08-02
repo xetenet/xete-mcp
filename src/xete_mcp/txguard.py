@@ -294,7 +294,11 @@ def _rpc_call(rpc_url: str, method: str, params: list, *, timeout: int = 20):
 
     import requests
 
-    from .safehttp import scrub
+    # BOTH sanitisers: they do DIFFERENT jobs and only one was applied. `scrub` removes
+    # CREDENTIALS and leaves newlines and Cf characters intact by design; `sanitize_text`
+    # flattens PROSE to one printable line and bounds it. Applying scrub alone felt
+    # complete and was not -- see the raise sites below.
+    from .safehttp import sanitize_text, scrub
 
     attempts, last = 3, None
     for attempt in range(attempts):
@@ -307,8 +311,13 @@ def _rpc_call(rpc_url: str, method: str, params: list, *, timeout: int = 20):
                 r.raise_for_status()
                 body = r.json()
                 if "error" in body:                      # a real answer: do not retry it
+                    # `str()` of a dict repr-escapes newlines, so the OBJECT form of a
+                    # JSON-RPC error looked safe while nothing sanitised it. JSON-RPC does
+                    # not require `error` to be an object, and the hostile server picks:
+                    # {"error": "prose\nwith newlines"} arrives completely raw.
                     raise RuntimeError(
-                        f"{method} rpc error: {scrub(str(body['error']))[:200]}")
+                        f"{method} rpc error: "
+                        f"{sanitize_text(scrub(str(body['error'])), 200)}")
                 return body["result"]
         except RuntimeError:
             raise
@@ -316,7 +325,7 @@ def _rpc_call(rpc_url: str, method: str, params: list, *, timeout: int = 20):
             last = e
         if attempt < attempts - 1:
             time.sleep(0.4 * (attempt + 1))
-    raise RuntimeError(f"{method}: {scrub(str(last))}")
+    raise RuntimeError(f"{method}: {sanitize_text(scrub(str(last)), 200)}")
 
 
 def read_config_names_wallet(rpc_url: str, program: Pubkey, *, timeout: int = 15) -> Pubkey:
