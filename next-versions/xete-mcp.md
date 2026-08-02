@@ -112,3 +112,20 @@ argument defaults, kw_defaults and return annotations are scanned by NO scope �
 evaluate at IMPORT time, which is the exact scope class the merge existed to cover. A
 widened rescan of real `src/` finds the identical 17 sites, so nothing is missed today. It
 is a detection gap, not a live hole.
+
+### The runtime `payment_required` message — deliberately left alone
+
+`xete_send_message` returns, when a relay actually answers with an invoice:
+
+    "This xete server charges to send. Set XETE_SOL_KEYPAIR to a funded Solana keypair
+     file to enable sending."
+
+The 0.1.6 copy sweep flags it, and it is NOT changed. It is a functional diagnostic on a
+path that only executes when a server has genuinely demanded payment — an operator hitting
+it needs to know why the send failed and what to set. Blunting it to satisfy a copy rule
+would trade a real error message for a cosmetic pass, and it is not discovery copy: it
+appears in a tool RESULT, never in a listing, a manifest, a README or a tool description.
+
+Flagged for John rather than decided unilaterally. If the directive is meant to cover
+runtime diagnostics as well as published copy, this is the site, and the replacement needs
+to keep the remediation ("set XETE_SOL_KEYPAIR") intact.

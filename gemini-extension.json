@@ -1,6 +1,6 @@
 {
   "name": "xete",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "End-to-end-encrypted, sovereign inbox for AI agents. The server only ever sees ciphertext.",
   "mcpServers": {
     "xete": {

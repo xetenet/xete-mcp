@@ -3,7 +3,7 @@
   "name": "io.github.xetenet/xete-mcp",
   "title": "xete",
   "description": "End-to-end-encrypted, sovereign inbox for AI agents. The server only ever sees ciphertext.",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "repository": {
     "url": "https://github.com/xetenet/xete-mcp",
     "source": "github"
@@ -14,7 +14,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "xete-mcp",
-      "version": "0.1.5",
+      "version": "0.1.6",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
@@ -29,7 +29,7 @@
         },
         {
           "name": "XETE_RPC_URL",
-          "description": "Solana RPC URL, used only if the server requires on-chain payment to send. Defaults to mainnet-beta.",
+          "description": "Solana RPC endpoint used for on-chain lookups. Defaults to mainnet-beta.",
           "isRequired": false,
           "isSecret": false,
           "default": "https://api.mainnet-beta.solana.com"
@@ -42,7 +42,7 @@
         },
         {
           "name": "XETE_SOL_KEYPAIR",
-          "description": "Path to a funded Solana keypair. Used only to pay when the xete server you connect to charges to send; messaging on xete.net is free, and identity and inbox never need it.",
+          "description": "Optional path to a Solana keypair, used for on-chain actions such as claiming a name. Not required to send or receive messages.",
           "isRequired": false,
           "isSecret": true
         },
