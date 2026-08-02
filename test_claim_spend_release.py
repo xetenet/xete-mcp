@@ -35,7 +35,7 @@ __all__ = ["alias_server"]
 def _entries(ledger: Path):
     if not ledger.exists():
         return []
-    return json.loads(ledger.read_text()).get("entries", [])
+    return json.loads(ledger.read_text(encoding="utf-8")).get("entries", [])
 
 
 def _setup(server, monkeypatch, price=5_000_000):
@@ -114,7 +114,7 @@ def test_a_submit_that_raises_still_names_the_transaction(alias_server, monkeypa
 def _ledger_entries(path: Path):
     if not path.exists():
         return []
-    return json.loads(path.read_text()).get("entries", [])
+    return json.loads(path.read_text(encoding="utf-8")).get("entries", [])
 
 
 def test_a_deposit_that_never_reached_the_network_gives_the_spend_back(monkeypatch, tmp_path):

@@ -412,7 +412,12 @@ def test_no_module_emits_an_endpoint_variable_without_redacting_it(module, floor
     because the names changed, because the AST shapes changed, because someone deleted the
     strings it keys on -- it FAILS rather than passing over an empty set.
     """
-    tree = ast.parse((SRC / module).read_text())
+    # encoding pinned: this repo's sources carry non-ASCII (em dashes throughout,
+    # and this file's own homoglyph fixtures). Python falls back to cp1252 on
+    # Windows, so a bare read_text() raises UnicodeDecodeError there -- a guard that
+    # cannot execute on a maintainer's machine is a guard that gets deleted at 3am by
+    # whoever hits it. Found by the independent oracle running on Windows.
+    tree = ast.parse((SRC / module).read_text(encoding="utf-8"))
     examined, bare = 0, []
     for expr, kind in _emission_expressions(tree):
         names = {n for n in ast.walk(expr)
@@ -439,7 +444,7 @@ def test_the_replaced_guard_is_gone_rather_than_left_passing_green():
     this exact property, so the next reader sees two guards agreeing when one of them is
     incapable of disagreeing.
     """
-    src = (REPO / "test_primitives_hardening.py").read_text()
+    src = (REPO / "test_primitives_hardening.py").read_text(encoding="utf-8")
     assert 'finditer(r"\\{(rpc_url|second|url)\\}"' not in src, (
         "the hollow regex guard is still in test_primitives_hardening.py. It cannot fail: "
         "the tokens it searches for were deleted by the fix it was written to verify.")

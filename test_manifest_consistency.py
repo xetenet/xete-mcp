@@ -28,11 +28,11 @@ REPO = Path(__file__).resolve().parent
 
 
 def _server_json():
-    return json.loads((REPO / "server.json").read_text())
+    return json.loads((REPO / "server.json").read_text(encoding="utf-8"))
 
 
 def _pyproject_version():
-    m = re.search(r'^version\s*=\s*"([^"]+)"', (REPO / "pyproject.toml").read_text(), re.M)
+    m = re.search(r'^version\s*=\s*"([^"]+)"', (REPO / "pyproject.toml").read_text(encoding="utf-8"), re.M)
     assert m, "no version in pyproject.toml"
     return m.group(1)
 
@@ -51,7 +51,7 @@ def test_the_package_version_is_the_same_everywhere():
     versions = {"server.json": d["version"], "pyproject.toml": _pyproject_version()}
     gem = REPO / "gemini-extension.json"
     if gem.exists():
-        versions["gemini-extension.json"] = json.loads(gem.read_text())["version"]
+        versions["gemini-extension.json"] = json.loads(gem.read_text(encoding="utf-8"))["version"]
     assert len(set(versions.values())) == 1, f"manifests disagree on version: {versions}"
 
 
@@ -61,7 +61,7 @@ def test_the_description_is_the_same_everywhere():
     gem = REPO / "gemini-extension.json"
     if not gem.exists():
         pytest.skip("no gemini-extension.json")
-    assert json.loads(gem.read_text())["description"] == _server_json()["description"]
+    assert json.loads(gem.read_text(encoding="utf-8"))["description"] == _server_json()["description"]
 
 
 @pytest.mark.parametrize("name", ["server.json", "glama.json", "gemini-extension.json"])
@@ -81,7 +81,7 @@ def test_glama_json_claims_a_real_github_user_not_the_org():
     p = REPO / "glama.json"
     if not p.exists():
         pytest.skip("no glama.json")
-    d = json.loads(p.read_text())
+    d = json.loads(p.read_text(encoding="utf-8"))
     assert d.get("maintainers"), "glama.json has no maintainers; it claims nothing"
     assert "xetenet" not in d["maintainers"], (
         "glama.json lists the ORGANISATION as a maintainer. Glama matches user logins, so this "

@@ -745,7 +745,7 @@ def test_there_is_no_hardcoded_treasury_left_to_go_stale():
     from xete_mcp import txguard
 
     assert not hasattr(txguard, "MAINNET_ALIAS_TREASURY")
-    assert RETIRED_TREASURY not in Path("src/xete_mcp/txguard.py").read_text()
+    assert RETIRED_TREASURY not in Path("src/xete_mcp/txguard.py").read_text(encoding="utf-8")
     program = Pubkey.from_string(ALIAS_PROGRAM_ID)
     assert txguard.treasury_pubkey(program) is None
 

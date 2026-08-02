@@ -203,18 +203,18 @@ def test_old_and_new_mail_decrypt_side_by_side_in_one_inbox(tmp_path):
 def test_the_migrated_keystore_persists_both_keys_and_backs_the_original_up(tmp_path):
     path = tmp_path / "identity.json"
     _keystore_0114(path)
-    original = path.read_text()
+    original = path.read_text(encoding="utf-8")
 
     load_or_create_identity(path)
 
-    on_disk = json.loads(path.read_text())
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
     assert base64.b64decode(on_disk["x_secret"]) == derive_x25519_secret(SEED)
     assert base64.b64encode(OLD_X_SECRET).decode() in on_disk["legacy_x_secrets"], (
         "the rewritten keystore dropped the pre-upgrade secret — the mailbox is now "
         "unrecoverable even though the in-memory load worked")
 
     backup = path.with_name(path.name + ".pre-derived-key.bak")
-    assert backup.exists() and backup.read_text() == original
+    assert backup.exists() and backup.read_text(encoding="utf-8") == original
     assert backup.stat().st_mode & 0o777 == 0o600
 
     # ...and re-loading the migrated file still opens pre-upgrade mail.
@@ -228,11 +228,11 @@ def test_migration_leaves_a_current_keystore_completely_alone(tmp_path):
     ident = Identity(ed_seed=SEED, agent_id=AGENT_ID)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(ident.to_json())
-    before = path.read_text()
+    before = path.read_text(encoding="utf-8")
 
     load_or_create_identity(path)
 
-    assert path.read_text() == before
+    assert path.read_text(encoding="utf-8") == before
     assert not path.with_name(path.name + ".pre-derived-key.bak").exists()
 
 
@@ -473,7 +473,7 @@ def paying(tmp_path, monkeypatch):
 
 
 def _entries(ledger: Path) -> list:
-    return json.loads(ledger.read_text())["entries"] if ledger.exists() else []
+    return json.loads(ledger.read_text(encoding="utf-8"))["entries"] if ledger.exists() else []
 
 
 def test_an_unreachable_rpc_does_not_consume_the_spend_window(paying):
@@ -787,8 +787,8 @@ def test_no_absolute_path_leaks_through_the_spend_limits_error_text(tools, tmp_p
 
 
 def test_the_env_vars_that_can_refuse_a_published_tool_are_documented():
-    readme = (REPO / "README.md").read_text()
-    envdoc = (REPO / "src/xete_mcp/server.py").read_text().split('"""')[1]
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    envdoc = (REPO / "src/xete_mcp/server.py").read_text(encoding="utf-8").split('"""')[1]
 
     assert "XETE_INVITE_CODE" in readme, "read on the login path, documented nowhere"
     assert "XETE_INVITE_CODE" in envdoc

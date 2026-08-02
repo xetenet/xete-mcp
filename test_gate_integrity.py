@@ -72,7 +72,7 @@ def test_the_protected_paths_file_is_readable_and_non_empty():
     pp = d / "protected-paths"
     if not pp.exists():
         pytest.skip("no protected-paths file in this hooks dir")
-    body = [ln for ln in pp.read_text().splitlines()
+    body = [ln for ln in pp.read_text(encoding="utf-8").splitlines()
             if ln.strip() and not ln.strip().startswith("#")]
     assert body, "protected-paths has no active patterns; the DDR gate guards nothing"
 
@@ -159,7 +159,7 @@ def test_protected_paths_patterns_match_files_that_actually_exist():
     pp = d / "protected-paths"
     if not pp.exists():
         pytest.skip("no protected-paths file")
-    pats = [ln.strip() for ln in pp.read_text().splitlines()
+    pats = [ln.strip() for ln in pp.read_text(encoding="utf-8").splitlines()
             if ln.strip() and not ln.strip().startswith("#")]
     tracked = subprocess.run(["git", "ls-files"], cwd=REPO,
                              capture_output=True, text=True).stdout.split()

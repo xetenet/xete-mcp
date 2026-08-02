@@ -602,7 +602,7 @@ def test_claim_posts_the_normalised_name(net, throwaway_identity):
     # is covered by its own tests; this test is about the NAME the POST carries.
     from xete_mcp.client import load_or_create_identity
     load_or_create_identity(server.IDENTITY_PATH)
-    _ident = json.loads(server.IDENTITY_PATH.read_text())
+    _ident = json.loads(server.IDENTITY_PATH.read_text(encoding="utf-8"))
     _ident["agent_id"] = "00000000-0000-4000-8000-000000000001"
     server.IDENTITY_PATH.write_text(json.dumps(_ident))
 
@@ -727,10 +727,10 @@ def test_readme_does_not_claim_the_live_alias_endpoints_are_undeployed():
     live run. Harmless in code — the hint only fires on a real 404 — but a README that
     tells an operator a working endpoint is missing sends them debugging the wrong thing.
     """
-    readme = (REPO / "README.md").read_text()
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
     assert "not deployed on `xete.net` yet" not in readme
     assert "the deployed relay predates it" not in readme
-    assert "the deployed relay predates it" not in (REPO / "src/xete_mcp/server.py").read_text()
+    assert "the deployed relay predates it" not in (REPO / "src/xete_mcp/server.py").read_text(encoding="utf-8")
 
 
 # ═════════════════════════════════════════════════════════════════════════════════════
@@ -1321,7 +1321,7 @@ def test_the_migration_never_overwrites_an_existing_backup(tmp_path):
     first = C.load_or_create_identity(p)
     assert first.legacy_x_secrets, "fixture is wrong — no legacy secret, migration is a no-op"
     assert bak.exists(), "the first migration did not write a backup at all"
-    precious = bak.read_text()
+    precious = bak.read_text(encoding="utf-8")
 
     # A DIFFERENT pre-upgrade keystore is now put in place — restored from a copy, or an
     # older machine's file. Migration runs for real again (different content, so the
@@ -1330,6 +1330,6 @@ def test_the_migration_never_overwrites_an_existing_backup(tmp_path):
     second = C.load_or_create_identity(p)
     assert second.legacy_x_secrets
 
-    assert bak.read_text() == precious, (
+    assert bak.read_text(encoding="utf-8") == precious, (
         "the migration overwrote an existing backup. That backup held the only copy of the "
         "FIRST pre-upgrade messaging secret, and the mailbox it opens is now unrecoverable.")

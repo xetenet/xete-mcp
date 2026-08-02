@@ -2998,5 +2998,5 @@ def test_a_deposit_that_cannot_land_is_refused_before_the_budget_is_charged(spen
     assert "rent-exempt" in str(ei.value)
 
     ledger = Path(os.environ[spendguard.ENV_LEDGER])
-    entries = json.loads(ledger.read_text())["entries"] if ledger.exists() else []
+    entries = json.loads(ledger.read_text(encoding="utf-8"))["entries"] if ledger.exists() else []
     assert entries == [], f"an impossible deposit consumed spend budget: {entries}"

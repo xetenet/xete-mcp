@@ -52,7 +52,7 @@ def ledger(tmp_path, monkeypatch):
 
 
 def _entries(path: Path) -> list:
-    return json.loads(path.read_text())["entries"]
+    return json.loads(path.read_text(encoding="utf-8"))["entries"]
 
 
 # ── defaults: never unlimited ────────────────────────────────────────────────────────
@@ -153,7 +153,7 @@ def test_entries_outside_the_window_stop_counting(ledger, monkeypatch):
         spendguard.authorize(1_000_000, "xete_send_message")
 
     # Age the recorded spend past the window.
-    data = json.loads(ledger.read_text())
+    data = json.loads(ledger.read_text(encoding="utf-8"))
     data["entries"][0]["ts"] -= 3601
     ledger.write_text(json.dumps(data))
 
@@ -234,7 +234,7 @@ def test_a_damaged_ledger_refuses_rather_than_resetting(ledger, monkeypatch, blo
     with pytest.raises(spendguard.SpendGuardUnavailable) as ex:
         spendguard.authorize(1_000, "xete_send_message")
     assert "NOT being reset" in str(ex.value)
-    assert ledger.read_text() == blob      # and it did not overwrite the evidence
+    assert ledger.read_text(encoding="utf-8") == blob      # and it did not overwrite the evidence
 
 
 def test_an_unknown_ledger_version_refuses(ledger, monkeypatch):
@@ -252,7 +252,7 @@ def test_rolling_the_ledger_back_does_not_grant_more_than_the_window(ledger, mon
     monkeypatch.setenv(spendguard.ENV_MAX, "10000000")
     monkeypatch.setenv(spendguard.ENV_WINDOW, "2000000")
     spendguard.authorize(1_000_000, "xete_send_message")
-    snapshot = ledger.read_text()
+    snapshot = ledger.read_text(encoding="utf-8")
     spendguard.authorize(1_000_000, "xete_send_message")
     with pytest.raises(spendguard.SpendRefused):
         spendguard.authorize(1_000_000, "xete_send_message")
@@ -345,7 +345,7 @@ def test_a_backwards_clock_does_not_age_spending_out_early(ledger, monkeypatch):
 
     spendguard.authorize(1_000, "xete_send_message")
 
-    data = json.loads(ledger.read_text())
+    data = json.loads(ledger.read_text(encoding="utf-8"))
     assert data["entries"][0]["ts"] == pytest.approx(future, abs=1.0)
     assert data["last_ts"] >= future
 
@@ -420,7 +420,7 @@ def test_a_ledger_symlinked_onto_the_keystore_cannot_destroy_it(ledger, monkeypa
     with pytest.raises(spendguard.SpendGuardUnavailable):
         spendguard.authorize(1_000, "xete_send_message")
 
-    assert identity.read_text() == '{"secret": "do not touch"}'
+    assert identity.read_text(encoding="utf-8") == '{"secret": "do not touch"}'
     assert identity.is_file() and not identity.is_symlink()
 
 
