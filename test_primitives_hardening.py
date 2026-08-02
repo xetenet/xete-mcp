@@ -124,21 +124,24 @@ def test_a_paid_rpc_credential_never_reaches_a_settlement_answer(url, secret):
         "diagnostic this field owes anyone; over-redacting is its own defect.")
 
 
-def test_the_settlement_module_cannot_emit_an_unredacted_endpoint():
-    """A static check, because the leak was on the SUCCESS path and a behavioural test only
-    covers the shapes someone thought to construct. Every f-string interpolation of an
-    endpoint variable in settlement.py must go through redact_url."""
-    import re
-    src = (REPO / "src" / "xete_mcp" / "settlement.py").read_text()
-    bare = []
-    for m in re.finditer(r"\{(rpc_url|second|url)\}", src):
-        line_start = src.rfind("\n", 0, m.start()) + 1
-        line = src[line_start:src.find("\n", m.end())]
-        if "redact_url" not in line:
-            bare.append(line.strip()[:100])
-    assert not bare, (
-        "settlement.py interpolates an endpoint variable without redact_url:\n  "
-        + "\n  ".join(bare))
+# DELETED: test_the_settlement_module_cannot_emit_an_unredacted_endpoint.
+#
+# It searched settlement.py for `{rpc_url}`, `{second}` and `{url}` and required
+# `redact_url` on the same line. When written it matched six sites. The fix it was written
+# to verify wrapped those six -- `{redact_url(rpc_url)}` -- WHICH DELETED THE LITERAL
+# TOKENS THE REGEX KEYS ON. From that commit onward it matched ZERO sites and passed green
+# over every leak that remained: the `.format(endpoint=...)` caveat templates, the
+# `{rpc_url or '(unnamed)'}` submit messages, the raw URLs used as dict KEYS on the
+# disagreement path, and the whole of server.py, which it never opened.
+#
+# It is deleted rather than repaired because the shape is the problem: a guard whose
+# passing condition is "the strings I search for are absent" is satisfied by their removal,
+# and it does not merely fail to catch the bug -- it RETIRES the finding, so the leak is
+# then believed fixed. Eight executed leaks were sitting behind this green check.
+#
+# Replaced by test_endpoint_credential_leak.py: a behavioural canary sweep that never reads
+# the source, plus an AST sweep that asserts a FLOOR on how many sites it examined, so a
+# sweep that goes blind fails instead of passing.
 
 
 @pytest.mark.parametrize("url,label", [

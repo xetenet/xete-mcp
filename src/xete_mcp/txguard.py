@@ -279,10 +279,22 @@ def _rpc_call(rpc_url: str, method: str, params: list, *, timeout: int = 20):
     would be the cheapest attack on this whole module. Retry before giving up, and when
     we do give up the caller fails closed. A node that answers with an `error` object
     has answered — that is not retried.
+
+    EVERY MESSAGE RAISED FROM HERE IS SCRUBBED, because this function talks to `requests`
+    directly rather than through `safehttp`, and `requests` writes the URL it was called
+    with into its own exception text: `HTTPSConnectionPool(host=…) … with url: /qn-TOKEN/`.
+    That string is re-raised, and `xete_alias_claim` reports a refusal reason WITHOUT
+    truncating it — deliberately, because a refusal is the most useful thing that tool can
+    say. So an operator's paid RPC credential reached the agent's context on DNS failure,
+    connect timeout, TLS error, connection reset, and a 401 after a key rotation. None of
+    those is an attack; they are Tuesday. Scrubbing at the raise is the only place that
+    covers all of them at once, because the caller cannot know a URL is in there.
     """
     import time
 
     import requests
+
+    from .safehttp import scrub
 
     attempts, last = 3, None
     for attempt in range(attempts):
@@ -295,7 +307,8 @@ def _rpc_call(rpc_url: str, method: str, params: list, *, timeout: int = 20):
                 r.raise_for_status()
                 body = r.json()
                 if "error" in body:                      # a real answer: do not retry it
-                    raise RuntimeError(f"{method} rpc error: {str(body['error'])[:200]}")
+                    raise RuntimeError(
+                        f"{method} rpc error: {scrub(str(body['error']))[:200]}")
                 return body["result"]
         except RuntimeError:
             raise
@@ -303,7 +316,7 @@ def _rpc_call(rpc_url: str, method: str, params: list, *, timeout: int = 20):
             last = e
         if attempt < attempts - 1:
             time.sleep(0.4 * (attempt + 1))
-    raise RuntimeError(f"{method}: {last}")
+    raise RuntimeError(f"{method}: {scrub(str(last))}")
 
 
 def read_config_names_wallet(rpc_url: str, program: Pubkey, *, timeout: int = 15) -> Pubkey:

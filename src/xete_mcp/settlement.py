@@ -286,7 +286,7 @@ def _send(client: Client, signers, ixs, payer: Keypair, label: str,
         # endpoint is lying about not forwarding, that string is the only way to find out.
         raise SettlementSubmitError(
             f"{label} was REJECTED at submit: signature {sig_local}. The endpoint "
-            f"{rpc_url or '(unnamed)'} simulated it and refused to forward it, so it did not "
+            f"{redact_url(rpc_url) if rpc_url else '(unnamed)'} simulated it and refused to forward it, so it did not "
             f"execute and nothing moved. Fix the cause and retry. (If you have reason to doubt "
             f"that endpoint, check the signature on chain — a node that refused a transaction it "
             f"had already forwarded would look the same.) Endpoint said: "
@@ -308,7 +308,7 @@ def _send(client: Client, signers, ixs, payer: Keypair, label: str,
     if str(returned) != sig_local:
         raise SettlementSubmitError(
             f"{label}: SIGNATURE MISMATCH — this client signed {sig_local}, and that is the only "
-            f"transaction to look for. The endpoint {rpc_url or '(unnamed)'} answered with a "
+            f"transaction to look for. The endpoint {redact_url(rpc_url) if rpc_url else '(unnamed)'} answered with a "
             f"different signature, so nothing it says about either transaction can be trusted. "
             f"The transaction MAY BE LIVE — check ours against a different endpoint before "
             f"retrying or discarding anything. It returned: {str(returned)[:96]}",
@@ -756,17 +756,20 @@ def status(rpc_url: str, escrow_id_hex: str, expect_commitment_hex: str | None =
                     "tell which from here. NOTHING is concluded: do not treat this settlement as "
                     "open, do not treat it as settled, and DO NOT DISCARD A CLAIM TICKET over "
                     "it. Retry, or ask an endpoint you control.")
+                # REDACTED IN THE KEYS TOO. A dict key is not an f-string, so it was
+                # invisible to the static guard that was supposed to cover this file -- and
+                # this is the one site that leaks BOTH configured providers at once.
                 out["disagreement"] = {
-                    rpc_url: {"exists": exists, "owner": owner,
-                              "len": None if data is None else len(data)},
-                    second: {"exists": e2, "owner": o2,
-                             "len": None if d2 is None else len(d2)}}
+                    redact_url(rpc_url): {"exists": exists, "owner": owner,
+                                          "len": None if data is None else len(data)},
+                    redact_url(second): {"exists": e2, "owner": o2,
+                                         "len": None if d2 is None else len(d2)}}
                 return out
 
     if not exists:
         out["note"] = "settled or never opened"
         if not out["corroborated"]:
-            out["note"] += _ONE_SOURCE_CAVEAT.format(endpoint=rpc_url)
+            out["note"] += _ONE_SOURCE_CAVEAT.format(endpoint=redact_url(rpc_url))
         return out
 
     if owner is None or owner != str(prog):
@@ -799,7 +802,7 @@ def status(rpc_url: str, escrow_id_hex: str, expect_commitment_hex: str | None =
     if expect_commitment_hex is None:
         out["verdict"] = UNVERIFIED_NOTE
         if not out["corroborated"]:
-            out["verdict"] += _ONE_SOURCE_CAVEAT.format(endpoint=rpc_url)
+            out["verdict"] += _ONE_SOURCE_CAVEAT.format(endpoint=redact_url(rpc_url))
         return out
     expected = str(expect_commitment_hex).strip().lower()
     out["expected_commitment"] = expected
@@ -819,5 +822,5 @@ def status(rpc_url: str, escrow_id_hex: str, expect_commitment_hex: str | None =
     else:
         out["verdict"] = (
             "ONE ENDPOINT SAYS the hidden beneficiary of this escrow is the wallet you named."
-            + _ONE_SOURCE_CAVEAT.format(endpoint=rpc_url))
+            + _ONE_SOURCE_CAVEAT.format(endpoint=redact_url(rpc_url)))
     return out

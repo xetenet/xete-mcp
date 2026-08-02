@@ -142,13 +142,53 @@ def _capped(raw: str) -> str:
     return head[:keep + 1] + "...(oversized, truncated)"
 
 
+# A URL embedded in a longer string — an exception message, a log line, a header. Stops at
+# whitespace and at the punctuation that ordinarily CLOSES a URL in prose or in a repr,
+# because `requests` writes its exception text as
+# `HTTPSConnectionPool(host=..., port=443): Max retries exceeded with url: /qn-TOK/ ...`
+# and a greedy run would swallow the sentence.
+_EMBEDDED_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s'\"<>)\]},]+")
+
+
+def _scrub_credentials(text: str) -> str:
+    """The userinfo and query passes ONLY — no URL pass, and that is load-bearing.
+
+    `redact_url` calls this on one branch, and `scrub` calls `redact_url`. Routing that
+    branch here instead of at `scrub` makes the cycle STRUCTURALLY impossible rather than
+    merely unreachable. It was unreachable when written — `redact_url` only reaches its
+    `scrub` branch for a string containing none of `@%?/\\`, which therefore cannot contain
+    `://` and cannot match `_EMBEDDED_URL_RE` — but that is a proof spread across two
+    functions and three regexes, and the failure mode if a later edit breaks it is
+    unbounded recursion inside the credential redactor. Not a thing to leave resting on an
+    argument.
+    """
+    out = _USERINFO_RE.sub(r"\1<redacted>@", _capped(text))
+    out = _BARE_USERINFO_RE.sub(r"\1<redacted>@", out)
+    return _QUERY_RE.sub("?<redacted>", out)
+
+
 def scrub(text) -> str:
     """Strip credentials out of arbitrary text — an exception message, a header, a URL.
 
-    Two shapes come out: `user:pass@` userinfo runs, and `?key=value` query strings. Used
-    on anything third-party (notably `requests`' own exception strings) before it is
+    Three shapes come out: any embedded `scheme://…` URL (routed through `redact_url`, so
+    PATH credentials go too), `user:pass@` userinfo runs, and `?key=value` query strings.
+    Used on anything third-party (notably `requests`' own exception strings) before it is
     interpolated into a message this package emits. Cheap, and the alternative is trusting
     every library in the stack to redact for us.
+
+    THE URL PASS WAS MISSING AND THE DOCSTRING ABOVE CLAIMED IT ANYWAY. Userinfo and query
+    are two of the three places a credential lives in a URL; the third is the PATH, which is
+    where QuickNode puts its token (`https://host/qn-TOKEN/`). So a function whose stated job
+    is removing credentials from text returned a QuickNode credential byte-for-byte, and
+    every caller that reached for it against a `requests` exception — which embeds the full
+    URL it was called with — was protected against Helius and not against QuickNode. `scrub`
+    is what code reaches for when it has TEXT rather than a URL, so the gap sat behind the
+    exact name that promised it was closed.
+
+    Note the direction of the trade: `redact_url` replaces the whole path, not the part that
+    looks secret, so a harmless URL in an error message loses its path here. That is
+    deliberate — "which endpoint" survives, "which object on it" does not, and no redactor
+    can tell a token from a route by looking at it.
 
     "CHEAP" WAS FALSE ABOVE A FEW KB, AND THE PARTY WHO PICKS THE LENGTH IS THE ONE THIS
     FUNCTION DEFENDS AGAINST. `_USERINFO_RE` opens with `[A-Za-z][A-Za-z0-9+.-]*:`; on a
@@ -163,9 +203,10 @@ def scrub(text) -> str:
     lost — every consumer of this output truncates it to 200 characters or fewer through
     `sanitize_text` — and the surviving 4KB is bounded work (~12ms worst case).
     """
-    out = _USERINFO_RE.sub(r"\1<redacted>@", _capped("" if text is None else str(text)))
-    out = _BARE_USERINFO_RE.sub(r"\1<redacted>@", out)
-    return _QUERY_RE.sub("?<redacted>", out)
+    # Cap FIRST, once, so the URL pass inherits the same bound as the other two rather
+    # than scanning an attacker-chosen length of text before they ever run.
+    capped = _capped("" if text is None else str(text))
+    return _scrub_credentials(_EMBEDDED_URL_RE.sub(lambda m: redact_url(m.group(0)), capped))
 
 
 # `scheme:` followed by two or more slashes of either lean. Backslashes are included
@@ -316,7 +357,11 @@ def redact_url(url) -> str:
         if not raw:
             return ""
         if not any(c in raw for c in "@%?/\\"):
-            return scrub(raw)
+            # `_scrub_credentials`, not `scrub`: `scrub` now routes embedded URLs back
+            # through THIS function, and calling it from inside it is a cycle. The guard
+            # above already excludes every string that could match a URL, so this is
+            # belt-and-braces — but see `_scrub_credentials` for why the braces are here.
+            return _scrub_credentials(raw)
         scheme = parts.scheme or (raw.split(":", 1)[0] if ":" in raw else "")
         return f"{scheme}://<unparseable-url>" if scheme else "<unparseable-url>"
     netloc = parts.netloc

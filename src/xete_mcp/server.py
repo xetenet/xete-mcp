@@ -1291,10 +1291,20 @@ def xete_alias_claim(name: str, max_price_lamports: int | None = None) -> str:
         # A refusal is the most useful thing this tool can say, so it is NOT truncated
         # to 300 characters like an ordinary error: the message names exactly what the
         # server sent and why it was not signed.
+        #
+        # SCRUBBED, precisely BECAUSE it is untruncated. The two mandatory RPC-backed
+        # checks on this path (`treasury_for_claim`, `bounded_simulated_debit`) reach
+        # `requests` through txguard, and a transport failure there carries the full
+        # credentialed RPC URL in the library's own exception text. Untruncated is the
+        # right call for a refusal and it is exactly what made this field the widest
+        # opening in the tool. txguard scrubs at the raise as well; this is the boundary,
+        # and a boundary that trusts its callers to have done it is not a boundary.
         return json.dumps({"status": "refused", "name": bare, "signed": False,
-                           "submitted": False, "reason": str(e)}, indent=2)
+                           "submitted": False, "reason": scrub(str(e))}, indent=2)
     except Exception as e:
-        return json.dumps({"status": "failed", "error": str(e)[:300]})
+        # Truncation is NOT redaction: `requests` puts the URL at roughly character 110,
+        # well inside 300.
+        return json.dumps({"status": "failed", "error": scrub(str(e))[:300]})
 
 
 # ── unified resolver ─────────────────────────────────────────────────────────────────
@@ -2090,7 +2100,7 @@ def _resolve_recipient_corroborated(recipient: str, purpose: str = "verify"):
             f"would launder this refusal rather than satisfy it — instead of '{recipient}'; or "
             "set XETE_ALIAS_RPC to two comma-separated Solana endpoints run by different "
             f"providers. Refusing to {verb} a %name with only one Solana endpoint configured "
-            f"({endpoints[0]}): " + why)
+            f"({redact_url(endpoints[0])}): " + why)
 
     answers: dict[str, str] = {}
     for url in endpoints[:2]:
@@ -2104,23 +2114,26 @@ def _resolve_recipient_corroborated(recipient: str, purpose: str = "verify"):
             # money (do not send what you could not confirm), but the refusal has to hand the
             # caller the way out, or it reads as an outage rather than a choice.
             raise CorroborationUnavailable(
-                f"PASS THE RECIPIENT'S BASE58 WALLET ADDRESS instead of '{recipient}': {url} "
+                f"PASS THE RECIPIENT'S BASE58 WALLET ADDRESS instead of '{recipient}': "
+                f"{redact_url(url)} "
                 f"could not answer for it ({type(e).__name__}: {str(e)[:120]}), and a %name "
                 "needs TWO independently-operated endpoints that agree before it can decide "
                 "where money goes. Set XETE_ALIAS_RPC to two working Solana endpoints run by "
                 "different providers, or pass the wallet address.") from e
         answers[url] = str(wallet)
-    a, b = endpoints[0], endpoints[1]
-    if answers[a] != answers[b]:
+    first_url, second_url = endpoints[0], endpoints[1]
+    if answers[first_url] != answers[second_url]:
         raise CorroborationUnavailable(
-            f"the %name '{recipient}' resolves DIFFERENTLY on two endpoints: {a} says "
-            f"{answers[a]}, {b} says {answers[b]}. One of them is lying or stale and there is no "
+            f"the %name '{recipient}' resolves DIFFERENTLY on two endpoints: "
+            f"{redact_url(first_url)} says {answers[first_url]}, {redact_url(second_url)} says "
+            f"{answers[second_url]}. One of them is lying or stale and there is no "
             "way to tell which from here. DO NOT SIGN. Resolve the recipient's wallet address "
             "OUT OF BAND — from the person being paid, not from another tool on this server — "
             "and pass it as base58.")
     from solders.pubkey import Pubkey
-    return Pubkey.from_string(answers[a]), (
-        f"the %alias registry as reported by TWO independent endpoints that agree: {a} and {b}. "
+    return Pubkey.from_string(answers[first_url]), (
+        f"the %alias registry as reported by TWO independent endpoints that agree: "
+        f"{redact_url(first_url)} and {redact_url(second_url)}. "
         "This is not proof the registry says it — both could be wrong together — but no single "
         "endpoint chose this answer."), f"%{name}"
 
