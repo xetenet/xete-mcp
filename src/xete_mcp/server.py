@@ -36,9 +36,8 @@ Config (env):
                     file is rewritten once into that two-field form, after copying the
                     original to <name>.pre-derived-key.bak. See xete_my_identity ->
                     messaging_key for which key is live and whether the relay took it.
-  XETE_SOL_KEYPAIR  path to a funded Solana keypair (JSON array). Used to pay only on
-                    a server that charges to send; messaging on xete.net is free, and
-                    identity and inbox never need it.
+  XETE_SOL_KEYPAIR  path to a Solana keypair (JSON array). Used for on-chain actions
+                    such as claiming a %name. Identity, sending and inbox never need it.
   XETE_PERMIT_URL   base URL of the %alias permit server — the separate service that
                     prices and co-signs a %name claim. Defaults to XETE_SERVER_URL.
                     Must be https:// unless the host is loopback. It is NOT trusted for
