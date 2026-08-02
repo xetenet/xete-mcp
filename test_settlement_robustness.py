@@ -164,10 +164,26 @@ def test_an_honest_draft_still_verifies():
 
 def test_a_durable_nonce_draft_still_verifies():
     """advance_nonce_account is a legitimate system instruction in this path — the fix must not
-    turn the nonce feature off in the name of safety."""
+    turn the nonce feature off in the name of safety.
+
+    THE CALLER NOW HAS TO NAME THE NONCE ACCOUNT, and that is the change, not a weakening.
+    This previously passed with no `expect_nonce_account` at all, which is precisely finding
+    A2: the verifier accepted an AdvanceNonceAccount for ANY account, and advancing a durable
+    nonce invalidates every transaction already queued against it — so a hostile drafter
+    could turn this deposit approval into the silent cancellation of an unrelated pending
+    transaction of the signer's, with nothing in the itemisation to show it.
+
+    No shape check can distinguish an intended nonce account from an attacker-chosen one, so
+    identity has to come from outside the draft. `xete_verify_settlement_tx` supplies it from
+    `XETE_NONCE_ACCOUNT` — the operator's own config — never from the transaction.
+
+    The property this test was written for is unchanged and still asserted: an honest
+    durable-nonce draft verifies. `test_draft_shape.py` covers the other direction, where a
+    nonce account the caller did not name is refused.
+    """
     nonce_ix = advance_nonce_account(AdvanceNonceAccountParams(
         nonce_pubkey=NONCE_ACCT, authorized_pubkey=DEPOSITOR.pubkey()))
-    r = _verify(_honest(first=[nonce_ix]))
+    r = _verify(_honest(first=[nonce_ix]), expect_nonce_account=NONCE_ACCT)
     assert r.ok, r.failures
 
 

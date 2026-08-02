@@ -2174,6 +2174,15 @@ def xete_verify_settlement_tx(unsigned_tx_b64: str, expect_recipient: str, salt:
             expect_amount_lamports=int(round(amount_sol * 1_000_000_000)),
             expect_depositor=Pubkey.from_string(DEPOSITOR_WALLET),
             expect_escrow_id_hex=expect_escrow_id or None,
+            # From the OPERATOR'S OWN CONFIG, never from the draft. A durable-nonce advance
+            # is the one instruction here with an effect outside this transaction: advancing
+            # a nonce invalidates every transaction already queued against it, so a hostile
+            # drafter naming a nonce account the depositor controls turns a deposit approval
+            # into the silent cancellation of an unrelated pending transaction of theirs.
+            # Nothing in the itemisation shows it. Unset config means this install does not
+            # do durable-nonce deposits, so any nonce advance is an instruction nobody asked
+            # for and the shape check refuses it.
+            expect_nonce_account=Pubkey.from_string(NONCE_ACCOUNT) if NONCE_ACCOUNT else None,
         )
         out = {
             "verified": r.ok,

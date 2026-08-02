@@ -331,6 +331,75 @@ def _lamport_movements(msg, keys, program, expected_pda) -> tuple[list[dict], li
     return movements, undecodable
 
 
+# The complete instruction sequence an honest deposit can be, in order. `draft_deposit`
+# emits exactly this and nothing else: an optional durable-nonce advance FIRST, then the two
+# compute-budget instructions, then the deposit.
+_SHAPE_WITHOUT_NONCE = ("cb_limit", "cb_price", "deposit")
+_SHAPE_WITH_NONCE = ("advance_nonce",) + _SHAPE_WITHOUT_NONCE
+
+_CB_SET_LIMIT = 2
+_CB_SET_PRICE = 3
+
+
+def _instruction_shape(msg, keys, program) -> tuple[list[str], list[str]]:
+    """Classify every instruction by KIND, in order, plus the nonce accounts named.
+
+    WHY A SHAPE CHECK EXISTS AT ALL, when this file already sums every lamport that leaves
+    the signer: because `destinations` and `total_lamport_movement` are both VALUE-WEIGHTED,
+    and an attacker does not have to move value to do damage. A zero-lamport instruction
+    contributes 0 to the total and is filtered out of the destination list, so it is
+    structurally invisible to every arithmetic check here. Four instructions were certified
+    `ok=True, failures=none` on exactly that basis by an independent review:
+
+      * a 0-lamport, 0-space system CreateAccount — decodes cleanly, moves nothing, and makes
+        the RUNTIME reject the whole transaction because a 0-byte account is not rent-exempt.
+        The human pays a fee for a deposit that never happens.
+      * an AdvanceNonceAccount for an arbitrary nonce account — see `expect_nonce_account`.
+      * an AdvanceNonceAccount anywhere but index 0, which `draft_deposit`'s own comment says
+        the runtime rejects.
+      * a 0-lamport transfer to an attacker-chosen address, which executes and writes an
+        interaction between the signer's wallet and that address into the public record.
+
+    Whitelisting the SHAPE kills all of those together, and kills the next zero-value system
+    instruction nobody has thought of yet. Patching `destinations` to stop filtering on
+    `lamports > 0` would fix two of the four and leave the ordering one alive.
+
+    Unknown or undecodable instructions get a kind that cannot match the whitelist, so the
+    default is refusal — this function never has to enumerate what is bad.
+    """
+    kinds: list[str] = []
+    nonce_accounts: list[str] = []
+    for n, cix in enumerate(msg.instructions):
+        if cix.program_id_index >= len(keys):
+            kinds.append(f"ix{n}:bad_program_index")
+            continue
+        prog_key = keys[cix.program_id_index]
+        data = bytes(cix.data)
+        if prog_key == settlement.CB:
+            tag = data[0] if data else None
+            kinds.append({_CB_SET_LIMIT: "cb_limit", _CB_SET_PRICE: "cb_price"}.get(
+                tag, f"ix{n}:compute_budget_tag{tag}"))
+        elif prog_key == settlement.SYS:
+            tag = _u32(data, 0) if len(data) >= 4 else None
+            if tag == _SYS_ADVANCE_NONCE:
+                kinds.append("advance_nonce")
+                # accounts[0] is the nonce account. Recorded rather than checked here so the
+                # caller's expectation does the deciding.
+                if cix.accounts and cix.accounts[0] < len(keys):
+                    nonce_accounts.append(str(keys[cix.accounts[0]]))
+                else:
+                    nonce_accounts.append("<unresolvable>")
+            else:
+                kinds.append(f"ix{n}:system_tag{tag}")
+        elif prog_key == program:
+            tag = data[0] if data else None
+            kinds.append("deposit" if tag == 0 and len(data) == _DEPOSIT_DATA_LEN
+                         else f"ix{n}:settlement_tag{tag}")
+        else:
+            kinds.append(f"ix{n}:unknown_program")
+    return kinds, nonce_accounts
+
+
 def _read_nonce(client: Client, nonce_account: Pubkey) -> tuple[Hash, Pubkey]:
     """Read a durable nonce account -> (nonce value, on-chain authority). Raises if absent."""
     info = client.get_account_info(nonce_account, commitment=Confirmed).value
@@ -440,6 +509,7 @@ def verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt_
                  expect_amount_lamports: int, expect_depositor: Pubkey,
                  expect_program: Pubkey | None = None,
                  expect_escrow_id_hex: str | None = None,
+                 expect_nonce_account: Pubkey | str | None = None,
                  max_fee_lamports: int = MAX_TX_FEE_LAMPORTS) -> VerifyResult:
     """ALWAYS returns a VerifyResult — see `_verify_draft` for the actual verification.
 
@@ -456,6 +526,7 @@ def verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt_
             unsigned_tx_b64, expect_recipient=expect_recipient, expect_salt_hex=expect_salt_hex,
             expect_amount_lamports=expect_amount_lamports, expect_depositor=expect_depositor,
             expect_program=expect_program, expect_escrow_id_hex=expect_escrow_id_hex,
+            expect_nonce_account=expect_nonce_account,
             max_fee_lamports=max_fee_lamports)
     except Exception as e:                      # noqa: BLE001 — deliberate, see above
         return VerifyResult(
@@ -472,6 +543,7 @@ def _verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt
                   expect_amount_lamports: int, expect_depositor: Pubkey,
                   expect_program: Pubkey | None = None,
                   expect_escrow_id_hex: str | None = None,
+                  expect_nonce_account: Pubkey | str | None = None,
                   max_fee_lamports: int = MAX_TX_FEE_LAMPORTS) -> VerifyResult:
     """Independently check that a drafted transaction does what its summary claims.
 
@@ -538,6 +610,31 @@ def _verify_draft(unsigned_tx_b64: str, *, expect_recipient: Pubkey, expect_salt
         record("deposit_instruction_present", False, f"tag-0 ix for {program}", str(e)[:200])
         return VerifyResult(ok=False, checks=checks, failures=failures)
     record("deposit_instruction_present", True, f"tag-0 ix for {program}", "found")
+
+    # ── THE SHAPE, before any arithmetic ────────────────────────────────────────────────
+    # An honest draft is a CLOSED SET of instructions in a fixed order. Everything below this
+    # point is value-weighted, and a zero-lamport instruction is invisible to all of it — see
+    # `_instruction_shape` for the four that were certified `ok=True, failures=none` on
+    # exactly that basis.
+    kinds, nonce_accounts = _instruction_shape(msg, keys, program)
+    want = list(_SHAPE_WITH_NONCE if expect_nonce_account is not None
+                else _SHAPE_WITHOUT_NONCE)
+    record("instruction_shape", kinds == want, want, kinds)
+
+    # Identity, which no shape check can supply: a nonce advance for an account the caller
+    # never named is indistinguishable in shape from the intended one. It is the only finding
+    # here with an effect OUTSIDE this transaction — advancing a durable nonce invalidates
+    # every transaction already queued against it, so a signature given for a deposit
+    # silently kills an unrelated pending transaction of the signer's, and nothing in the
+    # itemisation shows it.
+    #
+    # Note the asymmetry this closes: `draft_deposit` reads the nonce account and refuses on
+    # an authority mismatch, so the BUILDER was careful about nonce identity while the
+    # VERIFIER — the half that exists to face a hostile builder — did not check it at all.
+    if expect_nonce_account is not None:
+        want_nonce = str(expect_nonce_account)
+        record("nonce_account", nonce_accounts == [want_nonce], want_nonce,
+               nonce_accounts or "<no nonce advance in this transaction>")
 
     escrow_id = data[1:33]
     escrow_id_hex = escrow_id.hex()
