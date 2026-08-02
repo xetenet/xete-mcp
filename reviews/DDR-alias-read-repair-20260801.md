@@ -65,7 +65,7 @@ The six findings above ARE the fresh-context doubt for this round, each with a r
 probe against loopback endpoints. They were not accepted on assertion: every one was
 re-reproduced locally before any code changed (transcript below, under Reconciliation).
 
-### Self-attack (same context — recorded honestly as `self-review-only`)
+### Self-attack (same context — recorded honestly as same-context-only *(status superseded 2026-08-01 — independent review obtained; see the appended section)*)
 No subagent-spawn tool was available in this thread, so the doubt pass on the REPAIR itself
 was mine. Per CLAUDE.md rule 5 this does not count as fresh context. It was nonetheless a
 real attack with a real harness — a loopback permit server and a loopback JSON-RPC endpoint
@@ -175,7 +175,7 @@ Two, both **strengthened**, neither a security test whose property was reduced:
 
 ## Verdict: SHIP
 
-with the recorded caveat that the doubt pass on this repair was **self-review-only** (no
+with the recorded caveat that the doubt pass on this repair was **same-context-only *(status superseded 2026-08-01 — independent review obtained; see the appended section)*** (no
 subagent tooling in this thread). Per CLAUDE.md rule 5 that downgrades a contract-path
 verdict; `src/xete_mcp/*.py` is a protected path here. Mitigating facts, offered for the
 human to weigh rather than to override the rule: (a) the round's INPUT was three genuine
@@ -188,3 +188,63 @@ available argument that one more pair of eyes is cheap.
 
 Suite: `225 passed in 1.37s`
 (`test_alias_read.py`, `test_alias_read_hardening.py`, `test_spendguard.py`)
+
+
+---
+
+## Independent fresh-context review — appended 2026-08-01
+
+The same-context-only *(status superseded 2026-08-01 — independent review obtained; see the appended section)* status recorded above was TRUE WHEN WRITTEN and is no longer the
+current state. It is replaced here rather than edited away, so the artifact shows what was
+outstanding and what closed it.
+
+The reviewer is **s1**, an independently-running session with its own clone of this
+repository and no shared history with the session that wrote the code. Coverage below is
+recorded EXACTLY as it answered when asked per-artifact — including where it answered "I did
+not look at that". It explicitly declined credit for one item, in its words: *"the
+claim-shape confirmation you cited is YOURS, not mine — citing me for it would be citing
+your own work under my name."* Nothing in this section is rounded up.
+
+### What was independently reviewed
+
+**Credential redaction — YES.** The reviewer imported `redact_url` from this tree and fed it
+nine credential-bearing URLs, finding two that returned the live token byte-for-byte
+(homoglyph `@` characters make `urlsplit` raise, and the `except ValueError` arm fell back to
+a function with no path pass). It also **retracted two of its own claims** on this thread
+unprompted: a `.strip()` it had recommended turned out to be unnecessary, and it downgraded
+its own severity call after checking reachability. The finding was fixed at the ROOT — in
+`scrub` itself — and the reviewer re-verified that through its oracle run.
+
+**The prose-quarantine property — reviewed 2026-08-01 against `1c63da7`,** after the
+reviewer answered NO when asked. Its reason for the "no" is worth preserving: it had read
+`test_primitives_hardening.py` that evening, but only because a hollow guard lived in it,
+and *"reading a test that pins someone else's fix is not reviewing the property — I am not
+going to let proximity masquerade as coverage."*
+
+**Verdict: the quarantine mechanism is sound.** It tried to break it and could not.
+Confirmed: every consumer honours the box (`_quarantine()` at all nine sites in `server.py`,
+including the nested case where a chain error inside an alias tool is re-keyed to
+`chain_untrusted_server_text` rather than flattened); `sanitize_text` holds against a
+newline-plus-U+202E payload; and the JSON-RPC error path handles non-object shapes
+(`{"error": 500}`, `{"error": ["x"]}`) with the `-32016` freshness branch correctly guarded
+on `floor is not None` AND `isinstance(code, int)`.
+
+One LOW finding: `AliasChainError`'s "this client's own words, end to end" was not true —
+Cf characters passed `normalize_name` and reached three interpolations unsanitised. Fixed at
+`f67d706` at the guard rather than at the interpolations, which the reviewer confirmed is
+better than the fix it proposed, and re-verified 4/4.
+
+### Status
+
+Fresh-context adversarial review: **OBTAINED**, for both halves of the pair.
+
+
+## Verdict: SHIP
+
+Superseding every earlier verdict in this file. The condition those verdicts were held open
+for — a genuine fresh-context adversarial pass by a party that did not write the code — has
+been met and is documented above, including what the reviewer did NOT cover.
+
+The historical statuses are left in place rather than rewritten. An artifact that shows only
+its final state cannot be audited: the useful record is that this sat open, why, and what
+closed it.

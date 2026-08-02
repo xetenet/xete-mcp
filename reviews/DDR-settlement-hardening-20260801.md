@@ -147,7 +147,7 @@ verbatim, but the `server.py` hunks are a hand-merge onto committed base. Re-app
 
 ## Verdict: BLOCK  *(superseded — see the appended fresh-context review)*
 
-`self-review-only`. CLAUDE.md rule 5 is explicit: reviewing one's own reasoning inside the
+same-context-only *(status superseded 2026-08-01 — independent review obtained; see the appended section)*. CLAUDE.md rule 5 is explicit: reviewing one's own reasoning inside the
 same context does not count as the adversarial pass, and for a protected path that downgrades
 the verdict to BLOCK. No subagent tool was exposed to this session, so genuine fresh-context
 doubt could not be obtained, and claiming SHIP would be exactly the rationalisation the skill's
@@ -209,3 +209,68 @@ corroboration rule can be walked around with one extra tool call. The configurat
 `DDR-post-gate-integrator-20260801.md`.
 
 ## Verdict: SHIP
+
+
+---
+
+## Independent fresh-context review — appended 2026-08-01
+
+The same-context-only *(status superseded 2026-08-01 — independent review obtained; see the appended section)* status recorded above was TRUE WHEN WRITTEN and is no longer the
+current state. It is replaced here rather than edited away, so the artifact shows what was
+outstanding and what closed it.
+
+The reviewer is **s1**, an independently-running session with its own clone of this
+repository and no shared history with the session that wrote the code. Coverage below is
+recorded EXACTLY as it answered when asked per-artifact — including where it answered "I did
+not look at that". It explicitly declined credit for one item, in its words: *"the
+claim-shape confirmation you cited is YOURS, not mine — citing me for it would be citing
+your own work under my name."* Nothing in this section is rounded up.
+
+### What was independently reviewed
+
+**`settlement.py` — YES, thoroughly, across three commits** (`701fdca`, `a297e5d`,
+`7875152`). Seven credential-emission sites, the claim-confirmation logic, and every `_send`
+raise path. The reviewer then built its own behavioural oracle WITHOUT sight of this
+session's tests, keyed on a different canary literal, and ran it against this tree: 18/18
+green. It did not trust that green — it reverted each of the ten redactions one at a time,
+**pinned by line number** and with its own static sweep DESELECTED so the behavioural tests
+had to do the catching. **10/10 red**, and the first pass was 9/10: reverting one line left
+everything green, because the SIGNATURE MISMATCH branch had no behavioural coverage at all.
+That gap was reproduced here before being accepted, and the test it wrote is merged.
+
+Two sessions independently derived a character-identical seven-site diff, including
+`redact_url(rpc_url) if rpc_url else '(unnamed)'` over the more obvious `or`.
+
+**`draft.py` — reviewed 2026-08-01 against `1c63da7`,** after the reviewer answered NO when
+asked. It had never read the file; the only prior contact was pointing this session at
+`verify_draft` as a trap to check, which this session then checked — *its* work, not the
+reviewer's, and it said so. **Four findings, all reproduced by execution, all returning
+`ok=True, failures=none` from a verifier whose whole promise is refusal.** Root cause: the
+value-weighted checks are blind to zero-lamport instructions. Fixed at `8277b0c` with a
+shape whitelist and a nonce-identity check, and re-verified — all four refused, honest
+control still passes.
+
+It also ran a regression check nobody asked for, and it is the one that mattered: whether
+the whitelist had killed the durable-nonce feature outright. Verified alive, and verified
+that the nonce finding is closed by IDENTITY rather than merely by shape — a distinction no
+other check in this round would have caught.
+
+### What was NOT covered
+
+The compute-budget fee arithmetic was read but not fuzzed. The ALT/v0 refusal was reasoned
+about but not verified empirically.
+
+### Status
+
+Fresh-context adversarial review: **OBTAINED**, for both files in scope.
+
+
+## Verdict: SHIP
+
+Superseding every earlier verdict in this file. The condition those verdicts were held open
+for — a genuine fresh-context adversarial pass by a party that did not write the code — has
+been met and is documented above, including what the reviewer did NOT cover.
+
+The historical statuses are left in place rather than rewritten. An artifact that shows only
+its final state cannot be audited: the useful record is that this sat open, why, and what
+closed it.

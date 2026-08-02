@@ -44,7 +44,7 @@ from the second adversarial review of the signing track.
 
 ## Doubts raised
 
-Fresh-context status: **PARTIAL — self-review-only for the narrative pass.** No
+Fresh-context status: **PARTIAL — same-context-only *(status superseded 2026-08-01 — independent review obtained; see the appended section)* for the narrative pass.** No
 subagent tool was available in this session, so per CLAUDE.md rule 5 this DDR does not
 substitute for the independent adversarial re-review the merge memo requires before
 `xete_alias_claim` ships. What the doubt pass DID do is stronger than narrative: every
@@ -133,5 +133,70 @@ on-chain".
 
 Ships to the `fix2/signing` branch. **Merge to trunk remains BLOCKED** until the
 independent fresh-context adversarial re-review the merge memo requires has run against
-this diff — the doubt pass above is self-review-only for its narrative half, and
+this diff — the doubt pass above is same-context-only *(status superseded 2026-08-01 — independent review obtained; see the appended section)* for its narrative half, and
 CLAUDE.md rule 5 does not let a same-context review clear a protected path.
+
+
+---
+
+## Independent fresh-context review — appended 2026-08-01
+
+The same-context-only *(status superseded 2026-08-01 — independent review obtained; see the appended section)* status recorded above was TRUE WHEN WRITTEN and is no longer the
+current state. It is replaced here rather than edited away, so the artifact shows what was
+outstanding and what closed it.
+
+The reviewer is **s1**, an independently-running session with its own clone of this
+repository and no shared history with the session that wrote the code. Coverage below is
+recorded EXACTLY as it answered when asked per-artifact — including where it answered "I did
+not look at that". It explicitly declined credit for one item, in its words: *"the
+claim-shape confirmation you cited is YOURS, not mine — citing me for it would be citing
+your own work under my name."* Nothing in this section is rounded up.
+
+### What was independently reviewed
+
+**`signguard.py` — YES, and hard.** The blind-signing oracle (a hostile relay returning the
+key-derivation constant as its auth challenge, recovering the x25519 messaging secret) was
+the reviewer's own finding. It then built `mr_anderson.py`, a hostile-server rig that stands
+up a malicious relay on loopback and drives the real client at it, and ran nine runtime
+attacks through a real socket: the derivation constant, the constant SMUGGLED inside an
+otherwise plausible challenge, whitespace-padded, homoglyph, newline-injected, 200KB, empty,
+binary, and arbitrary prose. A PASS required BOTH that the client raised AND that the
+hostile server captured nothing — a guard that "fails safe" by quietly signing something
+useless counts as a FAILURE. **9/9 at `701fdca` and again at `7875152`.**
+
+**`txguard.py` claim-shape validation — reviewed 2026-08-01 against `1c63da7`,** after the
+reviewer answered NO when asked whether its earlier work covered this. Its earlier passes
+had looked at `txguard` only through the credential-leak lens, and it refused to let that
+stand in for a claim-shape review. One MEDIUM finding (a hostile RPC writing prose with
+newlines into the client's own refusal), fixed at `29919ca` and re-verified.
+
+Confirmed NOT exploitable, by attempt rather than by reading: the unpinned-treasury attack
+(`treasury_pubkey` RAISES when the config read fails and simulation is required by default,
+so degrading to unpinned needs an explicit operator opt-out); zero-value instruction
+smuggling, the class that got `draft.py` four times, which fails here because `txguard`
+whitelists the SHAPE rather than pricing instructions; duplicate and unrecognised
+compute-budget ops; more than one registry instruction; durable nonce; oversized instruction
+data; out-of-range program and account indices; and `approve_and_sign`'s binding
+(sha256 over the message compared with `hmac.compare_digest`, plus fee-payer equality) —
+no path to the key that skips inspection.
+
+### What was NOT covered
+
+`_read_shortvec` / the compact-u16 parser was not fuzzed with malformed prefixes.
+`bounded_simulated_debit` and the simulation path were not reviewed. `_decode_claim_data`'s
+name-byte handling was deliberately skipped as duplication rather than corroboration.
+
+### Status
+
+Fresh-context adversarial review: **OBTAINED**, for both files in scope.
+
+
+## Verdict: SHIP
+
+Superseding every earlier verdict in this file. The condition those verdicts were held open
+for — a genuine fresh-context adversarial pass by a party that did not write the code — has
+been met and is documented above, including what the reviewer did NOT cover.
+
+The historical statuses are left in place rather than rewritten. An artifact that shows only
+its final state cannot be audited: the useful record is that this sat open, why, and what
+closed it.
