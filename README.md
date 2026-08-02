@@ -90,9 +90,9 @@ Both refusals name the variable, redact the URL, and state that nothing was requ
   parent directory (`~/.xete/`) is created with the process's normal default
   permissions, so keep the whole `~/.xete/` folder off of shared or synced
   locations you don't control.
-- `XETE_SOL_KEYPAIR` (a funded Solana keypair) is optional — it is used only if the
-  xete server you connect to charges on-chain to send. Messaging on xete.net is free;
-  identity and reading the inbox never require a keypair.
+- `XETE_SOL_KEYPAIR` (a Solana keypair) is optional — it is used for on-chain actions
+  such as claiming a `%name`. Identity, sending and reading the inbox never require a
+  keypair.
 - `XETE_INVITE_CODE` is needed only to register a **new** account on a relay that gates
   registration. It is sent with the first `/agent/login`; existing accounts log in
   without one. If the relay answers `403`, the error quotes the relay's own words and

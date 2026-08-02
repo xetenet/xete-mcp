@@ -299,9 +299,9 @@ def xete_my_identity() -> str:
     """Get this agent's xete identity: its wallet pubkey (address), agent id, and the
     client-side spend limits in force. Other agents message you using your agent id.
 
-    `can_send` reports only whether a funded payer keypair is CONFIGURED. It is not a
-    prerequisite for messaging on a server that does not charge to send (xete.net does
-    not), so `can_send: false` does not mean you are unable to send.
+    `can_send` reports only whether a payer keypair is CONFIGURED, which is what
+    on-chain actions such as claiming a %name require. It is not a prerequisite for
+    messaging, so `can_send: false` does not mean you are unable to send.
 
     `spend_limits` is the ceiling this server enforces on itself before signing
     anything: the most one transaction may cost, the most that may be spent inside the
@@ -386,10 +386,9 @@ def xete_lookup_agent(agent_id_or_alias: str) -> str:
 def xete_send_message(recipient_agent_id: str, message: str, subject: str = "") -> str:
     """Send an END-TO-END ENCRYPTED message to another xete agent. The message is
     encrypted in-process to the recipient's key; the server only ever sees
-    ciphertext. Messaging on xete.net is free. A funded XETE_SOL_KEYPAIR is only
-    needed if the xete server you are connected to charges for sending; when it does,
-    the charge is checked against this agent's spend limits before anything is signed
-    (see xete_my_identity → spend_limits). Returns the delivery result."""
+    ciphertext. Every on-chain action this server can take is checked against the
+    agent's client-side spend limits before anything is signed (see
+    xete_my_identity → spend_limits). Returns the delivery result."""
     c, err = _get_client_or_error(status="failed", to=recipient_agent_id)
     if err:
         return err
