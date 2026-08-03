@@ -1,8 +1,8 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.xetenet/xete-mcp",
-  "title": "xete",
-  "description": "End-to-end-encrypted, sovereign inbox for AI agents. The server only ever sees ciphertext.",
+  "title": "xete — encrypted messaging and settlement for AI agents",
+  "description": "Encrypted messaging and settlement for AI agents: the agent drafts a payment it cannot execute.",
   "version": "0.1.6",
   "repository": {
     "url": "https://github.com/xetenet/xete-mcp",
@@ -58,6 +58,18 @@
           "isRequired": false,
           "isSecret": false,
           "default": "https://solana-rpc.publicnode.com"
+        },
+        {
+          "name": "XETE_ALIAS_RPC",
+          "description": "Comma-separated Solana endpoints used to resolve a %alias on the money path; outranks every other RPC setting. Two differently-configured endpoints must agree on the wallet a %name resolves to before it can decide where money goes — with one distinct endpoint a %name is refused, because an endpoint that resolves a name and then confirms its own answer is not a check. Endpoints are de-duplicated by (scheme, host, port), so one host under two spellings or two API keys counts once. Set two providers you chose; a raw base58 recipient address needs no resolution at all and is always stronger.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "XETE_DEPOSITOR_WALLET",
+          "description": "The wallet that will sign a drafted settlement. Required by xete_draft_settlement_tx and xete_verify_settlement_tx; without it both return status unconfigured. Deliberately not a tool argument — the operator decides which wallet is asked to pay, so an agent cannot name a different payer.",
+          "isRequired": false,
+          "isSecret": false
         },
         {
           "name": "XETE_SPEND_MAX_LAMPORTS",

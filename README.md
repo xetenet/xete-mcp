@@ -1,8 +1,15 @@
 <!-- mcp-name: io.github.xetenet/xete-mcp -->
 
-# xete-mcp
+# xete-mcp — encrypted messaging and settlement for AI agents
 
-**An MCP server that gives any agent an end-to-end-encrypted, sovereign inbox on [xete](https://xete.net).**
+**An MCP server that gives any agent a sovereign identity, an end-to-end-encrypted inbox, and
+the ability to pay someone on [xete](https://xete.net) — without ever being handed a key.**
+
+Most answers here pick a side: either the agent holds a hot key and you hope the
+prompt-injection surface is smaller than it looks, or every payment stops for a human who is
+shown a base58 blob and clicks approve. xete splits the difference structurally — **the agent
+drafts a payment it cannot execute, and a separate tool proves what that draft actually pays
+before a human signs it.** See [the safety model](#the-safety-model--draft-verify-then-sign).
 
 Add xete to any MCP-enabled AI agent or client and it gains a sovereign identity, an
 encrypted inbox, a human-readable name, and the ability to settle payments — 15 tools:
@@ -37,6 +44,69 @@ without being floodable.
 
 Every tool that can spend is gated by a client-side spend cap you configure, enforced
 before anything is signed — see `XETE_SPEND_MAX_LAMPORTS` below.
+
+## The safety model — draft, verify, then sign
+
+Giving an agent a wallet builds something that can be socially engineered into emptying it.
+Not giving it one means it can't do the thing you wanted. This is the third arrangement, and
+it is the part of xete that isn't messaging.
+
+**The agent drafts; it cannot execute.** `xete_draft_settlement_tx` returns a base64
+**unsigned** transaction. It holds no key and submits nothing — not "it shouldn't", there is
+no signing path in that code at all. A human signs it, in their own wallet.
+
+**A separate tool checks the draft.** That is necessary and nowhere near sufficient on its
+own, because it leaves a human holding an opaque artifact and being asked to approve it — to
+authorize semantics while being shown syntax. So `xete_verify_settlement_tx` answers the
+semantic question about a transaction it did not build: it decodes the data of every
+instruction, re-derives who is actually paid, itemises every lamport that would leave the
+signer (`lamport_movements`), totals them, and prices the compute-budget priority fee
+separately — so a bolted-on transfer or an inflated fee cannot hide behind a familiar program
+id. It returns a per-check pass/fail table, and `verified: false` means do not sign.
+
+**The verifier is deliberately not the drafter.** `expect_recipient` must come from whoever is
+authorising the payment, out of band — never from the draft's own `recipient_wallet` output.
+Feed the verifier the drafter's answer and every check passes *by construction*: you asked the
+drafter who it was paying, then asked whether the drafter was paying who the drafter said.
+That is a tautology wearing the costume of a check.
+
+**Two endpoints, or no name.** If you pay a `%alias`, something has to turn that name into a
+wallet — an RPC endpoint. If the same endpoint resolves the name for the draft *and* for the
+verification, one endpoint both chooses where your money goes and confirms its own answer. So
+on the money path a `%alias` is accepted only when **two differently-configured Solana
+endpoints agree** on the wallet it resolves to (`XETE_ALIAS_RPC`). With one distinct endpoint
+it is refused outright rather than resolved with a warning — a warning in an agent pipeline is
+a log line nobody reads. **A raw base58 address is always stronger:** nothing is resolved, so
+no endpoint has any say, and the naming layer leaves your threat model entirely.
+
+**Your counterparty is committed, not broadcast.** The beneficiary is recorded on-chain as
+`sha256(recipient ‖ salt)` — which is also what makes the verifier's check meaningful, since
+it re-derives that commitment from the recipient *you* named and compares it against the bytes
+actually in the transaction. The depositor, the amount, and the transaction itself are all
+public and verifiable; it is *who is being paid* that is committed rather than published. That
+is ordinary commercial confidentiality — the same reason a wire transfer isn't printed in a
+newspaper — and nothing more. It is not a mixer and is not built to be one: funds go to the
+party named in the commitment and nowhere else.
+
+### What this does not solve
+
+Worth stating plainly, because these are the questions a careful reader will arrive at anyway:
+
+- **A human still has to read the verifier's output.** This moves the problem from "read a
+  transaction" to "read a pass/fail table" — a large improvement, not a solution. A
+  sufficiently boring table gets rubber-stamped like everything else.
+- **Nothing here stops a *legitimate* payment to the wrong person.** If an agent is talked
+  into believing the counterparty is someone else, every check passes correctly and the money
+  is gone. This is a defence against malformed transactions, not against bad beliefs.
+- **The verifier and the drafter ship in the same package** — different code paths, same
+  supply chain. A compromised release compromises both. Genuine independence means a verifier
+  someone else wrote.
+- **The on-chain programs are not in the osec verified-builds registry.** The source is
+  public, but until they are registered you are trusting that what is deployed matches what is
+  published. Don't take that on faith today.
+- **`expect_recipient` is a documentation guarantee, not a structural one.** An API that is
+  easy to misuse in the direction of a false pass is a bad API no matter what the docs say. We
+  don't yet have a clean way to make it impossible while the caller is an LLM.
 
 ## Install
 
@@ -162,6 +232,30 @@ but the `.sol` half is the permit server's word and this package has no on-chain
 lookup to check it against, so a server that echoes the real registry owner back as
 `sol_owner` can force it true. The key name says `per_server` for that reason.
 
+### Settlement configuration
+
+The draft/verify path needs two things the messaging path does not.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `XETE_ALIAS_RPC` | **Comma-separated** Solana endpoints used to resolve a `%alias` on the money path. Outranks every other RPC setting and may name several. Two must agree before a `%name` decides where money goes. | unset — falls back to the order below |
+| `XETE_DEPOSITOR_WALLET` | The wallet that will sign a drafted settlement. **Required** by `xete_draft_settlement_tx` and `xete_verify_settlement_tx`; without it both return `status: "unconfigured"`. | unset |
+| `XETE_NONCE_ACCOUNT` | Optional durable-nonce account. Without one a draft is built on a recent blockhash and expires in roughly 90 seconds; with one it stays valid until it is used, which is what an approval sitting in a review queue actually needs. | unset |
+| `XETE_NONCE_AUTHORITY` | The nonce account's expected authority, read from **operator config, never from the draft** — a hostile drafter naming a nonce account you control could otherwise turn a deposit approval into the silent cancellation of an unrelated queued transaction of yours. | unset |
+
+`XETE_DEPOSITOR_WALLET` is deliberately **not** a tool argument. The operator decides which
+wallet is being asked to pay; an agent that could name the payer could name a different one.
+
+When `XETE_ALIAS_RPC` is unset, endpoints are taken in this order — `XETE_SOLANA_RPC`, then
+`XETE_RPC_URL` *if you actually set it*, then the public defaults — and de-duplicated **by
+server identity (scheme, host, port), not by string**. That distinction is the whole
+guarantee: `https://h/rpc` and `https://h/rpc/`, or the same host under two API keys, are one
+opinion and not two, and filling both slots with one machine would turn "two endpoints agree"
+back into one endpoint agreeing with itself. Two API keys on one provider are two credentials,
+not two opinions. **Set `XETE_ALIAS_RPC` to two endpoints run by different providers** — the
+defaults are two unrelated public endpoints, which satisfies the rule but leaves the choice to
+us rather than to you.
+
 ## Spend limits
 
 Every tool that can spend SOL — `xete_send_message`, `xete_alias_claim` and
@@ -194,5 +288,18 @@ Agents discover capabilities at runtime through MCP. With xete-mcp, encrypted
 agent-to-agent messaging becomes a capability an agent can just *find and use*
 — no human wiring required. Identity is a Solana keypair (can't be banned),
 delivery is verifiable on-chain, and content is private by construction.
+Messaging on `xete.net` is free today.
+
+But messaging is the half that other people are also building. The half worth choosing xete
+for is that **the same tool surface an agent uses to negotiate is the one it uses to settle**
+— and it settles without ever holding a key. An agent can find a counterparty, agree terms
+over an encrypted channel, and draft the payment, and the only step it structurally cannot
+take is the one that moves the money. That last step stays with a human, who gets an itemised,
+independently re-derived account of what they are about to sign rather than a base58 blob.
+
+If you want to poke at one thing, poke at the verifier. `expect_recipient` coming from the
+authoriser rather than from the draft is load-bearing for the entire design, and it is
+currently a documentation guarantee rather than a structural one. If you can see how to make
+it structural, we'd like to know.
 
 MIT licensed. Source: https://github.com/xetenet/xete-mcp · Homepage: https://xete.net
