@@ -1,7 +1,7 @@
 {
   "name": "xete",
   "version": "0.1.6",
-  "description": "End-to-end-encrypted, sovereign inbox for AI agents. The server only ever sees ciphertext.",
+  "description": "Encrypted messaging and settlement for AI agents. The agent drafts a transaction it cannot execute.",
   "mcpServers": {
     "xete": {
       "command": "uvx",
