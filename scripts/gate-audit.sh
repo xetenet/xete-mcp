@@ -19,7 +19,24 @@ fi
 # ---------- Signal 1: ungated protected-path commits on main ----------
 echo "## Signal 1: protected-path commits on main without a DDR in the same change"
 UNGATED=""
-for C in $(git log --first-parent --since="$DAYS days ago" --pretty=%h main 2>/dev/null); do
+# Never audit earlier than the gate itself existed. Commits made BEFORE the gate was
+# installed cannot have bypassed it, and reporting them is a guaranteed false positive:
+# on 2026-08-05 this flagged 9 commits dated 2026-05-31..06-15 against a gate installed
+# 2026-07-05. Since a finding OPENS A GITHUB ISSUE, that noise lands in the same inbox
+# that carries real security mail. An audit that cries wolf about its own pre-history
+# trains people to skim it, which is worse than not running it.
+GATE_BIRTH=$(git log --diff-filter=A --format=%aI -- "$PATTERNS_FILE" | tail -1)
+SINCE_ARG="$DAYS days ago"
+if [ -n "$GATE_BIRTH" ]; then
+  WINDOW_START=$(date -d "$DAYS days ago" +%s 2>/dev/null || echo 0)
+  BIRTH_EPOCH=$(date -d "$GATE_BIRTH" +%s 2>/dev/null || echo 0)
+  if [ "$BIRTH_EPOCH" -gt "$WINDOW_START" ] 2>/dev/null; then
+    SINCE_ARG="$GATE_BIRTH"
+    echo "_Window clamped to the gate's install date ($GATE_BIRTH) — earlier commits predate the gate._"
+    echo ""
+  fi
+fi
+for C in $(git log --first-parent --since="$SINCE_ARG" --pretty=%h main 2>/dev/null); do
   FILES=$(git show -m --first-parent --name-only --pretty=format: "$C" | sort -u)
   HIT=""
   while IFS= read -r pattern; do
@@ -69,7 +86,13 @@ echo "## Signal 3: thin DDRs"
 THIN=""
 for F in $(ls reviews/DDR-*.md 2>/dev/null); do
   LINES=$(grep -c '[^[:space:]]' "$F")
-  DOUBTS=$(awk '/^##+ *Doubts raised/{flag=1;next}/^##/{flag=0}flag&&/[^[:space:]]/{n++}END{print n+0}' "$F")
+  # Count content inside the "Doubts raised" section. The terminator MUST NOT match the
+  # section's own `###` subsections: the original `/^##/` also matched `### D1 ...`, so the
+  # counter switched off at the first doubt and reported ZERO for a DDR containing twelve.
+  # That made the most thorough review in the repo (DDR-spend-caps, D1-D12, the money path)
+  # look like a rubber stamp — an audit bug that discredits good work and hides real ones.
+  # `/^## /` matches only same-level headings, since `###` has no space in position 3.
+  DOUBTS=$(awk '/^##+ *Doubts raised/{flag=1;next}/^## /{flag=0}flag&&/[^[:space:]]/{n++}END{print n+0}' "$F")
   if [ "$LINES" -lt 15 ] || [ "$DOUBTS" -lt 2 ]; then
     THIN="$THIN\n- $F (${LINES} lines, ${DOUBTS} doubt lines)"
   fi
