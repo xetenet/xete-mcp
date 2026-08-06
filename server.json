@@ -29,9 +29,9 @@
         },
         {
           "name": "XETE_RPC_URL",
-          "description": "Solana RPC endpoint used for on-chain lookups. Defaults to mainnet-beta.",
+          "description": "Solana RPC endpoint used for on-chain lookups. Defaults to mainnet-beta. Treated as a secret: the default is a free public endpoint, but a paid provider puts your API token IN this URL — Helius in the query string, QuickNode/Alchemy/Ankr in the path — so the value you set is usually a credential.",
           "isRequired": false,
-          "isSecret": false,
+          "isSecret": true,
           "default": "https://api.mainnet-beta.solana.com"
         },
         {
@@ -54,16 +54,16 @@
         },
         {
           "name": "XETE_SOLANA_RPC",
-          "description": "Solana RPC used to read the %alias registry, the source of truth for which wallet a %name points to. Defaults to https://solana-rpc.publicnode.com (api.mainnet-beta throttles reads).",
+          "description": "Solana RPC used to read the %alias registry, the source of truth for which wallet a %name points to. Defaults to https://solana-rpc.publicnode.com (api.mainnet-beta throttles reads). Treated as a secret for the same reason as XETE_RPC_URL: a paid endpoint carries your API token inside the URL.",
           "isRequired": false,
-          "isSecret": false,
+          "isSecret": true,
           "default": "https://solana-rpc.publicnode.com"
         },
         {
           "name": "XETE_ALIAS_RPC",
-          "description": "Comma-separated Solana endpoints used to resolve a %alias on the money path; outranks every other RPC setting. Two differently-configured endpoints must agree on the wallet a %name resolves to before it can decide where money goes — with one distinct endpoint a %name is refused, because an endpoint that resolves a name and then confirms its own answer is not a check. Endpoints are de-duplicated by (scheme, host, port), so one host under two spellings or two API keys counts once. Set two providers you chose; a raw base58 recipient address needs no resolution at all and is always stronger.",
+          "description": "Comma-separated Solana endpoints used to resolve a %alias on the money path; outranks every other RPC setting. Two differently-configured endpoints must agree on the wallet a %name resolves to before it can decide where money goes — with one distinct endpoint a %name is refused, because an endpoint that resolves a name and then confirms its own answer is not a check. Endpoints are de-duplicated by (scheme, host, port), so one host under two spellings or two API keys counts once. Set two providers you chose; a raw base58 recipient address needs no resolution at all and is always stronger. Treated as a secret: this field is explicitly meant to hold two PAID provider endpoints, and a paid endpoint carries your API token inside the URL.",
           "isRequired": false,
-          "isSecret": false
+          "isSecret": true
         },
         {
           "name": "XETE_DEPOSITOR_WALLET",
