@@ -115,9 +115,14 @@ rm -rf "$SECRET_TMP"
 trap - EXIT HUP INT TERM
 # --------------------------- end secret scan -------------------------------
 
+# FAIL CLOSED. This used to warn and `exit 0` -- a missing patterns file silently disabled
+# the whole protected-path gate, which is the failure mode a gate exists to prevent. If the
+# file is genuinely gone, that is a repo problem to fix, not a commit to wave through.
 if [ ! -f "$PATTERNS_FILE" ]; then
-  echo "[xete-gate] WARNING: $PATTERNS_FILE missing; gate disabled." >&2
-  exit 0
+  echo "[xete-gate] COMMIT BLOCKED - $PATTERNS_FILE is missing, so the gate cannot evaluate" >&2
+  echo "  anything. Restore it (git checkout -- .githooks/protected-paths) or, if this is" >&2
+  echo "  deliberate, bypass explicitly with --no-verify so the choice is visible." >&2
+  exit 1
 fi
 
 STAGED=$(git diff --cached --name-only)
@@ -125,6 +130,11 @@ STAGED=$(git diff --cached --name-only)
 
 TOUCHED_PROTECTED=""
 while IFS= read -r pattern; do
+  # Strip any trailing CR. .gitattributes now pins these files to LF, but this stays as a
+  # belt-and-braces guard: a CRLF patterns file yields patterns like `^pyproject\.toml$\r`,
+  # which match NOTHING, so every protected path sails through and the gate reports success.
+  # That is precisely how this gate was silently dead in fresh Windows clones.
+  pattern=$(printf '%s' "$pattern" | tr -d '\r')
   case "$pattern" in ""|\#*) continue;; esac
   MATCH=$(echo "$STAGED" | grep -E "$pattern" || true)
   if [ -n "$MATCH" ]; then

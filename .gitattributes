@@ -1,0 +1,14 @@
+# Git hooks and shell scripts MUST be checked out with LF endings.
+#
+# WHY (proven 2026-08-05, not theoretical): this repo sets core.autocrlf=true and had no
+# .gitattributes, so a FRESH Windows clone received .githooks/* with CRLF. A CRLF hook has
+# a `#!/bin/sh\r` shebang and `\r`-terminated patterns in protected-paths, which makes the
+# pre-commit gate a silent no-op -- a fresh clone committed a protected path with no
+# reviews/DDR-*.md at exit 0, while the same hook enforced correctly in the older working
+# copy that happened to still hold LF. The gate reported green where it ran and did nothing
+# where it was used.
+#
+# Do not remove these rules. A gate that cannot be trusted to run is worse than no gate,
+# because it buys false confidence.
+.githooks/** text eol=lf
+*.sh        text eol=lf
