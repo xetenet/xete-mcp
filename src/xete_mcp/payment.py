@@ -10,6 +10,7 @@ id and treasury cannot be redirected by a malicious server.
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 import struct
 import time
@@ -27,7 +28,10 @@ from solana.rpc.core import RPCException
 from solana.rpc.types import TxOpts
 
 PROGRAM_ID = Pubkey.from_string("GLdM82RspCLDFmAUqty2Ef8GBGursZVgMD9cqeNHDq2U")
-TREASURY = Pubkey.from_string("XETEsj7sRmSQf1PHVU9FkmZW2n8z75UycWRrpJ8tRMv")
+# The payment destination the program accepts. The program pins this and rejects any transaction
+# naming a different account, so it must match the deployed program exactly. If you are running an
+# older release against a newer program, payments are refused; upgrade this package.
+TREASURY = Pubkey.from_string("DdcVGJcXBCZqRcMBCa6AyuKeF4pLop4NehSjkALN2SYh")
 LAMPORTS_PER_BLOB = 1_000_000  # 0.001 SOL
 
 
@@ -112,6 +116,33 @@ def _attempt_detail(payment_nonce: str, blob_count: int) -> str:
     server-chosen nonce is unbounded; a token at the tail could be truncated away.
     """
     return f"attempt={secrets.token_hex(8)} blobs={blob_count} nonce={payment_nonce}"
+
+
+# Compiled at import, deliberately. The first version built this pattern inside the helper
+# below, whose `except Exception` then swallowed the NameError from a missing `import re` and
+# returned [] forever — the feature was dead and every call looked like "the endpoint sent no
+# logs". A module-level compile fails loudly at import if the pattern or the import is wrong,
+# leaving the try/except to guard only what it is actually for: an unexpected exception repr.
+_PROGRAM_LOG_RE = re.compile(r"Program log: ([^\"']{0,200}?)(?=\"|'|\\n)")
+
+
+def _program_logs(e) -> list[str]:
+    """The program's OWN log lines out of a preflight rejection, if the endpoint returned any.
+
+    Worth the trouble because the useful sentence is always the program's, not the RPC layer's.
+    A caller told only "invalid program argument" has nothing to act on; the same rejection
+    carries `Program log: <the program's explanation>` right next to it, and truncating `str(e)`
+    to a couple of hundred characters is what throws that away.
+
+    Read out of the string form on purpose. The structured payload's shape moves between
+    solana-py versions, and a log that is merely NICE to have must never be the thing that
+    raises inside an error path — so this is regex over the repr, and it returns [] rather than
+    failing if anything is unexpected.
+    """
+    try:
+        return _PROGRAM_LOG_RE.findall(str(e))[:6]
+    except Exception:
+        return []
 
 
 def _release_recorded_spend(detail: str, charged: int, path_label: str = SEND_PATH_LABEL) -> None:
@@ -254,13 +285,37 @@ def pay_herd(rpc_url: str, payer: Keypair, payment_nonce: str, blob_count: int,
         # The node simulated it (skip_preflight=False) and declined to forward it. Nothing
         # moved. Reported as the failure it is — but WITH the signature, because an
         # endpoint lying about not having forwarded it looks exactly like this from here.
+        #
+        # AND THE SPEND IS GIVEN BACK. A preflight rejection is not an ambiguous outcome: the
+        # node simulated this exact transaction and it FAILED, so it cannot move lamports
+        # whether or not the endpoint also forwarded it — a forwarded copy fails on chain for
+        # the same deterministic reason. That is the same standard the pre-submission span
+        # already uses ("proof that no transaction exists"), and it matters because a
+        # rejection an agent cannot fix would otherwise drain the whole 24-hour window a few
+        # attempts at a time while spending exactly zero. `already processed` is handled
+        # above and is the one refusal that must NEVER be released.
+        _release_recorded_spend(detail, int(approval["charged_lamports"]))
+        logs = _program_logs(e)
+        # Some rejections are the caller's to fix and some are structurally unfixable by the
+        # caller. Telling an agent to "fix the cause and retry" when the cause is that this
+        # package predates the deployed program sends it into a retry loop that can never
+        # succeed, so the two cases get different advice.
+        stale_client = any("xete_wallet mismatch" in l for l in logs)
+        remedy = (
+            "This client and the deployed program DISAGREE about the payment destination, "
+            "which this package cannot resolve at runtime — UPGRADE xete-mcp and retry. "
+            "Retrying on this version will fail identically."
+            if stale_client else
+            "Fix the cause and retry."
+        )
+        said = "; ".join(logs) if logs else f"{type(e).__name__}: {str(e)[:160]}"
         raise PaymentNotSettled(
             f"the payment was REJECTED at submit: signature {sig_local}. The endpoint "
             f"simulated it and refused to forward it, so it did not execute and nothing "
-            f"was paid. Fix the cause and retry. (If you have reason to doubt that "
+            f"was paid. {remedy} (If you have reason to doubt that "
             f"endpoint, check the signature on chain first — a node that refused a "
-            f"transaction it had already forwarded would look identical.) Endpoint said: "
-            f"{type(e).__name__}: {str(e)[:160]}", signature=str(sig_local)) from e
+            f"transaction it had already forwarded would look identical.) Program said: "
+            f"{said}", signature=str(sig_local)) from e
     except Exception as e:                      # noqa: BLE001 — deliberate, see above
         # NO ANSWER. An endpoint that forwarded the transaction and then dropped the
         # socket on the reply is indistinguishable, from this client, from one that never

@@ -1,6 +1,6 @@
 {
   "name": "xete",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Encrypted messaging and settlement for AI agents. The agent drafts a transaction it cannot execute.",
   "mcpServers": {
     "xete": {
