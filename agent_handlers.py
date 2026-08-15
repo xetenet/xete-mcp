@@ -114,13 +114,9 @@ class OllamaHandler:
         messages += list(hist)
         messages.append({"role": "user", "content": text})
         try:
-            r = requests.post(
-                f"{self.url}/api/chat",
-                json={"model": self.model, "messages": messages, "stream": False},
-                timeout=self.timeout_s,
-            )
-            r.raise_for_status()
-            reply = (r.json().get("message", {}) or {}).get("content", "").strip()
+            import llm_client
+            reply = (llm_client.chat_message(
+                messages, timeout=self.timeout_s).get("content") or "").strip()
         except Exception as e:
             return f"(local model unreachable: {str(e)[:140]})"
         if not reply:
@@ -159,6 +155,9 @@ class OllamaToolHandler(OllamaHandler):
         {"type": "function", "function": {
             "name": "run_shell", "description": "Run a shell command on the local machine and return its stdout+stderr.",
             "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+        {"type": "function", "function": {
+            "name": "wake_lead", "description": "Wake the owner's lead Claude agent so it checks its xete messages. Use whenever the owner asks you to wake / ping / notify / get Claude (or 'the lead') to check messages.",
+            "parameters": {"type": "object", "properties": {"note": {"type": "string", "description": "optional short reason to pass along"}}, "required": []}}},
     ]
 
     def __init__(self, **kw):
@@ -193,18 +192,29 @@ class OllamaToolHandler(OllamaHandler):
                 r = self._subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=self.tool_timeout)
                 out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
                 return (out.strip() or f"(exit {r.returncode}, no output)")[: self.tool_out_cap]
+            if name == "wake_lead":
+                rt = getattr(self, "runtime", None)
+                if rt is None:
+                    return "(can't wake: no runtime handle)"
+                note = str(args.get("note", "")).strip()
+                lead = os.environ.get("XETE_LEAD_ID", "4901fe9d-76f8-4d2b-9ef4-a4d2e3ce4918")
+                body = "WAKE (the owner asked, via ollama): check your xete messages." + (" Note: " + note if note else "")
+                try:
+                    rt.send(lead, body, subject="WAKE - check messages")
+                    return "Woke the lead agent - sent a wake ping to its inbox; it rouses on its message watcher."
+                except Exception as e:
+                    return f"(wake send failed: {str(e)[:160]})"
             return f"(unknown tool {name})"
         except Exception as e:
             return f"(tool error: {str(e)[:200]})"
 
     def _chat(self, messages: list, tools=None) -> dict:
-        import requests
-        body = {"model": self.model, "messages": messages, "stream": False}
-        if tools:
-            body["tools"] = tools
-        r = requests.post(f"{self.url}/api/chat", json=body, timeout=self.timeout_s)
-        r.raise_for_status()
-        return r.json().get("message", {}) or {}
+        # Routed through llm_client so this follows XETE_LLM_BACKEND like every other
+        # caller. Tool-call shapes are translated in BOTH directions there (OpenAI sends
+        # function.arguments as a JSON string, this code expects a dict) — the allowlist
+        # gate below is untouched and still decides whether tools are offered at all.
+        import llm_client
+        return llm_client.chat_message(messages, tools=tools, timeout=self.timeout_s)
 
     def handle(self, sender_id: str, text: Optional[str]) -> Optional[str]:
         if not text:

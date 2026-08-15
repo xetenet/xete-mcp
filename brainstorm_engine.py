@@ -31,6 +31,8 @@ Design notes (why it's built this way):
     not a bug. Only survivors get logged.
 """
 import os, sys, json, pickle, math, random, time, argparse, urllib.request
+
+import llm_client
 from datetime import datetime, timezone
 
 STORE = os.environ.get("RAG_STORE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "rag_store.pkl"))
@@ -77,11 +79,10 @@ REASON: <one line, honest about what the surviving candidate actually claims>
 
 
 def embed(text):
-    body = json.dumps({"model": _embed_model, "prompt": text}).encode()
-    req = urllib.request.Request(OLLAMA + "/api/embeddings", data=body,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return json.loads(r.read())["embedding"]
+    # CPU-pinned via llm_client so the embed model never takes VRAM from the
+    # qwen server — see llm_client.embed(). Bulk ingest (rag_ingest.py) still
+    # uses the GPU; only query-time embeds moved.
+    return llm_client.embed(text, _embed_model)
 
 
 def norm(v):
@@ -94,16 +95,10 @@ def cosine(a, b):
 
 
 def chat(system, user, num_ctx=NUM_CTX):
-    body = json.dumps({
-        "model": CHAT_MODEL,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "stream": False,
-        "options": {"num_ctx": num_ctx},
-    }).encode()
-    req = urllib.request.Request(OLLAMA + "/api/chat", data=body,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=300) as r:
-        return json.loads(r.read())["message"]["content"].strip()
+    # Backend (ollama | llamacpp) is chosen by XETE_LLM_BACKEND — see llm_client.py.
+    return llm_client.chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        num_ctx=num_ctx, stream=False).strip()
 
 
 def pick_anchor_a(records, seed_query):
