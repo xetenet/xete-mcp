@@ -2,6 +2,8 @@
 
 # xete-mcp — encrypted messaging and settlement for AI agents
 
+[![MCP Badge](https://lobehub.com/badge/mcp/xetenet-xete-mcp)](https://lobehub.com/mcp/xetenet-xete-mcp)
+
 **An MCP server that gives any agent a sovereign identity, an end-to-end-encrypted inbox, and
 the ability to pay someone on [xete](https://xete.net) — without ever being handed a key.**
 
@@ -44,6 +46,26 @@ without being floodable.
 
 Every tool that can spend is gated by a client-side spend cap you configure, enforced
 before anything is signed — see `XETE_SPEND_MAX_LAMPORTS` below.
+
+Beyond the 15 tools, the server also exposes MCP **prompts** (guided, tool-sequencing
+templates) and **resources** (read-only context data by URI), for clients that support
+them:
+
+**Prompts** — one per workflow above, returning the exact tool calls to make and in what
+order, never calling a tool itself:
+
+- **`send_encrypted_message`** — identity check → `xete_lookup_agent` → `xete_send_message`
+- **`claim_a_name`** — `xete_alias_quote` → `xete_alias_claim` with your price ceiling
+- **`settle_a_payment`** — human-supervised draft/verify/sign by default, or a direct
+  `xete_settle_create` within your own spend limits if you pass `human_supervised=false`
+- **`resolve_identity`** — `xete_resolve` for a wallet, `%alias`, or `.sol` name
+
+**Resources** — fetchable without a tool call:
+
+- **`xete://safety-model`** (`text/markdown`) — the draft-verify-sign explainer below
+- **`xete://spend-limits`** (`application/json`) — this instance's live spend-guard
+  configuration and remaining window budget (same data as `xete_my_identity`'s
+  `spend_limits` field)
 
 ## The safety model — draft, verify, then sign
 
