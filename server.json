@@ -3,7 +3,7 @@
   "name": "io.github.xetenet/xete-mcp",
   "title": "xete — encrypted messaging and settlement for AI agents",
   "description": "Encrypted messaging and settlement for AI agents. The agent drafts a transaction it cannot execute.",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "repository": {
     "url": "https://github.com/xetenet/xete-mcp",
     "source": "github"
@@ -14,7 +14,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "xete-mcp",
-      "version": "0.1.6",
+      "version": "0.1.7",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
