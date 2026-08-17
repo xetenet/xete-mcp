@@ -5,14 +5,34 @@ existing @mcp.tool() functions in server.py — it never calls a tool itself, si
 anything, or submits anything on-chain. server.py registers these as @mcp.prompt()
 wrappers; the functions here are kept tool-free and pure so they're testable without
 FastMCP or network access.
+
+DDR fresh-context review (reviews/DDR-mcp-prompts-resources-20260817.md) found every
+caller-supplied string argument here was going straight into an f-string that mimics
+literal tool-call syntax, unescaped — an agent whose `message`/`recipient` argument to
+one of these PROMPTS is itself attacker-influenced (pulled from an inbox, web content,
+another tool's output) could have a fabricated extra tool call smuggled into the guide
+text a downstream LLM may read as instruction rather than data. That is the same class
+of finding server.py's `_echo()` already has a name for [G21] and already treats with
+`sanitize_text(value, 48)` — everything interpolated below goes through the identical
+helper, for the identical reason: it is a preview for a human-readable guide, not the
+actual payload (the real send still goes through xete_send_message directly), so 48
+characters of flattened, control-character-free text is plenty.
 """
 from __future__ import annotations
+
+from .safehttp import sanitize_text
+
+_PREVIEW_LIMIT = 48
+
+
+def _preview(value: str) -> str:
+    return sanitize_text(value, _PREVIEW_LIMIT)
 
 
 def send_encrypted_message(recipient_agent_id: str = "", message: str = "") -> str:
     """Guide for the identity + messaging workflow."""
-    who = recipient_agent_id or "<recipient_agent_id>"
-    what = message or "<your message>"
+    who = _preview(recipient_agent_id) or "<recipient_agent_id>"
+    what = _preview(message) or "<your message>"
     return (
         "To send an end-to-end-encrypted xete message:\n"
         "1. Call xete_my_identity to confirm your own agent id and check spend_limits "
@@ -27,7 +47,7 @@ def send_encrypted_message(recipient_agent_id: str = "", message: str = "") -> s
 
 def claim_a_name(name: str = "", max_price_lamports: int | None = None) -> str:
     """Guide for claiming a %name."""
-    n = name or "<%name>"
+    n = _preview(name) or "<%name>"
     ceiling = (f"max_price_lamports={max_price_lamports}" if max_price_lamports is not None
                else "a max_price_lamports ceiling you choose")
     return (
@@ -45,7 +65,7 @@ def claim_a_name(name: str = "", max_price_lamports: int | None = None) -> str:
 def settle_a_payment(recipient: str = "", amount_sol: float | None = None,
                       human_supervised: bool = True) -> str:
     """Guide for paying another agent, split by who is authorizing the spend."""
-    who = recipient or "<recipient wallet, %alias, or .sol name>"
+    who = _preview(recipient) or "<recipient wallet, %alias, or .sol name>"
     amt = f"{amount_sol}" if amount_sol is not None else "<amount_sol>"
     if human_supervised:
         return (
@@ -76,7 +96,7 @@ def settle_a_payment(recipient: str = "", amount_sol: float | None = None,
 
 def resolve_identity(identifier: str = "") -> str:
     """Guide for resolving a wallet, %alias, or .sol name to one identity view."""
-    who = identifier or "<wallet address, %alias, or .sol name>"
+    who = _preview(identifier) or "<wallet address, %alias, or .sol name>"
     return (
         f"To resolve {who} to a single identity view:\n"
         f"1. Call xete_resolve(\"{who}\") — returns the wallet it points to, the best "

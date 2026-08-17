@@ -1,5 +1,6 @@
 """SPEC-mcp-prompts-resources-20260817."""
 import json
+from pathlib import Path
 
 from xete_mcp import resources
 
@@ -35,3 +36,39 @@ def test_spend_limits_matches_spendguard_status_shape():
     for key in ("per_transaction_max_lamports", "window_lamports", "window_seconds",
                 "on_chain_floor_lamports"):
         assert reported.get(key) == live.get(key)
+
+
+def test_spend_limits_reports_json_even_when_spendguard_raises(monkeypatch):
+    # Mirrors what a real spendguard.status() failure embeds (server.py's own
+    # _scrub_paths docstring: "the home directory is in it, so the OS username is in
+    # it") — using an unrelated fake path here would pass without exercising the real
+    # redaction logic at all, which only scrubs Path.home() and the configured ledger.
+    from xete_mcp import spendguard
+
+    home = str(Path.home())
+
+    def boom():
+        raise RuntimeError(f"{home}/.xete/spend-ledger.json is corrupt")
+
+    monkeypatch.setattr(spendguard, "status", boom)
+    data = json.loads(resources.spend_limits())
+    assert data.get("enforced") is True
+    assert "error" in data
+    # _scrub_paths must still have run on the exception's own message.
+    assert home not in data["error"]
+
+
+def test_safety_model_is_byte_identical_to_readme():
+    # DDR finding (reviews/DDR-mcp-prompts-resources-20260817.md, doubt #5): the spec
+    # claims this can't silently drift from README.md, but nothing enforced that until
+    # this test. The wheel doesn't ship README.md (see resources.py's module
+    # docstring), so this only runs against a source checkout — exactly where an editor
+    # would actually change the README section and need to be told the copy broke.
+    readme = Path(__file__).parent / "README.md"
+    text = readme.read_text(encoding="utf-8")
+    start = text.index("## The safety model — draft, verify, then sign")
+    end = text.index("## Install")
+    section = text[start:end].rstrip("\n") + "\n"
+    assert resources.SAFETY_MODEL_MARKDOWN == section, (
+        "resources.SAFETY_MODEL_MARKDOWN has drifted from README.md's safety-model "
+        "section — update the hand-maintained copy in resources.py to match")
