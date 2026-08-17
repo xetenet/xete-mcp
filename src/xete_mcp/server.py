@@ -122,7 +122,7 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from .client import XeteClient, load_or_create_identity
-from . import alias_chain, draft, payment, settlement, signguard
+from . import alias_chain, draft, payment, prompts, resources, settlement, signguard
 from . import txguard as txguard_mod
 from .safehttp import (EndpointError, as_bool, as_int, as_name, as_str, distinct_endpoints,
                        get_json, post_json, project, redact_url, require_secure_url, scrub,
@@ -2219,6 +2219,51 @@ def xete_verify_settlement_tx(unsigned_tx_b64: str, expect_recipient: str, salt:
         # forward, which is how a refusal turns into "use the other tool that says yes".
         return json.dumps({"verified": False, "verdict": "DO NOT SIGN — verifier errored",
                            "error": str(e)[:800]})
+
+# MCP prompts and resources (SPEC-mcp-prompts-resources-20260817). Thin registrations
+# over the pure functions in prompts.py/resources.py — no new spend/signing path, see
+# that spec's Invariants. One prompt per README tool-grouping; two read-only resources.
+
+@mcp.prompt(name="send_encrypted_message")
+def _prompt_send_encrypted_message(recipient_agent_id: str = "", message: str = "") -> str:
+    """Guided steps to send an end-to-end-encrypted xete message."""
+    return prompts.send_encrypted_message(recipient_agent_id, message)
+
+
+@mcp.prompt(name="claim_a_name")
+def _prompt_claim_a_name(name: str = "", max_price_lamports: int | None = None) -> str:
+    """Guided steps to quote and claim a xete %name."""
+    return prompts.claim_a_name(name, max_price_lamports)
+
+
+@mcp.prompt(name="settle_a_payment")
+def _prompt_settle_a_payment(recipient: str = "", amount_sol: float | None = None,
+                              human_supervised: bool = True) -> str:
+    """Guided steps to pay another agent — human-supervised draft/verify/sign by
+    default, or a direct agent-authorized settlement within its own spend limits."""
+    return prompts.settle_a_payment(recipient, amount_sol, human_supervised)
+
+
+@mcp.prompt(name="resolve_identity")
+def _prompt_resolve_identity(identifier: str = "") -> str:
+    """Guided steps to resolve a wallet, %alias, or .sol name to one identity view."""
+    return prompts.resolve_identity(identifier)
+
+
+@mcp.resource(resources.SAFETY_MODEL_URI, name="safety-model", mime_type="text/markdown",
+              description="The draft-verify-sign safety model xete's settlement tools "
+                           "implement, verbatim from README.md.")
+def _resource_safety_model() -> str:
+    return resources.safety_model()
+
+
+@mcp.resource(resources.SPEND_LIMITS_URI, name="spend-limits", mime_type="application/json",
+              description="This instance's live client-side spend-guard configuration "
+                           "and remaining window budget — same data as xete_my_identity's "
+                           "spend_limits field, fetchable without a tool call.")
+def _resource_spend_limits() -> str:
+    return resources.spend_limits()
+
 
 def main():
     mcp.run()
