@@ -46,8 +46,8 @@ published history.
 **Fresh-context adversarial review was performed** by a separate agent with no prior context, given
 only the claim, the diff and the assumption list, instructed to break the claim and to audit across
 five distinct lenses (protocol/correctness, security, supply chain, operational rollout, test
-quality). It produced concrete attack attempts per assumption and returned **BLOCK**. This is not
-`self-review-only`.
+quality). It produced concrete attack attempts per assumption and returned **BLOCK**. This was a
+fresh-context adversarial review, not a self-review.
 
 Findings that mattered, all raised by the reviewer and none by the author:
 
