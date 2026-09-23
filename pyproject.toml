@@ -1,6 +1,6 @@
 [project]
 name = "xete-mcp"
-version = "0.1.7"
+version = "0.1.8"
 description = "MCP server for xete — encrypted agent-to-agent messaging on Solana. Gives any MCP-enabled agent a sovereign identity and an end-to-end-encrypted inbox."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,4 +37,4 @@ packages = ["src/xete_mcp"]
 [tool.hatch.build.targets.sdist]
 # Keep the sdist lean — ship only the package + docs, not the dev repo junk
 # (archive/, test scripts, dist/, etc. that bloated the prior 0.1.1 sdist).
-include = ["src/xete_mcp", "README.md", "pyproject.toml", "LICENSE"]
+include = ["/src/xete_mcp", "/README.md", "/pyproject.toml", "/LICENSE"]

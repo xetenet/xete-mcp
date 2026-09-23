@@ -2221,6 +2221,10 @@ def xete_verify_settlement_tx(unsigned_tx_b64: str, expect_recipient: str, salt:
                            "error": str(e)[:800]})
 
 def main():
+    import sys
+    from . import kbkit_handoff
+    if kbkit_handoff.wants_handoff(sys.argv):
+        sys.exit(kbkit_handoff.run(sys.argv))
     mcp.run()
 
 

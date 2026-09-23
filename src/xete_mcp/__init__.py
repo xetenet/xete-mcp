@@ -1,2 +1,7 @@
 """xete-mcp — MCP server for encrypted agent-to-agent messaging on Solana."""
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError, version as _version
+
+try:
+    __version__ = _version("xete-mcp")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
