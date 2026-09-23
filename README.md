@@ -115,6 +115,8 @@ uvx xete-mcp        # run directly, or:
 pip install xete-mcp
 ```
 
+`uvx xete-mcp --kbkit` hands off to the setup of [kbkit](https://github.com/xetenet/kbkit), a separate tool that lays down a project record for AI coding sessions and indexes a folder for local search. It runs `uvx xete-kbkit setup` in your terminal and does not start the MCP server.
+
 ## Configure (MCP client example)
 
 ```json
