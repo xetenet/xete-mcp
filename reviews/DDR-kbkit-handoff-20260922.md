@@ -64,8 +64,14 @@ message and exit code 2. Two new LOW findings:
 
 - `test_kbkit_handoff.py`: 8 tests (flag position, command line, `XETE_*` stripped, missing uvx,
   planted and relative uvx, drive-relative entry, Ctrl-C, server not started / started).
-- Full suite on Linux (WSL Ubuntu), Python 3.10 and 3.12: 846 passed, 9 skipped, 0 failed.
-- Full suite on Windows, Python 3.12: all pass except two tests that also fail on `origin/main`
-  there (POSIX file modes and the local hook check under Git for Windows); CI runs Ubuntu.
+- Full suite on Linux (WSL Ubuntu), Python 3.10, 3.12 and 3.13, on the final code: 846 passed,
+  9 skipped, 0 failed.
+- Full suite on Windows, Python 3.12: 849 passed; the two failures also fail on `origin/main`
+  there, checked on a clean checkout of 1687c90 (POSIX file modes, and the local hook check under
+  Git for Windows); CI runs Ubuntu.
+- CI caught one defect after round 2: the drive-relative fix used the host's path rules, so the
+  test's Windows case failed on a Linux runner. `find_uvx` now applies Windows path rules when
+  checking for Windows, and the positive case runs on the host's own rules. The Linux runs above
+  were repeated after that fix.
 
 ## Verdict: SHIP

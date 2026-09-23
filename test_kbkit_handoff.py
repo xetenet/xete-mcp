@@ -62,10 +62,14 @@ def test_uvx_in_the_current_folder_or_a_relative_entry_is_never_used(tmp_path, m
         assert kbkit_handoff.find_uvx(path=os.pathsep.join(["", ".", "hostile-repo", "\\hostile-repo"]), windows=windows) is None
     real = tmp_path / "bin"
     real.mkdir()
+    windows = os.name == "nt"
     (real / "uvx.bat").write_text("a batch file")
-    assert kbkit_handoff.find_uvx(path=str(real), windows=True) is None
-    (real / "uvx.exe").write_text("exe")
-    assert kbkit_handoff.find_uvx(path=os.pathsep.join([".", str(real)]), windows=True) == str(real / "uvx.exe")
+    assert kbkit_handoff.find_uvx(path=str(real), windows=windows) is None
+    # the real one after a planted entry is still found, on the host's own path rules
+    name = "uvx.exe" if windows else "uvx"
+    (real / name).write_text("uv")
+    os.chmod(real / name, 0o755)
+    assert kbkit_handoff.find_uvx(path=os.pathsep.join([".", str(real)]), windows=windows) == os.path.join(str(real), name)
 
 
 def test_ctrl_c_waits_for_the_setup_to_exit(monkeypatch):

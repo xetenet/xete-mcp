@@ -7,7 +7,9 @@ identity, and passes no XETE_* variable to the child.
 """
 from __future__ import annotations
 
+import ntpath
 import os
+import posixpath
 import subprocess
 import sys
 
@@ -29,14 +31,15 @@ def find_uvx(path: str | None = None, windows: bool | None = None) -> str | None
     file parses the arguments.
     """
     windows = os.name == "nt" if windows is None else windows
+    paths = ntpath if windows else posixpath
     name = "uvx.exe" if windows else "uvx"
     for entry in (os.environ.get("PATH", "") if path is None else path).split(os.pathsep):
         entry = entry.strip().strip('"')
-        if not entry or not os.path.isabs(entry):
+        if not entry or not paths.isabs(entry):
             continue
-        if windows and not os.path.splitdrive(entry)[0]:
+        if windows and not paths.splitdrive(entry)[0]:
             continue  # a leading backslash with no drive is relative to the current folder's drive
-        candidate = os.path.join(entry, name)
+        candidate = paths.join(entry, name)
         if os.path.isfile(candidate) and (windows or os.access(candidate, os.X_OK)):
             return candidate
     return None
